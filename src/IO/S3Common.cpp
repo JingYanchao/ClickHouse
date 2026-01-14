@@ -36,7 +36,6 @@ bool S3Exception::isRetryableError() const
     static const std::unordered_set<Aws::S3::S3Errors> unretryable_errors = {
         Aws::S3::S3Errors::NO_SUCH_KEY,
         Aws::S3::S3Errors::ACCESS_DENIED,
-        Aws::S3::S3Errors::INVALID_ACCESS_KEY_ID,
         Aws::S3::S3Errors::INVALID_SIGNATURE,
         Aws::S3::S3Errors::NO_SUCH_UPLOAD,
         Aws::S3::S3Errors::NO_SUCH_BUCKET,
