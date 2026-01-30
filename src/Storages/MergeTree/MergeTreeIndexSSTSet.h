@@ -6,10 +6,71 @@
 #include <rocksdb/file_system.h>
 #include <Storages/MergeTree/IDataPartStorage.h>
 #include <Storages/MergeTree/MergeTreeIndexSSTSetWriter.h>
+#include <IO/WriteBuffer.h>
+#include <unordered_map>
+
 namespace DB
 {
 
 class MergeTreeIndexSSTSet;
+
+/// WritableFile implementation that writes to a provided WriteBuffer
+class WriteBufferWritableFile : public rocksdb::FSWritableFile
+{
+public:
+    explicit WriteBufferWritableFile(WriteBuffer & write_buffer_)
+        : write_buffer(write_buffer_)
+        , file_size(0)
+    {
+    }
+
+    rocksdb::IOStatus Append(
+        const rocksdb::Slice & data,
+        const rocksdb::IOOptions &,
+        rocksdb::IODebugContext *) override
+    {
+        try
+        {
+            write_buffer.write(data.data(), data.size());
+            file_size += data.size();
+            return rocksdb::IOStatus::OK();
+        }
+        catch (...)
+        {
+            auto error_msg = getCurrentExceptionMessage(true);
+            return rocksdb::IOStatus::IOError("Failed to write data: " + error_msg);
+        }
+    }
+
+    rocksdb::IOStatus Close(const rocksdb::IOOptions &, rocksdb::IODebugContext *) override
+    {
+        write_buffer.preFinalize();
+        write_buffer.finalize();
+        return rocksdb::IOStatus::OK();
+    }
+
+    rocksdb::IOStatus Flush(const rocksdb::IOOptions &, rocksdb::IODebugContext *) override
+    {
+        /// write buffer flush by itself
+        return rocksdb::IOStatus::OK();
+    }
+
+    rocksdb::IOStatus Sync(const rocksdb::IOOptions &, rocksdb::IODebugContext *) override
+    {
+        write_buffer.sync();
+        return rocksdb::IOStatus::OK();
+    }
+
+    uint64_t GetFileSize(const rocksdb::IOOptions &, rocksdb::IODebugContext *) override
+    {
+        return file_size;
+    }
+
+private:
+    WriteBuffer & write_buffer;
+    uint64_t file_size;
+};
+
 class ReadBufferBasedSequentialFile : public rocksdb::FSSequentialFile
 {
 public:
@@ -64,46 +125,11 @@ private:
     std::unique_ptr<ReadBufferFromFileBase> file;
 };
 
-class FakeWritableFile : public rocksdb::FSWritableFile
-{
-public:
-    rocksdb::IOStatus Append(
-        const rocksdb::Slice &,
-        const rocksdb::IOOptions &,
-        rocksdb::IODebugContext *) override
-    {
-        return rocksdb::IOStatus::NotSupported();
-    }
-
-    rocksdb::IOStatus Close(const rocksdb::IOOptions &, rocksdb::IODebugContext *) override
-    {
-        /// Do nothing.
-        return rocksdb::IOStatus::OK();
-    }
-
-    rocksdb::IOStatus Flush(const rocksdb::IOOptions &, rocksdb::IODebugContext *) override
-    {
-        /// Do nothing.
-        return rocksdb::IOStatus::OK();
-    }
-
-    rocksdb::IOStatus Sync(const rocksdb::IOOptions &, rocksdb::IODebugContext *) override
-    {
-        /// Do nothing.
-        return rocksdb::IOStatus::OK();
-    }
-
-    uint64_t GetFileSize(const rocksdb::IOOptions &, rocksdb::IODebugContext *) override
-    {
-        return 0;
-    }
-};
-
 class DataPartStorageBasedFileSystem : public rocksdb::FileSystem
 {
 public:
-    explicit DataPartStorageBasedFileSystem(const DataPartStoragePtr & storage_)
-        : storage(storage_)
+    explicit DataPartStorageBasedFileSystem(const DataPartStoragePtr & storage_, WriteBuffer * write_buffer_)
+        : storage(storage_), write_buffer(write_buffer_)
     {
     }
 
@@ -158,7 +184,10 @@ public:
         std::unique_ptr<rocksdb::FSWritableFile> * r,
         rocksdb::IODebugContext *) override
     {
-        *r = std::make_unique<FakeWritableFile>();
+        if (!write_buffer)
+            return rocksdb::IOStatus::InvalidArgument("WriteBuffer not set");
+
+        *r = std::make_unique<WriteBufferWritableFile>(*write_buffer);
         return rocksdb::IOStatus::OK();
     }
 
@@ -224,11 +253,12 @@ public:
         rocksdb::IODebugContext *) override { return rocksdb::IOStatus::NotSupported(); }
 private:
     DataPartStoragePtr storage;
+    WriteBuffer* write_buffer = nullptr;
 };
 
-inline std::unique_ptr<rocksdb::Env> createDiskBasedUniqueIndexEnv(DataPartStoragePtr storage)
+inline std::unique_ptr<rocksdb::Env> createDiskBasedUniqueIndexEnv(std::shared_ptr<const IDataPartStorage> storage, WriteBuffer * write_buffer)
 {
-    return rocksdb::NewCompositeEnv(std::make_shared<DataPartStorageBasedFileSystem>(std::move(storage)));
+    return rocksdb::NewCompositeEnv(std::make_shared<DataPartStorageBasedFileSystem>(std::move(storage), write_buffer));
 }
 
 struct MergeTreeIndexGranuleSSTSet final : public IMergeTreeIndexGranule
@@ -290,6 +320,7 @@ struct MergeTreeIndexAggregatorSSTSet final : IMergeTreeIndexAggregator
 private:
     String index_name;
     size_t max_rows_sort_in_memory;
+    size_t index_bucket_number;
     Block index_sample_block;
     MergeTreeIndexSSTSetWriterPtr index_writer;
     Sizes key_sizes;
@@ -301,12 +332,14 @@ class MergeTreeIndexSSTSet final : public IMergeTreeIndex
 {
 public:
     MergeTreeIndexSSTSet(
-        const MergeTreeDataPartPtr & data_part,
+        const MergeTreeDataPartPtr & data_part_,
         const IndexDescription & index_,
+        size_t index_bucket_number_,
         size_t max_rows_sort_in_memory_)
         : IMergeTreeIndex(index_)
-        , data_part(data_part)
+        , data_part(data_part_)
         , max_rows_sort_in_memory(max_rows_sort_in_memory_)
+        , index_bucket_number(index_bucket_number_)
     {}
 
     ~MergeTreeIndexSSTSet() override = default;
@@ -325,6 +358,7 @@ public:
 private:
     MergeTreeDataPartPtr data_part;
     size_t max_rows_sort_in_memory;
+    size_t index_bucket_number;
 };
 
 }

@@ -1,5 +1,6 @@
 #pragma once
 #include <memory>
+#include <unordered_map>
 #include <Core/Block.h>
 #include <Columns/IColumn.h>
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
@@ -8,6 +9,8 @@
 
 namespace DB
 {
+
+class WriteBuffer;
 class SortedKeyIterator
 {
 public:
@@ -97,21 +100,16 @@ class MergeTreeIndexSSTSetWriter
 public:
     using KV = std::pair<std::string_view, std::string_view>;
     explicit MergeTreeIndexSSTSetWriter(
-        const String & index_path, const MergeTreeDataPartPtr & data_part, const StorageMetadataPtr & metadata_snapshot_);
+        size_t index_bucket_number, const String & index_path, const MergeTreeDataPartPtr & data_part, const StorageMetadataPtr & metadata_snapshot_);
     virtual ~MergeTreeIndexSSTSetWriter() = default;
 
     void write(const Block & block);
-
-    struct IndexInfo
-    {
-        size_t file_size = 0;
-    };
-    using IndexInfos = std::vector<IndexInfo>;
-    IndexInfos flushIndexFile();
+    void flushIndexFile(const std::vector<WriteBuffer*> & write_buffers);
+    
     MergeTreeDataPartPtr part;
 protected:
     virtual void processBlock(const Block & block) = 0;
-    virtual IndexInfos flushFileImpl() { throw Exception(ErrorCodes::LOGICAL_ERROR, "flushFileImpl is not implemented"); }
+    virtual void flushFileImpl() { throw Exception(ErrorCodes::LOGICAL_ERROR, "flushFileImpl is not implemented"); }
 
     inline void advanceRowOffset(size_t rows) { row_offset += rows; }
     bool compareKV(const KV & lkv, const KV & rkv) const;
@@ -128,15 +126,15 @@ public:
     class SstFileWriterImpl
     {
     public:
-        explicit SstFileWriterImpl(const IMergeTreeDataPart & part);
+        explicit SstFileWriterImpl(size_t index_bucket_number_, const IMergeTreeDataPart & part, const std::vector<WriteBuffer*> & write_buffers);
         using InputIter = SortedKeyIterator;
         using InputIterPtr = std::unique_ptr<InputIter>;
         /// Put a single key-value pair to the sst file.
         void put(const std::string_view & key, const std::string_view & value);
         /// Consume the iterator and write to the sst file.
         /// Deduplicate the unique key if needed.
-        IndexInfos writeAndFinish(InputIterPtr iter, size_t num_rows);
-        IndexInfos finish(size_t num_rows);
+        void writeAndFinish(InputIterPtr iter, size_t num_rows);
+        void finish(size_t num_rows);
     private:
         using WriterImpl = rocksdb::SstFileWriter;
         using WriterImplPtr = std::unique_ptr<WriterImpl>;
@@ -146,9 +144,12 @@ public:
         const size_t index_bucket_number;
         WriterImpls index_writers;
         std::vector<bool> index_writers_has_written_key;
-        std::unique_ptr<rocksdb::Env> env = nullptr;
+        std::vector<std::unique_ptr<rocksdb::Env>> envs;
     };
 protected:
+    std::unique_ptr<SstFileWriterImpl> writer;
+    const size_t index_bucket_number;
+    const String index_path;
     StorageMetadataPtr metadata_snapshot;
     Block index_sample_block;
     UInt32 row_offset = 0;
@@ -161,11 +162,14 @@ class MergeTreeIndexSSTSetWriterRocksDB : public MergeTreeIndexSSTSetWriter
 {
 public:
     explicit MergeTreeIndexSSTSetWriterRocksDB(
-        const String & index_path, const MergeTreeDataPartPtr & data_part, const StorageMetadataPtr & metadata_snapshot_);
+        size_t index_bucket_number,
+        const String & index_path,
+        const MergeTreeDataPartPtr & data_part,
+        const StorageMetadataPtr & metadata_snapshot_);
     ~MergeTreeIndexSSTSetWriterRocksDB() override;
 protected:
     void processBlock(const Block & block) override;
-    IndexInfos flushFileImpl() override;
+    void flushFileImpl() override;
 private:
     void closeAndDestroy();
     const String db_path;
@@ -178,12 +182,14 @@ class MergeTreeIndexSSTSetWriterInMemory : public MergeTreeIndexSSTSetWriter
 {
 public:
     explicit MergeTreeIndexSSTSetWriterInMemory(
-        const String & index_path, const MergeTreeDataPartPtr & data_part, const StorageMetadataPtr & metadata_snapshot_);
-
-private:
+        size_t index_bucket_number_,
+        const String & index_path,
+        const MergeTreeDataPartPtr & data_part,
+        const StorageMetadataPtr & metadata_snapshot_);
+protected:
     void processBlock(const Block & block) override;
-    IndexInfos flushFileImpl() override;
-
+    void flushFileImpl() override;
+private:
     std::vector<ColumnString::Ptr> key_holder;
     std::vector<KV> index_keys;
 };

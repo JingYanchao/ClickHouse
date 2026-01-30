@@ -28,8 +28,10 @@ extern const MergeTreeSettingsBool sst_set_index_bucket_number;
 }
 
 MergeTreeIndexSSTSetWriter::MergeTreeIndexSSTSetWriter(
-    const String & index_path, const MergeTreeDataPartPtr & data_part, const StorageMetadataPtr & metadata_snapshot_)
+    size_t index_bucket_number_, const String & index_path, const MergeTreeDataPartPtr & data_part, const StorageMetadataPtr & metadata_snapshot_)
     : part(data_part)
+    , index_path(index_path)
+    , index_bucket_number(index_bucket_number_)
     , metadata_snapshot(metadata_snapshot_)
 {
 }
@@ -37,34 +39,51 @@ MergeTreeIndexSSTSetWriter::MergeTreeIndexSSTSetWriter(
 void MergeTreeIndexSSTSetWriter::write(const Block & block)
 {
     auto block_copy = block;
-    index_sample_block.get
-    index_keys.expression->execute(block_copy);
-    processBlock(block_copy, index_keys);
+    unique_key.expression->execute(block_copy);
+    auto unique_key_block = getBlockAndPermute(block_copy, unique_key.sample_block.getNames(), permutation);
+    ColumnPtr version_column;
+    if (block.has(part->storage.merging_params.version_column))
+    {
+        Names version_column_name{part->storage.merging_params.version_column};
+        auto version_block = getBlockAndPermute(block, version_column_name, permutation);
+        version_column = version_block.getByName(part->storage.merging_params.version_column).column;
+    }
+    else
+    {
+        if (unlikely(part->storage.hasCustomizedVersionColumnForUniqueIndex() || part->info.level != 0))
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Customized version column or non-level 0 part requires explicit version column");
+        version_column = DataTypeUInt64().createColumnConst(block.rows(), part->info.min_block);
+    }
+    Stopwatch watch;
+    processUniqueKeyBlock(unique_key_block, version_column);
+    ProfileEvents::increment(ProfileEvents::UniqueKeyWriterProcessTimeMicroseconds, watch.elapsedMicroseconds());
     advanceRowOffset(block.rows());
 }
 
-std::vector<MergeTreeIndexSSTSetWriter::IndexInfo> MergeTreeIndexSSTSetWriter::flushIndexFile()
+void MergeTreeIndexSSTSetWriter::flushIndexFile(const std::vector<WriteBuffer*> & write_buffers)
 {
-    auto infos = flushFileImpl();
-    return infos;
+    writer = std::make_unique<SstFileWriterImpl>(index_bucket_number, *part, write_buffers);
+    flushFileImpl();
 }
 
 MergeTreeIndexSSTSetWriterPtr createMergeTreeIndexSSTSetWriter(
+    size_t max_rows_sort_in_memory,
+    size_t index_bucket_number,
     const String & index_path,
     const MergeTreeDataPartPtr & data_part,
     const StorageMetadataPtr & metadata_snapshot)
 {
-    if (data_part->rows_count <= max_align_t)
+    if (data_part->rows_count <= max_rows_sort_in_memory)
     {
         LOG_TRACE(getLogger("MergeTreeIndexSSTSetWriter"), "Using sorted unique index writer for insert sink part {}", data_part->name);
         /// Use in-memory unique index writer for insert sink.
-        return std::make_unique<MergeTreeIndexSSTSetWriterInMemory>(index_path, data_part, metadata_snapshot);
+        return std::make_unique<MergeTreeIndexSSTSetWriterInMemory>(index_bucket_number, index_path, data_part, metadata_snapshot);
     }
     else
     {
         LOG_TRACE(getLogger("MergeTreeIndexSSTSetWriter"), "Using RocksDB unique index writer for other cases part {}", data_part->name);
         /// Use RocksDB unique index writer for other cases.
-        return std::make_unique<MergeTreeIndexSSTSetWriterRocksDB>(index_path, data_part, metadata_snapshot);
+        return std::make_unique<MergeTreeIndexSSTSetWriterRocksDB>(index_bucket_number, index_path, data_part, metadata_snapshot);
     }
 }
 
@@ -122,10 +141,10 @@ void MergeTreeIndexSSTSetWriter::processBlockImpl(
         return;
     chassert(out_key_column->empty());
     constructSerializedKey(block.getColumnsWithTypeAndName(), out_key_column);
-    /// Sort the serialized key column for dedeuplicating.
+    /// Sort the serialized key column.
     IColumn::Permutation perm;
-    /// Dedup within the block
-    ColumnStringIterWrapper iter(*out_key_column, perm, row_offset);
+    auto value_column = ColumnString::create();
+    ColumnStringIterWrapper iter(*out_key_column, value_column, perm, row_offset);
     std::string_view last_key = iter.key();
     std::string_view last_value = iter.value();
     iter.next();
@@ -141,7 +160,7 @@ void MergeTreeIndexSSTSetWriter::processBlockImpl(
             last_key = std::move(key);
             last_value = std::move(value);
         }
-        else if (compareKV(last_key, last_value, key, value) > 0)
+        else if (compareKV({last_key, last_value}, {key, value}) > 0)
         {
             last_key = std::move(key);
             last_value = std::move(value);
@@ -149,26 +168,28 @@ void MergeTreeIndexSSTSetWriter::processBlockImpl(
     }
     put_fn(last_key, last_value);
 }
-
-MergeTreeIndexSSTSetWriter::SstFileWriterImpl::SstFileWriterImpl(const IMergeTreeDataPart & data_part)
-    : index_bucket_number((*data_part.storage.getSettings())[MergeTreeSetting::sst_set_index_bucket_number])
+MergeTreeIndexSSTSetWriter::SstFileWriterImpl::SstFileWriterImpl(
+    size_t index_bucket_number_, const IMergeTreeDataPart & data_part, const std::vector<WriteBuffer *> & write_buffers)
+    : index_bucket_number(index_bucket_number_)
     , index_writers(index_bucket_number)
     , index_writers_has_written_key(index_bucket_number, false)
+    , envs(index_bucket_number)
 {
-    rocksdb::Options options;
-    if (data_part.getDataPartStorage().isStoredOnRemoteDisk())
-    {
-        env = createDiskBasedUniqueIndexEnv(data_part.getDataPartStoragePtr());
-        options.env = env.get();
-    }
-    rocksdb::BlockBasedTableOptions table_options;
-    table_options.filter_policy.reset(rocksdb::NewBloomFilterPolicy(12));
-    options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+    if (write_buffers.size() != index_bucket_number)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "write_buffers size {} doesn't match bucket_number {}", write_buffers.size(), index_bucket_number);
+
     for (size_t i = 0; i < index_bucket_number; ++i)
     {
+        envs[i] = createDiskBasedUniqueIndexEnv(data_part.getDataPartStoragePtr(), write_buffers[i]);
+        rocksdb::Options options;
+        options.env = envs[i].get();
+        rocksdb::BlockBasedTableOptions table_options;
+        table_options.filter_policy.reset(rocksdb::NewBloomFilterPolicy(12));
+        options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+
         auto & [fs_path, writer_impl] = index_writers[i];
         writer_impl = std::make_unique<rocksdb::SstFileWriter>(rocksdb::EnvOptions(), options);
-        auto index_sub_path = data_part.getFullUniqueIndexPath(i);
+        auto index_sub_path = getFullUniqueIndexPath(i);
         auto status = writer_impl->Open(index_sub_path);
         if (!status.ok())
             throw Exception(ErrorCodes::CANNOT_OPEN_FILE, "Error while opening file {}: {}", index_sub_path, status.ToString());
@@ -187,60 +208,58 @@ void Writer::put(const std::string_view & key, const std::string_view & value)
     index_writers_has_written_key[bucket] = true;
 }
 
-MergeTreeIndexSSTSetWriter::IndexInfos Writer::finish(size_t num_rows)
+void Writer::finish(size_t num_rows)
 {
     if (num_rows == 0)
     {
         /// Remove the index files if exists.
         for (size_t bucket = 0; bucket < index_bucket_number; ++bucket)
         {
-            auto & [fs_path, writer] = index_writers[bucket];
-            writer.reset();
+            auto & [fs_path, writer_impl] = index_writers[bucket];
+            writer_impl.reset();
             if (0 != unlink(fs_path.c_str()) && errno != ENOENT)
                 ErrnoException::throwFromPath(ErrorCodes::CANNOT_UNLINK, fs_path, "Cannot unlink file {}", fs_path);
         }
-        return {};
+        return;
     }
-    IndexInfos index_infos;
-    index_infos.reserve(index_bucket_number);
+
     for (size_t bucket = 0; bucket < index_bucket_number; ++bucket)
     {
-        auto & [_, writer] = index_writers[bucket];
+        auto & [fs_path, writer_impl] = index_writers[bucket];
         if (!index_writers_has_written_key[bucket])
         {
             /// if there is no key written to bucket i, then we just put a empty key-value pair into it,
             /// as SST file cannot be empty.
-            auto status = writer->Put(rocksdb::Slice(), rocksdb::Slice());
+            auto status = writer_impl->Put(rocksdb::Slice(), rocksdb::Slice());
             if (!status.ok())
                 throw Exception(ErrorCodes::LOGICAL_ERROR, "Failed to write key-value to unique index {}: {}", bucket, status.ToString());
         }
 
         rocksdb::ExternalSstFileInfo file_info;
-        auto status = writer->Finish(&file_info);
+        auto status = writer_impl->Finish(&file_info);
         if (!status.ok())
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Error while finishing file {}: {}", file_info.file_path, status.ToString());
-        IndexInfo index_info;
-        index_info.file_size = file_info.file_size;
-        index_infos.emplace_back(std::move(index_info));
     }
-    return index_infos;
 }
 
-MergeTreeIndexSSTSetWriter::IndexInfos Writer::writeAndFinish(
+void Writer::writeAndFinish(
     InputIterPtr iter, size_t num_rows)
 {
     if (!iter->valid())
-        return finish(num_rows);
+    {
+        finish(num_rows);
+        return;
+    }
     for (; iter->valid(); iter->next())
     {
         put(iter->key(), iter->value());
     }
-    return finish(num_rows);
+    finish(num_rows);
 }
 
 MergeTreeIndexSSTSetWriterRocksDB::MergeTreeIndexSSTSetWriterRocksDB(
-    const String & index_path, const MergeTreeDataPartPtr & data_part, const StorageMetadataPtr & metadata_snapshot_)
-    : MergeTreeIndexSSTSetWriter(index_path, data_part, metadata_snapshot_)
+    size_t index_bucket_number_, const String & index_path_, const MergeTreeDataPartPtr & data_part, const StorageMetadataPtr & metadata_snapshot_)
+    : MergeTreeIndexSSTSetWriter(index_bucket_number_, index_path_, data_part, metadata_snapshot_)
     , db_path(index_path + ".tmp")
 {
     rocksdb::Options options;
@@ -317,9 +336,8 @@ private:
     std::unique_ptr<rocksdb::Iterator> iter;
 };
 
-std::vector<MergeTreeIndexSSTSetWriter::IndexInfo> MergeTreeIndexSSTSetWriterRocksDB::flushFileImpl()
+void MergeTreeIndexSSTSetWriterRocksDB::flushFileImpl()
 {
-    SstFileWriterImpl writer(*part);
     rocksdb::ReadOptions read_options;
     read_options.fill_cache = false;
     read_options.async_io = true;
@@ -330,11 +348,10 @@ std::vector<MergeTreeIndexSSTSetWriter::IndexInfo> MergeTreeIndexSSTSetWriterRoc
     writeBinaryBigEndian(std::numeric_limits<UInt64>::max(), max_version_buf);
     rocksdb::Slice max_version_slice(max_version_buf.str());
     read_options.timestamp = &max_version_slice;
-    auto index_infos = writer.writeAndFinish(
+    writer->writeAndFinish(
         std::make_unique<RocksDBIterWrapper>(db->NewIterator(read_options)),
         row_offset);
     closeAndDestroy();
-    return index_infos;
 }
 
 MergeTreeIndexSSTSetWriterRocksDB::~MergeTreeIndexSSTSetWriterRocksDB()
@@ -366,8 +383,8 @@ void MergeTreeIndexSSTSetWriterRocksDB::closeAndDestroy()
 }
 
 MergeTreeIndexSSTSetWriterInMemory::MergeTreeIndexSSTSetWriterInMemory(
-    const String & index_path, const MergeTreeDataPartPtr & data_part, const StorageMetadataPtr & metadata_snapshot_)
-    : MergeTreeIndexSSTSetWriter(index_path, data_part, metadata_snapshot_)
+    size_t index_bucket_number_, const String & index_path_, const MergeTreeDataPartPtr & data_part, const StorageMetadataPtr & metadata_snapshot_)
+    : MergeTreeIndexSSTSetWriter(index_bucket_number_, index_path_, data_part, metadata_snapshot_)
 {
 }
 
@@ -407,17 +424,15 @@ private:
     ConstIter end;
 };
 
-MergeTreeIndexSSTSetWriterInMemory::IndexInfos MergeTreeIndexSSTSetWriterInMemory::flushFileImpl()
+void MergeTreeIndexSSTSetWriterInMemory::flushFileImpl()
 {
-    SstFileWriterImpl writer(*part);
-
     ::sort(
         index_keys.begin(),
         index_keys.end(),
         [](const KV & a, const KV & b) { return a.first < b.first; });
 
     auto iter = std::make_unique<InMemoryBatchIterWrapper>(index_keys.cbegin(), index_keys.cend());
-    return writer.writeAndFinish(std::move(iter), row_offset);
+    writer->writeAndFinish(std::move(iter), row_offset);
 }
 
 }
