@@ -105,7 +105,7 @@ public:
 
     void write(const Block & block);
     void flushIndexFile(const std::vector<WriteBuffer*> & write_buffers);
-    
+    virtual size_t size() = 0;
     MergeTreeDataPartPtr part;
 protected:
     virtual void processBlock(const Block & block) = 0;
@@ -126,7 +126,11 @@ public:
     class SstFileWriterImpl
     {
     public:
-        explicit SstFileWriterImpl(size_t index_bucket_number_, const IMergeTreeDataPart & part, const std::vector<WriteBuffer*> & write_buffers);
+        explicit SstFileWriterImpl(
+            size_t index_bucket_number_,
+            const String & index_path_,
+            const IMergeTreeDataPart & part,
+            const std::vector<WriteBuffer *> & write_buffers);
         using InputIter = SortedKeyIterator;
         using InputIterPtr = std::unique_ptr<InputIter>;
         /// Put a single key-value pair to the sst file.
@@ -167,6 +171,7 @@ public:
         const MergeTreeDataPartPtr & data_part,
         const StorageMetadataPtr & metadata_snapshot_);
     ~MergeTreeIndexSSTSetWriterRocksDB() override;
+    size_t size() override;
 protected:
     void processBlock(const Block & block) override;
     void flushFileImpl() override;
@@ -186,6 +191,8 @@ public:
         const String & index_path,
         const MergeTreeDataPartPtr & data_part,
         const StorageMetadataPtr & metadata_snapshot_);
+    ~MergeTreeIndexSSTSetWriterInMemory() override;
+    size_t size() override { return index_keys.size(); }
 protected:
     void processBlock(const Block & block) override;
     void flushFileImpl() override;

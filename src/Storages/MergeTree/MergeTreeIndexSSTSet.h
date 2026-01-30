@@ -312,7 +312,7 @@ struct MergeTreeIndexAggregatorSSTSet final : IMergeTreeIndexAggregator
 
     ~MergeTreeIndexAggregatorSSTSet() override = default;
 
-    bool empty() const override { return !size(); }
+    bool empty() const override { return !index_writer->size(); }
     MergeTreeIndexGranulePtr getGranuleAndReset() override;
 
     void update(const Block & block, size_t * pos, size_t limit) override;
