@@ -99,14 +99,15 @@ class MergeTreeIndexSSTSetWriter
 {
 public:
     using KV = std::pair<std::string_view, std::string_view>;
-    explicit MergeTreeIndexSSTSetWriter(
-        size_t index_bucket_number, const String & index_path, const MergeTreeDataPartPtr & data_part, const StorageMetadataPtr & metadata_snapshot_);
+    explicit MergeTreeIndexSSTSetWriter(const String & index_path);
     virtual ~MergeTreeIndexSSTSetWriter() = default;
 
     void write(const Block & block);
-    void flushIndexFile(const std::vector<WriteBuffer*> & write_buffers);
+    void flushIndexFile(const String & index_path, WriteBuffer* write_buffer);
     virtual size_t size() = 0;
-    MergeTreeDataPartPtr part;
+    
+    /// Get the index path
+    const String & getIndexPath() const { return index_path; }
 protected:
     virtual void processBlock(const Block & block) = 0;
     virtual void flushFileImpl() { throw Exception(ErrorCodes::LOGICAL_ERROR, "flushFileImpl is not implemented"); }
@@ -127,34 +128,25 @@ public:
     {
     public:
         explicit SstFileWriterImpl(
-            size_t index_bucket_number_,
             const String & index_path_,
-            const IMergeTreeDataPart & part,
-            const std::vector<WriteBuffer *> & write_buffers);
+            const IMergeTreeDataPart & part, WriteBuffer * buf);
         using InputIter = SortedKeyIterator;
         using InputIterPtr = std::unique_ptr<InputIter>;
         /// Put a single key-value pair to the sst file.
         void put(const std::string_view & key, const std::string_view & value);
         /// Consume the iterator and write to the sst file.
         /// Deduplicate the unique key if needed.
-        void writeAndFinish(InputIterPtr iter, size_t num_rows);
-        void finish(size_t num_rows);
+        void writeAndFinish(InputIterPtr iter);
+        void finish();
     private:
-        using WriterImpl = rocksdb::SstFileWriter;
-        using WriterImplPtr = std::unique_ptr<WriterImpl>;
-        using WriterImpls = std::vector<std::pair<String, WriterImplPtr>>;
-        std::hash<InputIter::Key> hash_func;
-
-        const size_t index_bucket_number;
-        WriterImpls index_writers;
-        std::vector<bool> index_writers_has_written_key;
-        std::vector<std::unique_ptr<rocksdb::Env>> envs;
+        using WriterImplPtr = std::unique_ptr<rocksdb::SstFileWriter>;
+        WriterImplPtr index_writer;
+        std::unique_ptr<rocksdb::Env> env;
     };
 protected:
     std::unique_ptr<SstFileWriterImpl> writer;
-    const size_t index_bucket_number;
-    const String index_path;
     StorageMetadataPtr metadata_snapshot;
+    const String index_path;
     Block index_sample_block;
     UInt32 row_offset = 0;
 };
@@ -166,10 +158,7 @@ class MergeTreeIndexSSTSetWriterRocksDB : public MergeTreeIndexSSTSetWriter
 {
 public:
     explicit MergeTreeIndexSSTSetWriterRocksDB(
-        size_t index_bucket_number,
-        const String & index_path,
-        const MergeTreeDataPartPtr & data_part,
-        const StorageMetadataPtr & metadata_snapshot_);
+        const String & index_path_);
     ~MergeTreeIndexSSTSetWriterRocksDB() override;
     size_t size() override;
 protected:
@@ -187,10 +176,7 @@ class MergeTreeIndexSSTSetWriterInMemory : public MergeTreeIndexSSTSetWriter
 {
 public:
     explicit MergeTreeIndexSSTSetWriterInMemory(
-        size_t index_bucket_number_,
-        const String & index_path,
-        const MergeTreeDataPartPtr & data_part,
-        const StorageMetadataPtr & metadata_snapshot_);
+        const String & index_path_);
     ~MergeTreeIndexSSTSetWriterInMemory() override;
     size_t size() override { return index_keys.size(); }
 protected:
@@ -200,5 +186,9 @@ private:
     std::vector<ColumnString::Ptr> key_holder;
     std::vector<KV> index_keys;
 };
+
+MergeTreeIndexSSTSetWriterPtr createMergeTreeIndexSSTSetWriter(
+    size_t max_rows_sort_in_memory,
+    const String & index_path);
 
 }

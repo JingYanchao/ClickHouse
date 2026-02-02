@@ -1,98 +1,138 @@
-#include <Storages/MergeTree/MergeTreeIndexSSTSet.h>
-
-#include <Common/FieldAccurateComparison.h>
-#include <Common/quoteString.h>
-
 #include <DataTypes/IDataType.h>
+#include <Storages/MergeTree/MergeTreeIndexSSTSet.h>
+#include <Storages/MergeTree/MergeTreeIndexSSTSetWriter.h>
 
 #include <Interpreters/ExpressionActions.h>
 #include <Interpreters/ExpressionAnalyzer.h>
 #include <Interpreters/PreparedSets.h>
-
-#include <Parsers/ASTIdentifier.h>
-#include <Parsers/ASTLiteral.h>
-#include <Parsers/ASTSelectQuery.h>
-
 #include <Functions/FunctionFactory.h>
-#include <Functions/IFunctionAdaptors.h>
 #include <Functions/indexHint.h>
 #include <Planner/PlannerActionsVisitor.h>
+#include <Storages/MergeTree/MergeTreeIndexSet.h>
+#include <IO/WriteBufferFromFile.h>
+#include <IO/copyData.h>
+#include <rocksdb/sst_file_reader.h>
+#include <filesystem>
+#include <chrono>
 
 namespace DB
 {
 
 namespace ErrorCodes
 {
-    extern const int LOGICAL_ERROR;
-    extern const int INCORRECT_QUERY;
+extern const int LOGICAL_ERROR;
+extern const int INCORRECT_QUERY;
+}
+
+MergeTreeIndexGranuleSSTSet::MergeTreeIndexGranuleSSTSet(const String & index_name_, const Block & index_sample_block_)
+    : index_name(index_name_)
+    , block(index_sample_block_.cloneEmpty())
+    , max_rows_sort_in_memory(0)
+    , index_writer(nullptr)
+{
 }
 
 MergeTreeIndexGranuleSSTSet::MergeTreeIndexGranuleSSTSet(
-    const String & index_name_,
-    const Block & index_sample_block_,
-    size_t max_rows_sort_in_memory_)
+    const String & index_name_, const Block & index_sample_block_, MutableColumns && columns_)
     : index_name(index_name_)
-    , block(index_sample_block_.cloneEmpty())
-    , max_rows_sort_in_memory(max_rows_sort_in_memory_)
+    , block(index_sample_block_.cloneWithColumns(std::move(columns_)))
+    , max_rows_sort_in_memory(0)
+    , index_writer(nullptr)
 {
-    size_t num_columns = block.columns();
 }
 
-void MergeTreeIndexGranuleSSTSet::serializeBinary(WriteBuffer & /*ostr*/) const
+MergeTreeIndexGranuleSSTSet::MergeTreeIndexGranuleSSTSet(
+    const String & index_name_, const Block & index_sample_block_, MutableColumns && columns_, MergeTreeIndexSSTSetWriter * index_writer_)
+    : index_name(index_name_)
+    , block(index_sample_block_.cloneWithColumns(std::move(columns_)))
+    , max_rows_sort_in_memory(0)
+    , index_writer(index_writer_)
 {
-    /// SST Set index uses RocksDB SST file format and is written through MergeTreeIndexSSTSetWriter.
-    /// It does not use the standard serializeBinary mechanism.
-    throw Exception(
-        ErrorCodes::LOGICAL_ERROR,
-        "Index with type 'sst_set' cannot be serialized with serializeBinary. "
-        "SST Set index data is written directly to SST files via MergeTreeIndexSSTSetWriter.");
 }
 
-void MergeTreeIndexGranuleSSTSet::deserializeBinary(ReadBuffer & /*istr*/, MergeTreeIndexVersion /*version*/)
+void MergeTreeIndexGranuleSSTSet::serializeBinary(WriteBuffer & ostr) const
 {
-    /// SST Set index uses RocksDB SST file format and is read through RocksDB API.
-    /// It does not use the standard deserializeBinary mechanism.
-    throw Exception(
-        ErrorCodes::LOGICAL_ERROR,
-        "Index with type 'sst_set' cannot be deserialized with deserializeBinary. "
-        "SST Set index data is read directly from SST files via RocksDB API.");
+    if (index_writer)
+    {
+        /// Get index_path from the writer
+        const auto & index_path = index_writer->getIndexPath();
+        index_writer->flushIndexFile(index_path, &ostr);
+    }
 }
 
 
-MergeTreeIndexBulkGranulesSSTSet::MergeTreeIndexBulkGranulesSSTSet(
-    const Block & index_sample_block_)
-    : block(index_sample_block_.cloneEmpty()),
-    block_for_reading(index_sample_block_.cloneEmpty())
+void MergeTreeIndexGranuleSSTSet::deserializeBinary(ReadBuffer & /* istr */, MergeTreeIndexVersion version)
+{
+    if (version != 1)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Unknown index version {}.", version);
+
+    /// This method should not be called for SST Set index
+    /// Use deserializeBinaryWithMultipleStreams instead
+    throw Exception(ErrorCodes::LOGICAL_ERROR, "deserializeBinary should not be called for SST Set index");
+}
+
+void MergeTreeIndexGranuleSSTSet::deserializeBinaryWithMultipleStreams(
+    MergeTreeIndexInputStreams & /* streams */, 
+    MergeTreeIndexDeserializationState & state)
+{
+    /// Get the SST file path from the data part
+    const auto & data_part_storage = state.part.getDataPartStorage();
+    String sst_file_name = index_name + ".idx";
+    
+    /// Check if the SST file exists
+    if (!data_part_storage.existsFile(sst_file_name))
+    {
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "SST index file {} not found in part {}", 
+                        sst_file_name, data_part_storage.getFullPath());
+    }
+    
+    /// Get the full path to the SST file
+    String sst_file_path = std::string(std::filesystem::path(data_part_storage.getFullPath()) / sst_file_name);
+    
+    /// Use RocksDB SstFileReader to read the SST file directly
+    rocksdb::Options options;
+    rocksdb::SstFileReader sst_reader(options);
+    
+    auto status = sst_reader.Open(sst_file_path);
+    if (!status.ok())
+    {
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Failed to open SST file {}: {}", 
+                        sst_file_path, status.ToString());
+    }
+    
+    /// Read all key-value pairs into memory
+    std::unique_ptr<rocksdb::Iterator> iter(sst_reader.NewIterator(rocksdb::ReadOptions()));
+    index_data.clear();
+    
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next())
+    {
+        std::string key = iter->key().ToString();
+        std::string value = iter->value().ToString();
+        index_data[key] = value;
+    }
+    
+    if (!iter->status().ok())
+    {
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Error iterating SST file {}: {}", 
+                        sst_file_path, iter->status().ToString());
+    }
+}
+
+
+MergeTreeIndexBulkGranulesSSTSet::MergeTreeIndexBulkGranulesSSTSet(const Block & index_sample_block_)
+    : block(index_sample_block_.cloneEmpty())
+    , block_for_reading(index_sample_block_.cloneEmpty())
 {
     size_t num_columns = block.columns();
     serializations.resize(num_columns);
     for (size_t i = 0; i < num_columns; ++i)
         serializations[i] = block.getByPosition(i).type->getDefaultSerialization();
 
-    block.insert(ColumnWithTypeAndName
-    {
-        ColumnUInt64::create(),
-        std::make_shared<DataTypeUInt64>(),
-        "_granule_num"
-    });
+    block.insert(ColumnWithTypeAndName{ColumnUInt64::create(), std::make_shared<DataTypeUInt64>(), "_granule_num"});
 }
 
-
-void MergeTreeIndexBulkGranulesSSTSet::deserializeBinary(size_t granule_num, ReadBuffer & istr, MergeTreeIndexVersion version)
-{
-    if (version != 1)
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "Unknown index version {}.", version);
-
-    if (empty)
-    {
-        min_granule = granule_num;
-        empty = false;
-    }
-    max_granule = granule_num;
-}
-
-
-MergeTreeIndexAggregatorSSTSet::MergeTreeIndexAggregatorSSTSet(const MergeTreeDataPartPtr & data_part, const String & index_name_, const Block & index_sample_block_, size_t max_rows_sort_in_memory_)
+MergeTreeIndexAggregatorSSTSet::MergeTreeIndexAggregatorSSTSet(
+    const String & index_name_, const Block & index_sample_block_, size_t max_rows_sort_in_memory_)
     : index_name(index_name_)
     , max_rows_sort_in_memory(max_rows_sort_in_memory_)
     , index_sample_block(index_sample_block_)
@@ -107,41 +147,53 @@ MergeTreeIndexAggregatorSSTSet::MergeTreeIndexAggregatorSSTSet(const MergeTreeDa
         column_ptrs.emplace_back(materialized_columns.back().get());
     }
 
-    data.init(ClearableSetVariants::chooseMethod(column_ptrs, key_sizes));
-    index_writer = std::make_shared<MergeTreeIndexSSTSetWriter>(index_sample_block, max_rows_sort_in_memory);
-
+    // TODO: Get index path from data part - need to pass data_part to constructor
+    // For now, this will be set when the aggregator is properly initialized
+    // String index_path = data_part->getDataPartStorage().getFullPath() + index_name_ + ".idx";
+    // index_writer = createMergeTreeIndexSSTSetWriter(max_rows_sort_in_memory, index_path, data_part);
     columns = index_sample_block.cloneEmptyColumns();
 }
 
 void MergeTreeIndexAggregatorSSTSet::update(const Block & block, size_t * pos, size_t limit)
 {
     if (*pos >= block.rows())
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "The provided position is not less than the number of block rows. "
-                "Position: {}, Block rows: {}.", *pos, block.rows());
+        throw Exception(
+            ErrorCodes::LOGICAL_ERROR,
+            "The provided position is not less than the number of block rows. "
+            "Position: {}, Block rows: {}.",
+            *pos,
+            block.rows());
 
     size_t rows_read = std::min(limit, block.rows() - *pos);
+
+    // Extract the columns for the index
+    Block index_block;
+    for (size_t i = 0; i < index_sample_block.columns(); ++i)
+    {
+        const auto & column_name = index_sample_block.getByPosition(i).name;
+        if (block.has(column_name))
+        {
+            auto column = block.getByName(column_name).column;
+            // Extract the range [*pos, *pos + rows_read)
+            auto cut_column = column->cut(*pos, rows_read);
+            index_block.insert(ColumnWithTypeAndName(cut_column, index_sample_block.getByPosition(i).type, column_name));
+        }
+    }
+
+    // Write the block to the index writer
+    if (index_block.rows() > 0)
+    {
+        index_writer->write(index_block);
+    }
 
     *pos += rows_read;
 }
 
 MergeTreeIndexGranulePtr MergeTreeIndexAggregatorSSTSet::getGranuleAndReset()
 {
-    auto granule = std::make_shared<MergeTreeIndexGranuleSSTSet>(index_name, index_sample_block);
-
-    switch (data.type)
-    {
-        case ClearableSetVariants::Type::EMPTY:
-            break;
-#define M(NAME) \
-        case ClearableSetVariants::Type::NAME: \
-            data.NAME->data.clear(); \
-            break;
-        APPLY_FOR_SET_VARIANTS(M)
-#undef M
-    }
-
+    // Create a granule with the index_writer reference so it can flush data when serialized
+    auto granule = std::make_shared<MergeTreeIndexGranuleSSTSet>(index_name, index_sample_block, std::move(columns), index_writer.get());
     columns = index_sample_block.cloneEmptyColumns();
-
     return granule;
 }
 
@@ -152,7 +204,7 @@ KeyCondition buildCondition(const IndexDescription & index, const ActionsDAGWith
 
 MergeTreeIndexGranulePtr MergeTreeIndexSSTSet::createIndexGranule() const
 {
-    return std::make_shared<MergeTreeIndexGranuleSSTSet>(index.name, index.sample_block, max_rows);
+    return std::make_shared<MergeTreeIndexGranuleSSTSet>(index.name, index.sample_block);
 }
 
 MergeTreeIndexBulkGranulesPtr MergeTreeIndexSSTSet::createIndexBulkGranules() const
@@ -162,20 +214,19 @@ MergeTreeIndexBulkGranulesPtr MergeTreeIndexSSTSet::createIndexBulkGranules() co
 
 MergeTreeIndexAggregatorPtr MergeTreeIndexSSTSet::createIndexAggregator() const
 {
-    return std::make_shared<MergeTreeIndexAggregatorSSTSet>(index.name, index.sample_block, max_rows);
+    return std::make_shared<MergeTreeIndexAggregatorSSTSet>(index.name, index.sample_block, max_rows_sort_in_memory);
 }
 
-MergeTreeIndexConditionPtr MergeTreeIndexSSTSet::createIndexCondition(
-    const ActionsDAG::Node * predicate, ContextPtr context) const
+MergeTreeIndexConditionPtr MergeTreeIndexSSTSet::createIndexCondition(const ActionsDAG::Node * predicate, ContextPtr context) const
 {
     ActionsDAGWithInversionPushDown filter_dag(predicate, context);
-    return std::make_shared<MergeTreeIndexConditionSet>(max_rows, filter_dag, context, index);
+    return std::make_shared<MergeTreeIndexConditionSet>(max_rows_sort_in_memory, filter_dag, context, index);
 }
 
-MergeTreeIndexPtr setIndexCreator(const IndexDescription & index)
+MergeTreeIndexPtr SSTSetIndexCreator(const IndexDescription & index)
 {
-    size_t max_rows = index.arguments[0].safeGet<size_t>();
-    return std::make_shared<MergeTreeIndexSSTSet>(index, max_rows);
+    size_t max_rows_sort_in_memory = index.arguments[0].safeGet<size_t>();
+    return std::make_shared<MergeTreeIndexSSTSet>(index, max_rows_sort_in_memory);
 }
 
 }

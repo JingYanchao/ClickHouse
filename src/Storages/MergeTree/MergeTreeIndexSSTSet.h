@@ -7,7 +7,6 @@
 #include <Storages/MergeTree/IDataPartStorage.h>
 #include <Storages/MergeTree/MergeTreeIndexSSTSetWriter.h>
 #include <IO/WriteBuffer.h>
-#include <unordered_map>
 
 namespace DB
 {
@@ -162,7 +161,7 @@ public:
         const rocksdb::IOOptions &,
         rocksdb::IODebugContext *) override
     {
-        if (storage->exists(f))
+        if (storage->existsFile(f))
             return rocksdb::IOStatus::OK();
         else
             return rocksdb::IOStatus::NotFound();
@@ -272,8 +271,16 @@ struct MergeTreeIndexGranuleSSTSet final : public IMergeTreeIndexGranule
         const Block & index_sample_block_,
         MutableColumns && columns_);
 
+    MergeTreeIndexGranuleSSTSet(
+        const String & index_name_,
+        const Block & index_sample_block_,
+        MutableColumns && columns_,
+        MergeTreeIndexSSTSetWriter * index_writer_);
+
     void serializeBinary(WriteBuffer & ostr) const override;
+    void serializeBinaryWithMultipleStreams(MergeTreeIndexOutputStreams & streams) const override;
     void deserializeBinary(ReadBuffer & istr, MergeTreeIndexVersion version) override;
+    void deserializeBinaryWithMultipleStreams(MergeTreeIndexInputStreams & streams, MergeTreeIndexDeserializationState & state) override;
 
     size_t size() const { return block.rows(); }
     bool empty() const override { return !size(); }
@@ -285,6 +292,11 @@ struct MergeTreeIndexGranuleSSTSet final : public IMergeTreeIndexGranule
 
     Block block;
     const size_t max_rows_sort_in_memory;
+    MergeTreeIndexSSTSetWriter * index_writer;  // Non-owning pointer to the writer
+    
+    /// For reading: store the SST file content in memory
+    /// This will be populated by deserializeBinary
+    std::unordered_map<std::string, std::string> index_data;  // key -> value mapping
 };
 
 
@@ -305,7 +317,6 @@ struct MergeTreeIndexBulkGranulesSSTSet final : public IMergeTreeIndexBulkGranul
 struct MergeTreeIndexAggregatorSSTSet final : IMergeTreeIndexAggregator
 {
     explicit MergeTreeIndexAggregatorSSTSet(
-        const MergeTreeDataPartPtr & data_part,
         const String & index_name_,
         const Block & index_sample_block_,
         size_t max_rows_sort_in_memory);
@@ -320,7 +331,6 @@ struct MergeTreeIndexAggregatorSSTSet final : IMergeTreeIndexAggregator
 private:
     String index_name;
     size_t max_rows_sort_in_memory;
-    size_t index_bucket_number;
     Block index_sample_block;
     MergeTreeIndexSSTSetWriterPtr index_writer;
     Sizes key_sizes;
@@ -332,14 +342,10 @@ class MergeTreeIndexSSTSet final : public IMergeTreeIndex
 {
 public:
     MergeTreeIndexSSTSet(
-        const MergeTreeDataPartPtr & data_part_,
         const IndexDescription & index_,
-        size_t index_bucket_number_,
         size_t max_rows_sort_in_memory_)
         : IMergeTreeIndex(index_)
-        , data_part(data_part_)
         , max_rows_sort_in_memory(max_rows_sort_in_memory_)
-        , index_bucket_number(index_bucket_number_)
     {}
 
     ~MergeTreeIndexSSTSet() override = default;
@@ -356,9 +362,7 @@ public:
     MergeTreeIndexConditionPtr createIndexCondition(
         const ActionsDAG::Node * predicate, ContextPtr context) const override;
 private:
-    MergeTreeDataPartPtr data_part;
     size_t max_rows_sort_in_memory;
-    size_t index_bucket_number;
 };
 
 }
