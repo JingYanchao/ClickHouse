@@ -99,7 +99,7 @@ class MergeTreeIndexSSTSetWriter
 {
 public:
     using KV = std::pair<std::string_view, std::string_view>;
-    explicit MergeTreeIndexSSTSetWriter(const String & index_path);
+    explicit MergeTreeIndexSSTSetWriter(const String & index_path, size_t max_rows_sort_in_memory_);
     virtual ~MergeTreeIndexSSTSetWriter() = default;
 
     void write(const Block & block);
@@ -128,8 +128,7 @@ public:
     {
     public:
         explicit SstFileWriterImpl(
-            const String & index_path_,
-            const IMergeTreeDataPart & part, WriteBuffer * buf);
+            const String & index_path_, WriteBuffer * buf);
         using InputIter = SortedKeyIterator;
         using InputIterPtr = std::unique_ptr<InputIter>;
         /// Put a single key-value pair to the sst file.
@@ -144,6 +143,7 @@ public:
         std::unique_ptr<rocksdb::Env> env;
     };
 protected:
+    size_t max_rows_sort_in_memory;
     std::unique_ptr<SstFileWriterImpl> writer;
     StorageMetadataPtr metadata_snapshot;
     const String index_path;
@@ -158,7 +158,7 @@ class MergeTreeIndexSSTSetWriterRocksDB : public MergeTreeIndexSSTSetWriter
 {
 public:
     explicit MergeTreeIndexSSTSetWriterRocksDB(
-        const String & index_path_);
+        const String & index_path_, size_t max_rows_sort_in_memory_);
     ~MergeTreeIndexSSTSetWriterRocksDB() override;
     size_t size() override;
 protected:
@@ -176,7 +176,8 @@ class MergeTreeIndexSSTSetWriterInMemory : public MergeTreeIndexSSTSetWriter
 {
 public:
     explicit MergeTreeIndexSSTSetWriterInMemory(
-        const String & index_path_);
+        const String & index_path_,
+        size_t max_rows_sort_in_memory);
     ~MergeTreeIndexSSTSetWriterInMemory() override;
     size_t size() override { return index_keys.size(); }
 protected:

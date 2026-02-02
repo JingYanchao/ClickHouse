@@ -142,6 +142,9 @@ MergeTreeIndexFactory::MergeTreeIndexFactory()
     registerCreator("set", setIndexCreator);
     registerValidator("set", setIndexValidator);
 
+    registerCreator("sst_set", SSTSetIndexCreator);
+    registerValidator("sst_set", SSTSetIndexValidator);
+
     registerCreator("ngrambf_v1", bloomFilterIndexTextCreator);
     registerValidator("ngrambf_v1", bloomFilterIndexTextValidator);
 

@@ -384,6 +384,9 @@ void minmaxIndexValidator(const IndexDescription & index, bool attach);
 MergeTreeIndexPtr setIndexCreator(const IndexDescription & index);
 void setIndexValidator(const IndexDescription & index, bool attach);
 
+MergeTreeIndexPtr SSTSetIndexCreator(const IndexDescription & index);
+void SSTSetIndexValidator(const IndexDescription & index, bool attach);
+
 MergeTreeIndexPtr bloomFilterIndexTextCreator(const IndexDescription & index);
 void bloomFilterIndexTextValidator(const IndexDescription & index, bool attach);
 

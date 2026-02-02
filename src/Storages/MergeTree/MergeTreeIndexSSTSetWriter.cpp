@@ -21,12 +21,9 @@ namespace ErrorCodes
     extern const int ROCKSDB_ERROR;
 }
 
-/// Temporary RocksDB path suffix for deduplication
-static constexpr std::string_view ROCKSDB_TEMP_SUFFIX = ".tmp";
-
 MergeTreeIndexSSTSetWriter::MergeTreeIndexSSTSetWriter(
-    const String & index_path)
-    : index_path(index_path)
+    const String & index_path_, size_t max_rows_sort_in_memory_)
+    : max_rows_sort_in_memory(max_rows_sort_in_memory_), index_path(index_path_)
 {
 }
 
@@ -36,28 +33,17 @@ void MergeTreeIndexSSTSetWriter::write(const Block & block)
     advanceRowOffset(block.rows());
 }
 
-void MergeTreeIndexSSTSetWriter::flushIndexFile(const String & index_path, WriteBuffer* write_buffer)
+void MergeTreeIndexSSTSetWriter::flushIndexFile(const String & index_path_, WriteBuffer* write_buffer)
 {
-    writer = std::make_unique<SstFileWriterImpl>(index_path, *part, write_buffer);
+    writer = std::make_unique<SstFileWriterImpl>(index_path_, write_buffer);
     flushFileImpl();
 }
 
 MergeTreeIndexSSTSetWriterPtr createMergeTreeIndexSSTSetWriter(
-    size_t max_rows_sort_in_memory,
+    size_t max_rows_sort_in_memory_,
     const String & index_path)
 {
-    if (data_part->rows_count <= max_rows_sort_in_memory)
-    {
-        LOG_TRACE(getLogger("MergeTreeIndexSSTSetWriter"), "Using sorted unique index writer for insert sink part {}", data_part->name);
-        /// Use in-memory unique index writer for insert sink.
-        return std::make_unique<MergeTreeIndexSSTSetWriterInMemory>(index_path);
-    }
-    else
-    {
-        LOG_TRACE(getLogger("MergeTreeIndexSSTSetWriter"), "Using RocksDB unique index writer for other cases part {}", data_part->name);
-        /// Use RocksDB unique index writer for other cases.
-        return std::make_unique<MergeTreeIndexSSTSetWriterRocksDB>(index_path);
-    }
+    return std::make_unique<MergeTreeIndexSSTSetWriterInMemory>(index_path, max_rows_sort_in_memory_);
 }
 
 void MergeTreeIndexSSTSetWriter::constructSerializedKey(const ColumnsWithTypeAndName & arguments, ColumnString::MutablePtr & out_key_column) const
@@ -143,38 +129,19 @@ void MergeTreeIndexSSTSetWriter::processBlockImpl(
     put_fn(last_key, last_value);
 }
 
-static String getIndexBucketPath(const String & index_path, size_t bucket_id)
-{
-    /// Convert "sst.idx" to "sst-{bucket_id}.idx"
-    /// Find the last dot to locate the extension
-    auto dot_pos = index_path.find_last_of('.');
-    if (dot_pos == String::npos)
-    {
-        /// No extension found, just append the bucket_id
-        return fmt::format("{}-{}", index_path, bucket_id);
-    }
-    else
-    {
-        /// Insert the bucket_id before the extension
-        String base = index_path.substr(0, dot_pos);
-        String extension = index_path.substr(dot_pos);
-        return fmt::format("{}-{}{}", base, bucket_id, extension);
-    }
-}
-
 MergeTreeIndexSSTSetWriter::SstFileWriterImpl::SstFileWriterImpl(
-    const String & index_path, const IMergeTreeDataPart & data_part, WriteBuffer * write_buffers)
+    const String & index_path_, WriteBuffer * write_buffers)
 {
-    env = createDiskBasedUniqueIndexEnv(data_part.getDataPartStoragePtr(), write_buffers);
+    env = createWriteSSTFileEnv(write_buffers);
     rocksdb::Options options;
     options.env = env.get();
     rocksdb::BlockBasedTableOptions table_options;
     table_options.filter_policy.reset(rocksdb::NewBloomFilterPolicy(12));
     options.table_factory.reset(NewBlockBasedTableFactory(table_options));
     index_writer = std::make_unique<rocksdb::SstFileWriter>(rocksdb::EnvOptions(), options);
-    auto status = index_writer->Open(index_path);
+    auto status = index_writer->Open(index_path_);
     if (!status.ok())
-        throw Exception(ErrorCodes::CANNOT_OPEN_FILE, "Error while opening file {}: {}", index_path, status.ToString());
+        throw Exception(ErrorCodes::CANNOT_OPEN_FILE, "Error while opening file {}: {}", index_path_, status.ToString());
 }
 
 using Writer = MergeTreeIndexSSTSetWriter::SstFileWriterImpl;
@@ -210,8 +177,8 @@ void Writer::writeAndFinish(
 }
 
 MergeTreeIndexSSTSetWriterRocksDB::MergeTreeIndexSSTSetWriterRocksDB(
-    const String & index_path_)
-    : MergeTreeIndexSSTSetWriter(index_path_)
+    const String & index_path_, size_t max_rows_sort_in_memory_)
+    : MergeTreeIndexSSTSetWriter(index_path_, max_rows_sort_in_memory_)
     , db_path(index_path_ + ".tmp")
 {
     rocksdb::Options options;
@@ -346,8 +313,8 @@ size_t MergeTreeIndexSSTSetWriterRocksDB::size()
 }
 
 MergeTreeIndexSSTSetWriterInMemory::MergeTreeIndexSSTSetWriterInMemory(
-    const String & index_path_)
-    : MergeTreeIndexSSTSetWriter(index_path_)
+    const String & index_path_, size_t max_rows_sort_in_memory_)
+    : MergeTreeIndexSSTSetWriter(index_path_, max_rows_sort_in_memory_)
 {
 }
 
