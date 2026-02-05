@@ -1,6 +1,7 @@
 #include <DataTypes/DataTypeTuple.h>
 #include <Columns/ColumnTuple.h>
 
+#include <Columns/ColumnAggregateFunction.h>
 #include <Columns/ColumnCompressed.h>
 #include <Columns/IColumnImpl.h>
 #include <Core/Field.h>
@@ -181,8 +182,14 @@ bool ColumnTuple::isDefaultAt(size_t n) const
 {
     const size_t tuple_size = columns.size();
     for (size_t i = 0; i < tuple_size; ++i)
+    {
+        /// ColumnAggregateFunction doesn't support isDefaultAt, treat it as non-default
+        if (typeid_cast<const ColumnAggregateFunction *>(columns[i].get()))
+            return false;
+        
         if (!columns[i]->isDefaultAt(n))
             return false;
+    }
     return true;
 }
 

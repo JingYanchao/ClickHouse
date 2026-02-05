@@ -19,6 +19,43 @@ AggregatingSortedAlgorithm::ColumnsDefinition::ColumnsDefinition() = default;
 AggregatingSortedAlgorithm::ColumnsDefinition::ColumnsDefinition(ColumnsDefinition &&) noexcept = default;
 AggregatingSortedAlgorithm::ColumnsDefinition::~ColumnsDefinition() = default;
 
+static void tryDefineSubColumns(AggregatingSortedAlgorithm::ColumnsDefinition & def, const ColumnWithTypeAndName & column, size_t column_number)
+{
+    auto subcolumn_names = column.type->getSubcolumnNames();
+    for (size_t j = 0; j < subcolumn_names.size(); ++j)
+    {
+        const auto & subcolumn_name = subcolumn_names[j];
+        auto subcolumn_type = column.type->getSubcolumnType(subcolumn_name);
+        if (!subcolumn_type)
+            continue;
+
+        if (const auto * simple = dynamic_cast<const DataTypeCustomSimpleAggregateFunction *>(subcolumn_type->getCustomName()))
+        {
+            auto function = simple->getFunction();
+            /// if subcolumn contains LowCardinality, we skip it
+            const auto nested_type = recursiveRemoveLowCardinality(subcolumn_type);
+            if (!nested_type->equals(*subcolumn_type))
+                continue;
+
+            AggregatingSortedAlgorithm::SimpleAggregateDescription subcolumn_desc(function, column_number, nullptr, subcolumn_type);
+            if (subcolumn_desc.function->allocatesMemoryInArena())
+                def.allocates_memory_in_arena = true;
+            subcolumn_desc.subcolumn_description.parent_data_type = column.type;
+            subcolumn_desc.subcolumn_description.subcolumn_name = subcolumn_name;
+            subcolumn_desc.subcolumn_description.is_subcolumn = true;
+            def.columns_to_simple_aggregate.emplace_back(std::move(subcolumn_desc));
+        }
+        else if (dynamic_cast<const DataTypeAggregateFunction *>(subcolumn_type.get()))
+        {
+            AggregatingSortedAlgorithm::AggregateDescription subcolumn_desc(column_number);
+            subcolumn_desc.subcolumn_description.parent_data_type = column.type;
+            subcolumn_desc.subcolumn_description.subcolumn_name = subcolumn_name;
+            subcolumn_desc.subcolumn_description.is_subcolumn = true;
+            def.columns_to_aggregate.emplace_back(std::move(subcolumn_desc));
+        }
+    }
+}
+
 static AggregatingSortedAlgorithm::ColumnsDefinition defineColumns(
     const Block & header, const SortDescription & description)
 {
@@ -34,7 +71,10 @@ static AggregatingSortedAlgorithm::ColumnsDefinition defineColumns(
         if (!dynamic_cast<const DataTypeAggregateFunction *>(column.type.get())
             && !dynamic_cast<const DataTypeCustomSimpleAggregateFunction *>(column.type->getCustomName()))
         {
+            /// This is a non-aggregate column (but may have aggregate subcolumns)
             def.column_numbers_not_to_aggregate.push_back(i);
+            /// Check and define if this column has aggregate subcolumns
+            tryDefineSubColumns(def, column, i);
             continue;
         }
 
@@ -178,7 +218,14 @@ void AggregatingSortedAlgorithm::AggregatingMergedData::startGroup(const ColumnR
 
     /// Add the empty aggregation state to the aggregate columns. The state will be updated in the `addRow` function.
     for (auto & column_to_aggregate : def.columns_to_aggregate)
+    {
+        // For subcolumns, when parent column inserts data, subcolumn size automatically increases
+        // We need to remove the automatically added row before inserting our default state
+        if (column_to_aggregate.subcolumn_description.is_subcolumn && !column_to_aggregate.column->empty())
+            column_to_aggregate.column->popBack(1);
+        
         column_to_aggregate.column->insertDefault();
+    }
 
     /// Reset simple aggregation states for next row
     for (auto & desc : def.columns_to_simple_aggregate)
@@ -206,6 +253,9 @@ void AggregatingSortedAlgorithm::AggregatingMergedData::finishGroup()
     /// Write the simple aggregation result for the current group.
     for (auto & desc : def.columns_to_simple_aggregate)
     {
+        /// Remove the last row Before inserting the result. Because parent column may have already copy data from source column。
+        if (desc.subcolumn_description.is_subcolumn && desc.column->size() > 0)
+            desc.column->popBack(1);
         desc.function->insertResultInto(desc.state.data(), *desc.column, def.arena.get());
         desc.destroyState();
     }
@@ -222,12 +272,35 @@ void AggregatingSortedAlgorithm::AggregatingMergedData::addRow(SortCursor & curs
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't add a row to the group because it was not started.");
 
     for (auto & desc : def.columns_to_aggregate)
-        desc.column->insertMergeFrom(*cursor->all_columns[desc.column_number], cursor->getRow());
+    {
+        if (!desc.subcolumn_description.is_subcolumn)
+        {
+            desc.column->insertMergeFrom(*cursor->all_columns[desc.column_number], cursor->getRow());
+        }
+        else
+        {
+            const auto *input_subcolumn
+                = desc.subcolumn_description.parent_data_type
+                      ->getSubcolumn(desc.subcolumn_description.subcolumn_name, cursor->all_columns[desc.column_number]->getPtr())
+                      .get();
+            desc.column->insertMergeFrom(*input_subcolumn, cursor->getRow());
+        }
+    }
 
     for (auto & desc : def.columns_to_simple_aggregate)
     {
-        auto & col = cursor->all_columns[desc.column_number];
-        desc.add_function(desc.function.get(), desc.state.data(), &col, cursor->getRow(), def.arena.get());
+        if (!desc.subcolumn_description.is_subcolumn)
+        {
+            auto & col = cursor->all_columns[desc.column_number];
+            desc.add_function(desc.function.get(), desc.state.data(), &col, cursor->getRow(), def.arena.get());
+        }
+        else
+        {
+            auto subcolumn = desc.subcolumn_description.parent_data_type->getSubcolumn(
+                desc.subcolumn_description.subcolumn_name, cursor->all_columns[desc.column_number]->getPtr());
+            const IColumn * column_ptr = subcolumn.get();
+            desc.add_function(desc.function.get(), desc.state.data(), &column_ptr, cursor->getRow(), def.arena.get());
+        }
     }
 }
 
@@ -247,10 +320,31 @@ Chunk AggregatingSortedAlgorithm::AggregatingMergedData::pull()
 void AggregatingSortedAlgorithm::AggregatingMergedData::initAggregateDescription()
 {
     for (auto & desc : def.columns_to_simple_aggregate)
-        desc.column = columns[desc.column_number].get();
+    {
+        if (!desc.subcolumn_description.is_subcolumn)
+        {
+            desc.column = columns[desc.column_number].get();
+        }
+        else
+        {
+            auto subcolumn = desc.subcolumn_description.parent_data_type
+                                 ->getSubcolumn(desc.subcolumn_description.subcolumn_name, columns[desc.column_number]->getPtr())
+                                 ->assumeMutable();
+            desc.column = subcolumn.get();
+        }
+    }
 
     for (auto & desc : def.columns_to_aggregate)
-        desc.column = typeid_cast<ColumnAggregateFunction *>(columns[desc.column_number].get());
+    {
+        if (!desc.subcolumn_description.is_subcolumn)
+            desc.column = typeid_cast<ColumnAggregateFunction *>(columns[desc.column_number].get());
+        else
+            desc.column = typeid_cast<ColumnAggregateFunction *>(
+                desc.subcolumn_description.parent_data_type
+                    ->getSubcolumn(desc.subcolumn_description.subcolumn_name, columns[desc.column_number]->getPtr())
+                    ->assumeMutable()
+                    .get());
+    }
 }
 
 

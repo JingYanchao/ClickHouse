@@ -34,6 +34,13 @@ public:
 
     MergedStats getMergedStats() const override { return merged_data.getMergedStats(); }
 
+    struct SubColumnDescription
+    {
+        bool is_subcolumn = false;
+        DataTypePtr parent_data_type;
+        String subcolumn_name;
+    };
+
     /// Stores information for aggregation of SimpleAggregateFunction columns
     struct SimpleAggregateDescription
     {
@@ -47,6 +54,8 @@ public:
         /// For LowCardinality, convert is converted to nested type. nested_type is nullptr if no conversion needed.
         const DataTypePtr nested_type; /// Nested type for LowCardinality, if it is.
         const DataTypePtr real_type; /// Type in header.
+
+        SubColumnDescription subcolumn_description;
 
         AlignedBuffer state;
         bool created = false;
@@ -72,6 +81,8 @@ public:
     {
         ColumnAggregateFunction * column = nullptr;
         const size_t column_number = 0; /// Position in header.
+
+        SubColumnDescription subcolumn_description;
 
         AggregateDescription() = default;
         explicit AggregateDescription(size_t col_number) : column_number(col_number) {}
