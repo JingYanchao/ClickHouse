@@ -99,6 +99,9 @@ public:
 
         /// Does SimpleAggregateFunction allocates memory in arena?
         bool allocates_memory_in_arena = false;
+
+        /// record the origin header
+        Block origin_header;
     };
 
 private:

@@ -243,9 +243,11 @@ static SummingSortedAlgorithm::ColumnsDefinition defineColumns(
     bool remove_default_values,
     bool aggregate_all_columns)
 {
-    size_t num_columns = header.columns();
+    Block header_flatten = Nested::flattenTupleRecursive(header);
     SummingSortedAlgorithm::ColumnsDefinition def;
-    def.column_names = header.getNames();
+    def.origin_header = header;
+    def.column_names = header_flatten.getNames();
+    size_t num_columns = header_flatten.columns();
 
     /// name of nested structure -> the column numbers that refer to it.
     std::unordered_map<std::string, std::vector<size_t>> discovered_maps;
@@ -257,7 +259,7 @@ static SummingSortedAlgorithm::ColumnsDefinition defineColumns(
         */
     for (size_t i = 0; i < num_columns; ++i)
     {
-        const ColumnWithTypeAndName & column = header.safeGetByPosition(i);
+        const ColumnWithTypeAndName & column = header_flatten.safeGetByPosition(i);
 
         const auto * simple = dynamic_cast<const DataTypeCustomSimpleAggregateFunction *>(column.type->getCustomName());
         bool is_non_empty_tuple = typeid_cast<const DataTypeTuple *>(column.type.get()) && !typeid_cast<const DataTypeTuple *>(column.type.get())->getElements().empty();
@@ -472,6 +474,7 @@ static void preprocessChunk(Chunk & chunk, const SummingSortedAlgorithm::Columns
 {
     auto num_rows = chunk.getNumRows();
     auto columns = chunk.detachColumns();
+    columns = Nested::flattenTupleColumnsRecursive(def.origin_header, columns);
 
     for (const auto & desc : def.columns_to_aggregate)
     {
@@ -524,7 +527,7 @@ static void postprocessChunk(
 
         res_columns[column_number] = std::move(column);
     }
-
+    res_columns = Nested::reconstructTupleColumnsRecursive(def.origin_header, res_columns);
     chunk.setColumns(std::move(res_columns), num_rows);
 }
 
@@ -818,6 +821,7 @@ void SummingSortedAlgorithm::initialize(Inputs inputs)
 {
     removeReplicatedFromSortingColumns(header, inputs, description);
     removeConstAndSparse(inputs);
+    header = std::make_shared<Block>(Nested::flattenTupleRecursive(*header));
     merged_data.initialize(*header, inputs);
 
     for (auto & input : inputs)

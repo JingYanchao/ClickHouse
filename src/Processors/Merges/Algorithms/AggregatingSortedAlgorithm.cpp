@@ -5,6 +5,7 @@
 #include <DataTypes/DataTypeAggregateFunction.h>
 #include <DataTypes/DataTypeCustomSimpleAggregateFunction.h>
 #include <DataTypes/DataTypeLowCardinality.h>
+#include <DataTypes/NestedUtils.h>
 #include <Common/Arena.h>
 
 namespace DB
@@ -23,12 +24,13 @@ static AggregatingSortedAlgorithm::ColumnsDefinition defineColumns(
     const Block & header, const SortDescription & description)
 {
     AggregatingSortedAlgorithm::ColumnsDefinition def = {};
-    size_t num_columns = header.columns();
-
+    def.origin_header = header;
+    Block header_flatten = Nested::flattenTupleRecursive(header);
+    size_t num_columns = header_flatten.columns();
     /// Fill in the column numbers that need to be aggregated.
     for (size_t i = 0; i < num_columns; ++i)
     {
-        const ColumnWithTypeAndName & column = header.safeGetByPosition(i);
+        const ColumnWithTypeAndName & column = header_flatten.safeGetByPosition(i);
 
         /// We leave only states of aggregate functions.
         if (!dynamic_cast<const DataTypeAggregateFunction *>(column.type.get())
@@ -78,7 +80,7 @@ static void preprocessChunk(Chunk & chunk, const AggregatingSortedAlgorithm::Col
 {
     auto num_rows = chunk.getNumRows();
     auto columns = chunk.detachColumns();
-
+    columns = Nested::flattenTupleColumnsRecursive(def.origin_header, columns);
     for (const auto & desc : def.columns_to_simple_aggregate)
         if (desc.nested_type)
             columns[desc.column_number] = recursiveRemoveLowCardinality(columns[desc.column_number]);
@@ -91,7 +93,6 @@ static void postprocessChunk(Chunk & chunk, const AggregatingSortedAlgorithm::Co
 {
     size_t num_rows = chunk.getNumRows();
     auto columns = chunk.detachColumns();
-
     for (const auto & desc : def.columns_to_simple_aggregate)
     {
         if (desc.nested_type)
@@ -101,6 +102,7 @@ static void postprocessChunk(Chunk & chunk, const AggregatingSortedAlgorithm::Co
             columns[desc.column_number] = recursiveLowCardinalityTypeConversion(columns[desc.column_number], from_type, to_type);
         }
     }
+    columns = Nested::reconstructTupleColumnsRecursive(def.origin_header, columns);
 
     chunk.setColumns(std::move(columns), num_rows);
 }
@@ -151,7 +153,6 @@ AggregatingSortedAlgorithm::AggregatingMergedData::AggregatingMergedData(
 void AggregatingSortedAlgorithm::AggregatingMergedData::initialize(const DB::Block & header, const IMergingAlgorithm::Inputs & inputs)
 {
     MergedData::initialize(header, inputs);
-
     for (const auto & desc : def.columns_to_simple_aggregate)
     {
         /// Remove LowCardinality from columns if needed. It's important to use columns initialized in
@@ -271,6 +272,7 @@ void AggregatingSortedAlgorithm::initialize(Inputs inputs)
 {
     removeReplicatedFromSortingColumns(header, inputs, description);
     removeConstAndSparse(inputs);
+    header = std::make_shared<Block>(Nested::flattenTupleRecursive(*header));
     merged_data.initialize(*header, inputs);
 
     for (auto & input : inputs)

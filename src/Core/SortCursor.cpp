@@ -1,5 +1,6 @@
 #include <Core/Block.h>
 #include <Core/SortCursor.h>
+#include <Columns/ColumnTuple.h>
 
 namespace DB
 {
@@ -24,10 +25,8 @@ void SortCursorImpl::reset(const Columns & columns, const Block & block, UInt64 
     raw_sort_columns_data.clear();
 #endif
 
-    size_t num_columns = columns.size();
-
-    for (size_t j = 0; j < num_columns; ++j)
-        all_columns.push_back(columns[j].get());
+    for (const auto & col : columns)
+        all_columns.push_back(col.get());
 
     for (size_t j = 0, size = desc.size(); j < size; ++j)
     {

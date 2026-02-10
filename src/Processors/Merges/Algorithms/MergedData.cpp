@@ -77,9 +77,9 @@ void MergedData::insertChunk(Chunk && chunk, size_t rows_size)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot insert to MergedData from Chunk because MergedData is not empty.");
 
     UInt64 num_rows = chunk.getNumRows();
-    UInt64 num_columns = chunk.getNumColumns();
-    chassert(columns.size() == num_columns);
     auto chunk_columns = chunk.mutateColumns();
+    UInt64 num_columns = chunk_columns.size();
+    chassert(columns.size() == num_columns);
 
     /// Here is a special code for constant columns.
     /// Currently, 'columns' will contain constants, but 'chunk_columns' will not.
