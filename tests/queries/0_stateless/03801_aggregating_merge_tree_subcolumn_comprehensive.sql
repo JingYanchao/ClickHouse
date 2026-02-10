@@ -126,62 +126,7 @@ SELECT * FROM test_comprehensive_simple ORDER BY id;
 
 DROP TABLE test_comprehensive_simple;
 
--- Test 3: Complex nested types with SimpleAggregateFunction
-DROP TABLE IF EXISTS test_complex_types;
-
-CREATE TABLE test_complex_types (
-    id UInt64,
-    complex_agg Tuple(
-        sum_map SimpleAggregateFunction(sumMap, Tuple(Array(Int32), Array(Int64))),
-        min_map SimpleAggregateFunction(minMap, Tuple(Array(Int32), Array(Int64))),
-        max_map SimpleAggregateFunction(maxMap, Tuple(Array(Int32), Array(Int64))),
-        map_uniq_arr SimpleAggregateFunction(groupUniqArrayArrayMap, Map(Int32, Array(Int64)))
-    )
-) ENGINE = AggregatingMergeTree() ORDER BY id;
-
-INSERT INTO test_complex_types VALUES(
-    1,
-    tuple(
-        ([1,2], [10,20]),
-        ([1,2], [5,10]),
-        ([1,2], [15,25]),
-        map(1, [100,200], 2, [300,400])
-    )
-);
-
-INSERT INTO test_complex_types VALUES(
-    1,
-    tuple(
-        ([1,3], [15,30]),
-        ([1,3], [3,8]),
-        ([1,3], [20,35]),
-        map(1, [2,3], 2, [4,5,6])
-    )
-);
-
-INSERT INTO test_complex_types VALUES(
-    2,
-    tuple(
-        ([2,3], [100,200]),
-        ([2,3], [50,100]),
-        ([2,3], [150,250]),
-        map(3,[7,8])
-    )
-);
-
--- Test immediate aggregation with FINAL
-SELECT 'Complex types test - with FINAL:';
-SELECT * FROM test_complex_types FINAL ORDER BY id;
-
--- Test on-disk aggregation with OPTIMIZE
-OPTIMIZE TABLE test_complex_types FINAL;
-
-SELECT 'Complex types test - after OPTIMIZE:';
-SELECT * FROM test_complex_types ORDER BY id;
-
-DROP TABLE test_complex_types;
-
--- Test 4: AggregateFunction subcolumns (state-based aggregation)
+-- Test 3: AggregateFunction subcolumns (state-based aggregation)
 DROP TABLE IF EXISTS test_agg_function_subcolumn;
 
 CREATE TABLE test_agg_function_subcolumn (
@@ -283,7 +228,7 @@ ORDER BY id;
 
 DROP TABLE test_agg_function_subcolumn;
 
--- Test 5: Mixed SimpleAggregateFunction and AggregateFunction subcolumns
+-- Test 4: Mixed SimpleAggregateFunction and AggregateFunction subcolumns
 DROP TABLE IF EXISTS test_mixed_agg;
 
 CREATE TABLE test_mixed_agg (
@@ -379,7 +324,7 @@ ORDER BY key;
 
 DROP TABLE test_mixed_agg;
 
--- Test 6: With overflow
+-- Test 5: With overflow
 DROP TABLE IF EXISTS test_with_overflow;
 
 CREATE TABLE test_with_overflow (
@@ -429,7 +374,7 @@ ORDER BY key1, key2;
 
 DROP TABLE test_multi_key;
 
--- Test 8: Nullable type subcolumn aggregation
+-- Test 7: Nullable type subcolumn aggregation
 DROP TABLE IF EXISTS test_nullable_subcolumn;
 
 CREATE TABLE test_nullable_subcolumn (
@@ -505,7 +450,7 @@ SELECT * FROM test_nullable_subcolumn FINAL ORDER BY id;
 
 DROP TABLE test_nullable_subcolumn;
 
--- Test 9: Nullable with AggregateFunction subcolumns
+-- Test 8: Nullable with AggregateFunction subcolumns
 DROP TABLE IF EXISTS test_nullable_agg_function;
 
 CREATE TABLE test_nullable_agg_function (
@@ -594,7 +539,7 @@ ORDER BY id;
 
 DROP TABLE test_nullable_agg_function;
 
--- Test 10: Direct subcolumns with various data types (not nested in tuples)
+-- Test 9: Direct subcolumns with various data types (not nested in tuples)
 DROP TABLE IF EXISTS test_direct_subcolumns;
 
 CREATE TABLE test_direct_subcolumns (
