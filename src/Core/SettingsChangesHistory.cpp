@@ -1134,6 +1134,7 @@ const VersionToSettingsChangesMap & getMergeTreeSettingsChangesHistory()
             {"map_buckets_coefficient", 1.0, 1.0, "Add a setting to control the coefficient used in `sqrt` and `linear` strategy for calculating the number of buckets for 'with_buckets' Map serialization"},
             {"map_buckets_min_avg_size", 32, 32, "Add a setting to control the minimum average map size (number of keys per row) required to apply `with_buckets` serialization"},
             {"shared_merge_tree_use_zookeeper_connection_pool", false, false, "New setting"},
+            {"allow_tuple_element_aggregation", false, false, "New setting"},
         });
         addSettingsChanges(merge_tree_settings_changes_history, "26.2",
         {
