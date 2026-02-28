@@ -2,6 +2,7 @@
 
 #include <Storages/MergeTree/IMergeTreeDataPartWriter.h>
 #include <Storages/MergeTree/MergeTreeWriterStream.h>
+#include <Storages/MergeTree/SSTFileUtil.h>
 #include <IO/WriteBufferFromFile.h>
 #include <IO/WriteBufferFromFileBase.h>
 #include <Compression/CompressedWriteBuffer.h>
@@ -95,6 +96,12 @@ protected:
 
     virtual void addStreams(const NameAndTypePair & name_and_type, const ASTPtr & effective_codec_desc) = 0;
 
+    /// Create an SST write stream for the given SortedStringKV column.
+    void createSSTStreamIfNeeded(const NameAndTypePair & name_and_type, const String & stream_name);
+
+    /// Finalize and checksum all SST streams.
+    void fillSSTChecksums(MergeTreeDataPartChecksums & checksums);
+
     /// On first block create all required streams for columns with dynamic subcolumns and remember the block sample.
     /// On each next block check if dynamic structure of the columns equals to the dynamic structure of the same
     /// columns in the sample block. If for some column dynamic structure is different, adjust it so it matches
@@ -138,6 +145,10 @@ protected:
 
     /// List of substreams for each column in order of serialization.
     ColumnsSubstreams columns_substreams;
+
+    /// Independent SST data streams for SortedStringKV columns.
+    /// Key: column name. SST files are separate from regular column data streams.
+    SSTFileWriteStreams sst_streams;
 
 private:
     void initSkipIndices();

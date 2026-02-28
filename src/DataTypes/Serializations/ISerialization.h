@@ -28,6 +28,9 @@ class ReadBuffer;
 class WriteBuffer;
 class ProtobufReader;
 class ProtobufWriter;
+class SSTFileWriter;
+class SSTFileWriteStream;
+class MergeTreeReaderStreamSingleColumnWholePart;
 
 class IDataType;
 using DataTypePtr = std::shared_ptr<const IDataType>;
@@ -348,6 +351,17 @@ public:
     using OutputStreamGetter = std::function<WriteBuffer*(const SubstreamPath &)>;
     using InputStreamGetter = std::function<ReadBuffer*(const SubstreamPath &)>;
     using StreamMarkGetter = std::function<MarkInCompressedFile(const SubstreamPath &)>;
+    /// Getter for SST write stream (SortedStringKVData substream).
+    /// Injected by MergeTreeDataPartWriter and used by SerializationSortedStringKV
+    /// to obtain the SSTFileWriteStream without polluting the main stream_getter.
+    /// The SSTFileWriteStream is owned by the Writer layer (via SSTFileWriteStreams).
+    using SSTWriteStreamGetter = std::function<SSTFileWriteStream *(const SubstreamPath &)>;
+
+    /// Getter for SST read stream (SortedStringKVData substream).
+    /// Injected by MergeTreeDataReader and used by SerializationSortedStringKV
+    /// to obtain the MergeTreeReaderStreamSingleColumnWholePart for deserialization.
+    /// The stream is owned by the Reader layer.
+    using SSTReadStreamGetter = std::function<MergeTreeReaderStreamSingleColumnWholePart *(const SubstreamPath &)>;
 
     struct SerializeBinaryBulkSettings
     {
@@ -398,6 +412,15 @@ public:
         /// Type of MergeTree data part we serialize data from if any.
         /// Some serializations may differ from type part for more optimal deserialization.
         MergeTreeDataPartType data_part_type = MergeTreeDataPartType::Unknown;
+
+        /// Optional getter for SST write stream (SortedStringKVData substream).
+        /// When set, SerializationSortedStringKV uses this to obtain the SSTFileWriteStream
+        /// (owned by the Writer layer) for writing KV pairs to the SST file.
+        SSTWriteStreamGetter sst_write_stream_getter;
+
+        /// Whether the current write starts a new granule/mark.
+        /// In Wide parts, continuation granules (where mark_on_start = false)
+        bool mark_on_start = true;
     };
 
     struct DeserializeBinaryBulkSettings
@@ -450,6 +473,12 @@ public:
         /// Type of MergeTree data part we deserialize data from if any.
         /// Some serializations may differ from type part for more optimal deserialization.
         MergeTreeDataPartType data_part_type = MergeTreeDataPartType::Unknown;
+
+        /// Optional getter for SST read stream (SortedStringKVData substream).
+        /// When set, SerializationSortedStringKV uses this to obtain the
+        /// MergeTreeReaderStreamSingleColumnWholePart (owned by the Reader layer)
+        /// for reading KV pairs from the SST file.
+        SSTReadStreamGetter sst_read_stream_getter;
 
         /// Usually substreams cache contains the whole column with rows from
         /// multiple ranges. But sometimes we need to read a separate column
