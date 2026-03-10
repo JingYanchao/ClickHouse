@@ -19,7 +19,7 @@ using MutableDataPartStoragePtr = std::shared_ptr<IDataPartStorage>;
 
 class SSTFileWriter;
 
-/// SST data file extension for SortedStringKV columns.
+/// SST data file extension for SST-based column types.
 static constexpr auto SST_DATA_FILE_EXTENSION = ".sst";
 
 /// SST file write stream: manages FileBuffer + SSTFileWriter for a single column.

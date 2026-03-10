@@ -210,7 +210,7 @@ void MergeTreeDataPartWriterWide::addStreams(
             settings.marks_compress_block_size,
             query_write_settings);
 
-        createSSTStreamIfNeeded(name_and_type, stream_name);
+        createSSTFileStreamIfNeeded(name_and_type, stream_name);
 
         if (columns_to_load_marks.contains(name_and_type.name))
             cached_marks.emplace(stream_name, std::make_unique<MarksInCompressedFile::PlainArray>());
@@ -553,7 +553,7 @@ void MergeTreeDataPartWriterWide::writeColumn(
             = [&](const ISerialization::SubstreamPath & substream_path) -> SSTFileWriteStream *
             {
                 auto stream_name = getStreamName(name_and_type, substream_path);
-                return sst_streams.at(stream_name).get();
+                return sst_file_streams.at(stream_name).get();
             };
     }
 
@@ -829,7 +829,8 @@ void MergeTreeDataPartWriterWide::fillChecksums(MergeTreeDataPartChecksums & che
         fillDataChecksums(checksums, checksums_to_remove);
 
     /// SST columns are independent files — finalize and checksum them separately.
-    fillSSTChecksums(checksums);
+    for (auto & [col_name, sst_stream] : sst_file_streams)
+        sst_stream->fillSSTChecksums(checksums);
 
     if (settings.rewrite_primary_key)
         fillPrimaryIndexChecksums(checksums);
@@ -843,14 +844,13 @@ void MergeTreeDataPartWriterWide::finish(bool sync)
     if (!columns_list.empty())
         finishDataSerialization(sync);
 
-    /// Finalize SST data streams (independent of column data streams).
-    for (auto & [col_name, sst_stream] : sst_streams)
+    for (auto & [col_name, sst_stream] : sst_file_streams)
     {
         sst_stream->finalize();
         if (sync)
             sst_stream->sync();
     }
-    sst_streams.clear();
+    sst_file_streams.clear();
 
     if (settings.rewrite_primary_key)
         finishPrimaryIndexSerialization(sync);

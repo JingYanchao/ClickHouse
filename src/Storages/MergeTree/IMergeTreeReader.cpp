@@ -597,7 +597,7 @@ std::unique_ptr<MergeTreeReaderStreamSingleColumnWholePart> IMergeTreeReader::cr
     return std::make_unique<MergeTreeReaderStreamSingleColumnWholePart>(
         data_part_info_for_read->getDataPartStorage(),
         stream_name,
-        SST_DATA_FILE_EXTENSION,
+            SST_DATA_FILE_EXTENSION,
         marks_count,
         MarkRanges{{0, marks_count}},
         stream_settings,

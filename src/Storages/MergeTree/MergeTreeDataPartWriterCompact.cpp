@@ -97,7 +97,7 @@ void MergeTreeDataPartWriterCompact::addStreams(const NameAndTypePair & name_and
             stream = std::make_shared<CompressedStream>(plain_hashing, compression_codec);
 
         compressed_streams.emplace(stream_name, stream);
-        createSSTStreamIfNeeded(name_and_type, stream_name);
+        createSSTFileStreamIfNeeded(name_and_type, stream_name);
     };
 
     ISerialization::EnumerateStreamsSettings enumerate_settings;
@@ -319,7 +319,7 @@ void MergeTreeDataPartWriterCompact::writeDataBlock(const Block & block, const G
                     {
                         String sst_stream_name = ISerialization::getFileNameForStream(
                             *name_and_type, substream_path, ISerialization::StreamFileNameSettings(*storage_settings));
-                        return sst_streams.at(sst_stream_name).get();
+                        return sst_file_streams.at(sst_stream_name).get();
                     };
             }
 
@@ -556,7 +556,8 @@ void MergeTreeDataPartWriterCompact::fillChecksums(MergeTreeDataPartChecksums & 
         fillDataChecksums(checksums);
 
     /// SST columns are independent files — finalize and checksum them separately.
-    fillSSTChecksums(checksums);
+    for (auto & [col_name, sst_stream] : sst_file_streams)
+        sst_stream->fillSSTChecksums(checksums);
 
     if (settings.rewrite_primary_key)
         fillPrimaryIndexChecksums(checksums);
@@ -570,14 +571,13 @@ void MergeTreeDataPartWriterCompact::finish(bool sync)
     if (!columns_list.empty())
         finishDataSerialization(sync);
 
-    /// Finalize SST data streams (independent of compact data.bin).
-    for (auto & [col_name, sst_stream] : sst_streams)
+    for (auto & [col_name, sst_stream] : sst_file_streams)
     {
         sst_stream->finalize();
         if (sync)
             sst_stream->sync();
     }
-    sst_streams.clear();
+    sst_file_streams.clear();
 
     if (settings.rewrite_primary_key)
         finishPrimaryIndexSerialization(sync);

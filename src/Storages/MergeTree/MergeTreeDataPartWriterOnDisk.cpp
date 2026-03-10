@@ -85,9 +85,9 @@ void MergeTreeDataPartWriterOnDisk::cancel() noexcept
         stream->cancel();
 
     /// Cancel all SST streams.
-    for (auto & [col_name, sst_stream] : sst_streams)
+    for (auto & [col_name, sst_stream] : sst_file_streams)
         sst_stream->cancel();
-    sst_streams.clear();
+    sst_file_streams.clear();
 }
 
 size_t MergeTreeDataPartWriterOnDisk::computeIndexGranularity(const Block & block) const
@@ -422,24 +422,18 @@ Names MergeTreeDataPartWriterOnDisk::getSkipIndicesColumns() const
     return Names(skip_indexes_column_names_set.begin(), skip_indexes_column_names_set.end());
 }
 
-void MergeTreeDataPartWriterOnDisk::createSSTStreamIfNeeded(const NameAndTypePair & name_and_type, const String & stream_name)
+void MergeTreeDataPartWriterOnDisk::createSSTFileStreamIfNeeded(const NameAndTypePair & name_and_type, const String & stream_name)
 {
     if (!dynamic_cast<const DataTypeSortedStringKV *>(name_and_type.type->getCustomName()))
         return;
 
-    sst_streams.emplace(
+    sst_file_streams.emplace(
         stream_name,
         std::make_unique<SSTFileWriteStream>(
             escapeForFileName(name_and_type.name),
             data_part_storage,
             settings.max_compress_block_size,
             settings.query_write_settings));
-}
-
-void MergeTreeDataPartWriterOnDisk::fillSSTChecksums(MergeTreeDataPartChecksums & checksums)
-{
-    for (auto & [col_name, sst_stream] : sst_streams)
-        sst_stream->fillSSTChecksums(checksums);
 }
 
 void MergeTreeDataPartWriterOnDisk::initOrAdjustDynamicStructureIfNeeded(Block & block)

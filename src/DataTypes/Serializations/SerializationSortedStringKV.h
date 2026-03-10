@@ -23,7 +23,7 @@ class SSTFileReader;
 ///   column.sst          - SST file with all KV pairs (global per part)
 ///
 /// The SST stream is managed externally by MergeTreeDataPartWriter and injected via getters.
-class SerializationSortedStringKV : public SerializationTuple
+class SerializationSortedStringKV final : public SerializationTuple
 {
 public:
     /// Write state: holds reference to SSTFileWriter for streaming KV pairs
