@@ -2,6 +2,7 @@
 
 #include <Storages/MergeTree/IMergeTreeDataPartWriter.h>
 #include <Storages/MergeTree/MergeTreeWriterStream.h>
+#include <Storages/MergeTree/SSTFileUtil.h>
 #include <IO/WriteBufferFromFile.h>
 #include <IO/WriteBufferFromFileBase.h>
 #include <Compression/CompressedWriteBuffer.h>
@@ -108,6 +109,9 @@ protected:
 
     virtual ISerialization::SerializeBinaryBulkSettings getSerializationSettings() const = 0;
 
+     /// Create an SST write stream for the given column if needed.
+    void createSSTFileStreamIfNeeded(const NameAndTypePair & name_and_type, const String & stream_name);
+
     const MergeTreeIndices skip_indices;
     const String marks_file_extension;
     const CompressionCodecPtr default_codec;
@@ -146,6 +150,10 @@ protected:
 
     /// List of substreams for each column in order of serialization.
     ColumnsSubstreams columns_substreams;
+
+    /// Independent SST data streams for SST-based column types.
+    /// Key: column name. SST files are separate from regular column data streams.
+    SSTFileWriteStreams sst_file_streams;
 
 private:
     void initSkipIndices();
