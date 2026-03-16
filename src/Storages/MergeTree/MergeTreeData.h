@@ -1,5 +1,6 @@
 #pragma once
 
+#include <any>
 #include <mutex>
 #include <tuple>
 #include <base/defines.h>
@@ -88,6 +89,8 @@ class ExpressionActions;
 using ExpressionActionsPtr = std::shared_ptr<ExpressionActions>;
 using ManyExpressionActions = std::vector<ExpressionActionsPtr>;
 class MergeTreeDeduplicationLog;
+class MergeTreeDedupManager;
+using MergeTreeDedupManagerPtr = std::shared_ptr<MergeTreeDedupManager>;
 using PartitionIdToMaxBlock = std::unordered_map<String, Int64>;
 
 namespace ErrorCodes
@@ -352,6 +355,16 @@ public:
     /// * Next, if commit() is called, the parts are added to the active set and the parts that are
     ///   covered by them are marked Outdated.
     /// If neither commit() nor rollback() was called, the destructor rollbacks the operation.
+    /// What kind of operation produced the part being committed.
+    /// Used by dedup to choose optimization strategy.
+    enum class CommitOperation : uint8_t
+    {
+        Insert,    /// Normal INSERT
+        Merge,     /// Background merge
+        Mutation,  /// Background mutation
+        Fetch,     /// Replicated fetch from another replica (future use)
+    };
+
     class Transaction : private boost::noncopyable
     {
     public:
@@ -359,6 +372,9 @@ public:
 
         DataPartsVector commit();
         DataPartsVector commit(DataPartsLock & lock);
+
+        void setCommitOperation(CommitOperation op) { commit_operation = op; }
+        CommitOperation getCommitOperation() const { return commit_operation; }
 
         /// Rename should be done explicitly, before calling commit(), to
         /// guarantee that no lock held during rename (since rename is IO
@@ -389,6 +405,7 @@ public:
 
         MutableDataParts precommitted_parts;
         MutableDataParts precommitted_parts_need_rename;
+        CommitOperation commit_operation = CommitOperation::Insert;
     };
 
     using TransactionUniquePtr = std::unique_ptr<Transaction>;
@@ -546,6 +563,30 @@ public:
 
     bool hasProjection() const override;
 
+    /// Hook called by the no-arg Transaction::commit() BEFORE lockParts().
+    /// Allows UniqueMergeTree to acquire dedup lock and perform dedup
+    /// before DataPartsLock, so dedup does not block reads.
+    /// Lock ordering: dedup_mutex -> DataPartsLock.
+    /// NOTE: Only called by no-arg commit(). Callers of commit(DataPartsLock &)
+    /// must handle dedup externally before acquiring DataPartsLock.
+    /// Returns std::any so that the caller can hold onto the returned RAII lock
+    /// (e.g. UniqueProcessLock) until commit is finished.
+    using TransactionPreLockHook = std::function<std::any(const MutableDataParts & parts, CommitOperation op)>;
+
+    void setTransactionPreLockHook(TransactionPreLockHook hook) { transaction_pre_lock_hook = std::move(hook); }
+
+    /// Manually invoke the pre-lock hook for callers that use commit(DataPartsLock &)
+    /// instead of the no-arg commit(). This is needed by MergeTreeSink::commitPart()
+    /// which manages lockParts() itself and would otherwise skip dedup.
+    /// The caller MUST hold the returned std::any alive until commit finishes,
+    /// because it contains the dedup mutex guard.
+    [[nodiscard]] std::any invokePreLockHook(const MutableDataParts & parts, CommitOperation op = CommitOperation::Insert)
+    {
+        if (transaction_pre_lock_hook && !parts.empty())
+            return transaction_pre_lock_hook(parts, op);
+        return {};
+    }
+
     bool areAsynchronousInsertsEnabled() const override;
 
     bool supportsTrivialCountOptimization(const StorageSnapshotPtr & storage_snapshot, ContextPtr query_context) const override;
@@ -627,12 +668,19 @@ public:
         RangesInDataPartsPtr parts;
 
         MutationsSnapshotPtr mutations_snapshot;
+
+        std::unordered_map<String, ProjectionIndexBitmapPtr> delete_mark_buffer_map;
     };
+
+    StorageSnapshot::DataPtr getStorageSnapshotDataAttachPartsOnMerge(DataPartsVector & parts) const;
 
     StorageSnapshotPtr getStorageSnapshot(const StorageMetadataPtr & metadata_snapshot, ContextPtr query_context) const override;
 
     /// The same as above but does not hold vector of data parts.
     StorageSnapshotPtr getStorageSnapshotWithoutData(const StorageMetadataPtr & metadata_snapshot, ContextPtr query_context) const override;
+
+    /// Build snapshot data for merge, filtering out empty/fully-deleted parts and collecting delete mark bitmaps.
+    StorageSnapshot::DataPtr getStorageSnapshotDataAttachPartsOnMerge(DataPartsVector & parts);
 
     /// Load the set of data parts from disk. Call once - immediately after the object is created.
     void loadDataParts(bool skip_sanity_checks, std::optional<std::unordered_set<std::string>> expected_parts);
@@ -1133,8 +1181,8 @@ public:
 
     /// Get constant pointer to storage settings.
     /// Copy this pointer into your scope and you will get consistent settings.
-    /// When `projection` is provided, apply projection-level overrides on top of the table settings.
-    MergeTreeSettingsPtr getSettings(ProjectionDescriptionRawPtr projection = nullptr) const;
+    /// If settings_changes is provided, apply these overrides on top of the table settings.
+    MergeTreeSettingsPtr getSettings(const SettingsChanges * settings_changes = nullptr) const;
 
     StorageMetadataPtr getInMemoryMetadataPtr(bool bypass_metadata_cache = false) const override; /// NOLINT
 
@@ -1238,6 +1286,10 @@ public:
 
     /// Merging params - what additional actions to perform during merge.
     const MergingParams merging_params;
+
+    /// Whether the user has specified a custom version column for the unique index.
+    /// When false, the default version (_block_number) is used.
+    bool hasCustomizedVersionColumnForUniqueIndex() const { return !merging_params.version_column.empty(); }
 
     bool is_custom_partitioned = false;
 
@@ -1406,6 +1458,14 @@ protected:
     /// Relative path data, changes during rename for ordinary databases use
     /// under lockForShare if rename is possible.
     String relative_data_path;
+
+    /// Hook called before lockParts() in the no-arg Transaction::commit().
+    /// Used by UniqueMergeTree for dedup (lock ordering: dedup_mutex -> DataPartsLock).
+    TransactionPreLockHook transaction_pre_lock_hook;
+
+    /// Manages cross-part dedup logic and delete mark buffers.
+    /// Initialized by UniqueMergeTree; nullptr for other engine variants.
+    MergeTreeDedupManagerPtr dedup_manager;
 
 private:
     /// Columns and secondary indices sizes can be calculated lazily.

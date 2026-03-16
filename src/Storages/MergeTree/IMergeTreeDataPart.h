@@ -52,9 +52,14 @@ class MarkCache;
 class UncompressedCache;
 class MergeTreeTransaction;
 class PackedFilesReader;
+class SSTFileReader;
+using SSTFileReaderPtr = std::shared_ptr<const SSTFileReader>;
 
 struct MergeTreeReadTaskInfo;
 using MergeTreeReadTaskInfoPtr = std::shared_ptr<const MergeTreeReadTaskInfo>;
+
+struct ProjectionIndexBitmap;
+using ProjectionIndexBitmapPtr = std::shared_ptr<ProjectionIndexBitmap>;
 
 class PrimaryIndexCache;
 using PrimaryIndexCachePtr = std::shared_ptr<PrimaryIndexCache>;
@@ -265,6 +270,10 @@ public:
 
     /// When the part is removed from the working set. Changes once.
     mutable std::atomic<time_t> remove_time { std::numeric_limits<time_t>::max() };
+
+    /// Delete mark bitmap for unique dedup: bits set to 1 represent deleted (deduped) rows.
+    /// Populated by MergeTreeDedupManager during dedup or rebuild.
+    mutable ProjectionIndexBitmapPtr delete_mark_bitmap;
 
     /// If true, the destructor will delete the directory with the part.
     /// FIXME Why do we need this flag? What's difference from Temporary and DeleteOnDestroy state? Can we get rid of this?
@@ -591,6 +600,21 @@ public:
 
     /// True if here is lightweight deleted mask file in part.
     bool hasLightweightDelete() const;
+
+    /// Returns the delete mark bitmap for this part (may be nullptr if not set).
+    ProjectionIndexBitmapPtr getDeleteMarkBitmap() const;
+
+    /// Sets the delete mark bitmap for this part.
+    void setDeleteMarkBitmap(ProjectionIndexBitmapPtr bitmap);
+
+    /// Returns the number of rows marked as deleted in the delete mark bitmap.
+    size_t getDeleteMarksCount() const;
+
+    /// Returns cached SST reader for the unique projection of this part.
+    /// Looks up or creates the reader in the global SSTFileReaderCache.
+    /// Returns nullptr if no unique projection SST exists.
+    SSTFileReaderPtr getOrOpenSSTReader(const StorageMetadataPtr & metadata_snapshot) const;
+
 
     /// Read existing rows count from _row_exists column
     UInt64 readExistingRowsCount();

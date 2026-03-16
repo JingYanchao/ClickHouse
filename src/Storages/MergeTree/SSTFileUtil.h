@@ -3,6 +3,8 @@
 #include <IO/HashingWriteBuffer.h>
 #include <IO/WriteBufferFromFileBase.h>
 #include <IO/ReadBufferFromFileBase.h>
+#include <IO/ReadSettings.h>
+#include <Storages/MergeTree/IDataPartStorage.h>
 #include <Storages/MergeTree/MergeTreeReaderStream.h>
 #include <base/types.h>
 #include <memory>
@@ -10,6 +12,13 @@
 #include <rocksdb/sst_file_reader.h>
 #include <rocksdb/iterator.h>
 #include <rocksdb/db.h>
+
+namespace ProfileEvents
+{
+    extern const Event SSTReaderCacheHits;
+    extern const Event SSTReaderCacheMisses;
+}
+
 namespace DB
 {
 
@@ -62,7 +71,7 @@ using SSTReadBuffers = std::unordered_map<String, std::unique_ptr<ReadBufferFrom
 
 /// RocksDB Env helpers
 std::unique_ptr<rocksdb::Env> createWriteBufferFileSystemEnv(WriteBuffer * write_buffer);
-std::unique_ptr<rocksdb::Env> createReadBufferFileSystemEnv(SeekableReadBuffer * read_buffer, uint64_t base_offset, uint64_t region_size);
+std::unique_ptr<rocksdb::Env> createReadBufferFileSystemEnv(const DataPartStoragePtr & storage);
 
 class SSTFileReader
 {
@@ -70,19 +79,73 @@ public:
     using IndexPropertiesPtr = std::shared_ptr<const rocksdb::TableProperties>;
 
     SSTFileReader(SeekableReadBuffer * read_buffer, uint64_t base_offset, uint64_t region_size);
+    /// Construct from a DataPartStorage: automatically opens the SST file,
+    /// reads file size, and manages the underlying ReadBuffer internally.
+    /// This is the preferred constructor for dedup / part-level access.
+    SSTFileReader(const DataPartStoragePtr & storage, const String & sst_file_name);
 
     std::unique_ptr<rocksdb::Iterator> newIterator(const rocksdb::ReadOptions & options) const;
     bool mayContainKey(std::string_view key) const;
     void verifyChecksums() const;
     IndexPropertiesPtr getProperties() const;
+    /// Single key lookup using MultiGet internally.
+    bool get(const rocksdb::Slice & key, std::string * value_out) const;
     bool isEmpty() const;
-
+    /// Release ReadBuffer memory (1MB per file) to save memory.
+    /// After calling this, the index reader can still be used normally.
+    void releaseBufferMemory() const;
 private:
+    /// Common initialization logic shared by both constructors.
+    void init(const String & file_name);
+
     using MinMax = std::pair<std::string, std::string>;
     std::unique_ptr<rocksdb::Env> sst_env;
     std::unique_ptr<rocksdb::SstFileReader> index_reader;
     MinMax key_range;
 };
+
+using SSTFileReaderPtr = std::shared_ptr<const SSTFileReader>;
+using SSTFileReaders = std::vector<SSTFileReaderPtr>;
+using SSTFileReaderCacheValue = SSTFileReaderPtr;
+
+class SSTFileReaderCache
+    : public CacheBase<UInt128, SSTFileReaderCacheValue, UInt128TrivialHash>
+{
+private:
+    using Base = CacheBase<UInt128, SSTFileReaderCacheValue, UInt128TrivialHash>;
+
+public:
+    SSTFileReaderCache(
+        const String & cache_policy,
+        CurrentMetrics::Metric size_in_bytes_metric,
+        CurrentMetrics::Metric count_metric,
+        size_t max_size_in_bytes,
+        double size_ratio)
+        : Base(cache_policy, size_in_bytes_metric, count_metric, max_size_in_bytes, Base::NO_MAX_COUNT, size_ratio)
+    {
+    }
+
+    /// Compute cache key from table UUID and part name.
+    static UInt128 hash(const UUID & table_uuid, const String & part_name)
+    {
+        SipHash s;
+        s.update(reinterpret_cast<const char *>(&table_uuid), sizeof(table_uuid));
+        s.update(part_name.data(), part_name.size());
+        return s.get128();
+    }
+
+    template <typename LoadFunc>
+    MappedPtr getOrSet(const Key & key, LoadFunc && load)
+    {
+        auto result = Base::getOrSet(key, std::forward<LoadFunc>(load));
+        if (result.second)
+            ProfileEvents::increment(ProfileEvents::SSTReaderCacheMisses);
+        else
+            ProfileEvents::increment(ProfileEvents::SSTReaderCacheHits);
+        return result.first;
+    }
+};
+using SSTFileReaderCachePtr = std::shared_ptr<SSTFileReaderCache>;
 
 class SSTFileWriter
 {

@@ -1,6 +1,7 @@
 #include <Parsers/ASTProjectionDeclaration.h>
 
 #include <IO/Operators.h>
+#include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTSetQuery.h>
 

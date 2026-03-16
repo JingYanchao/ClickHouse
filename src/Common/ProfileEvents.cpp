@@ -93,6 +93,8 @@
     M(DefaultImplementationForNullsRowsWithNulls, "Number of rows which contain null values processed by default implementation for nulls in function execution", ValueType::Number) \
     M(MarkCacheHits, "Number of times an entry has been found in the mark cache, so we didn't have to load a mark file.", ValueType::Number) \
     M(MarkCacheMisses, "Number of times an entry has not been found in the mark cache, so we had to load a mark file in memory, which is a costly operation, adding to query latency.", ValueType::Number) \
+    M(SSTReaderCacheHits, "Number of times an entry has been found in the SST reader cache.", ValueType::Number) \
+    M(SSTReaderCacheMisses, "Number of times an entry has not been found in the SST reader cache, so we had to open and parse an SST file.", ValueType::Number) \
     M(PrimaryIndexCacheHits, "Number of times an entry has been found in the primary index cache, so we didn't have to load a index file.", ValueType::Number) \
     M(PrimaryIndexCacheMisses, "Number of times an entry has not been found in the primary index cache, so we had to load a index file in memory, which is a costly operation, adding to query latency.", ValueType::Number) \
     M(IcebergMetadataFilesCacheHits, "Number of times iceberg metadata files have been found in the cache.", ValueType::Number) \
@@ -579,6 +581,11 @@ The server successfully detected this situation and will download merged part fr
     M(SharedPartsLockHoldMicroseconds, "Total time spent holding shared data parts lock in MergeTree tables", ValueType::Microseconds) \
     M(SharedPartsLockWaitMicroseconds, "Total time spent waiting for shared data parts lock in MergeTree tables", ValueType::Microseconds) \
     M(SharedPartsLocks, "Number of times shared data parts lock has been acquired for MergeTree tables", ValueType::Number) \
+    M(UniqueProcessLockWaitMicroseconds, "Total time spent waiting for unique process lock in UniqueMergeTree dedup", ValueType::Microseconds) \
+    M(UniqueProcessLockHoldMicroseconds, "Total time spent holding unique process lock in UniqueMergeTree dedup", ValueType::Microseconds) \
+    M(UniqueKeyDeduplicateSkipPartsByPart, "Number of parts skipped during unique key dedup due to non-overlapping key ranges", ValueType::Number) \
+    M(UniqueKeyDeduplicateSkipPartsByKey, "Number of keys skipped during unique key dedup due to bloom filter", ValueType::Number) \
+    M(UniqueKeyDeduplicateZeroSkip, "Number of dedup iterations where no parts or keys were skipped", ValueType::Number) \
     \
     M(RealTimeMicroseconds, "Total (wall clock) time spent in processing (queries and other tasks) threads (note that this is a sum).", ValueType::Microseconds) \
     M(UserTimeMicroseconds, "Total time spent in processing (queries and other tasks) threads executing CPU instructions in user mode. This includes time CPU pipeline was stalled due to main memory access, cache misses, branch mispredictions, hyper-threading, etc.", ValueType::Microseconds) \

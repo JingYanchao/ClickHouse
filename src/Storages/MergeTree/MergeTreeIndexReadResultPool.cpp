@@ -246,6 +246,18 @@ void ProjectionIndexBitmap::addBulk(const std::type_identity_t<Offset> * values,
     }
 }
 
+void ProjectionIndexBitmap::flipRange(size_t begin, size_t end)
+{
+    if (type == BitmapType::Bitmap32)
+    {
+        roaring_bitmap_flip_inplace(data.bitmap32, begin, end);
+    }
+    else
+    {
+        roaring64_bitmap_flip_inplace(data.bitmap64, begin, end);
+    }
+}
+
 bool ProjectionIndexBitmap::rangeAllZero(size_t begin, size_t end) const
 {
     if (type == BitmapType::Bitmap32)
@@ -333,6 +345,22 @@ bool ProjectionIndexBitmap::appendToFilter(PaddedPODArray<UInt8> & filter, size_
         roaring::api::roaring64_iterator_free(it);
         return has_value;
     }
+}
+
+bool ProjectionIndexBitmap::contains(UInt64 value)
+{
+    if (type == BitmapType::Bitmap32)
+        return roaring_bitmap_contains(data.bitmap32, static_cast<UInt32>(value));
+    else
+        return roaring64_bitmap_contains(data.bitmap64, value);
+}
+
+void ProjectionIndexBitmap::add(UInt64 value)
+{
+    if (type == BitmapType::Bitmap32)
+        roaring_bitmap_add(data.bitmap32, static_cast<UInt32>(value));
+    else
+        roaring64_bitmap_add(data.bitmap64, value);
 }
 
 template bool ProjectionIndexBitmap::contains<UInt32>(UInt32 value);

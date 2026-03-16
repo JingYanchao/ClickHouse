@@ -7,6 +7,7 @@
 #include <Interpreters/Context.h>
 #include <ranges>
 #include <DataTypes/DataTypeSortedStringKV.h>
+#include <Storages/MergeTree/MergeTreeVirtualColumns.h>
 
 namespace DB
 {
@@ -186,6 +187,12 @@ void MergeTreeReaderCompact::readData(
 {
     const auto & name_and_type = columns_to_read[column_idx];
     const auto [name, type] = name_and_type;
+
+    if (settings.enable_upsert && name_and_type.name == RowExistsColumn::name)
+    {
+        fillMemoryRowExistsColumn(column, rows_to_read);
+        return;
+    }
 
     bool seek_to_substream_mark = name_and_type.isSubcolumn() && has_substream_marks;
     auto buffer_getter = [&](const ISerialization::SubstreamPath & substream_path) -> ReadBuffer *
@@ -493,6 +500,10 @@ void MergeTreeReaderCompact::createColumnsForReading(Columns & res_columns) cons
     {
         if (column_positions[i] && res_columns[i] == nullptr)
             res_columns[i] = columns_to_read[i].type->createColumn(*serializations[i]);
+
+        /// when upsert, virtual column _row_exists should be added
+        if (settings.enable_upsert && !res_columns[i] && columns_to_read[i].name == RowExistsColumn::name)
+            res_columns[i] = RowExistsColumn::type->createColumn();
     }
 }
 

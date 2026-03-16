@@ -96,6 +96,7 @@
 #include <Storages/MergeTree/Compaction/MergeSelectorApplier.h>
 #include <Storages/MergeTree/PatchParts/PatchPartsUtils.h>
 #include <Storages/MergeTree/Compaction/PartsCollectors/Common.h>
+#include <Storages/MergeTree/MergeTreeDedupManager.h>
 
 #include <boost/algorithm/string/join.hpp>
 
@@ -1126,16 +1127,13 @@ void MergeTreeData::checkProperties(
                 true /* allow_nullable_key */,
                 local_context);
 
-            if (projection.index_granularity || projection.index_granularity_bytes)
+            if (!canUseAdaptiveGranularity() && projection.has_index_granularity_overrides)
             {
-                if (!canUseAdaptiveGranularity())
-                {
-                    throw Exception(
-                        ErrorCodes::SUPPORT_IS_DISABLED,
-                        "Projection {} specifies index_granularity-related overrides, but the parent table uses fixed granularity. "
-                        "Such overrides are supported with adaptive granularity (e.g. index_granularity_bytes > 0)",
-                        projection.name);
-                }
+                throw Exception(
+                    ErrorCodes::SUPPORT_IS_DISABLED,
+                    "Projection {} specifies index_granularity-related overrides, but the parent table uses fixed granularity. "
+                    "Such overrides are supported with adaptive granularity (e.g. index_granularity_bytes > 0)",
+                    projection.name);
             }
             projections_names.insert(projection.name);
         }
@@ -4855,7 +4853,7 @@ MergeTreeDataPartFormat MergeTreeData::choosePartFormat(
     using PartStorageType = MergeTreeDataPartStorageType;
 
     String out_reason;
-    const auto settings = getSettings(projection);
+    const auto settings = getSettings(projection ? &projection->settings_changes : nullptr);
     if (!canUsePolymorphicParts(*settings, out_reason))
         return {PartType::Wide, PartStorageType::Full};
 
@@ -8503,6 +8501,15 @@ void MergeTreeData::Transaction::renameParts()
 
 MergeTreeData::DataPartsVector MergeTreeData::Transaction::commit()
 {
+    /// Invoke pre-lock hook if set (e.g. for unique projection dedup).
+    /// This runs BEFORE lockParts(), ensuring lock ordering:
+    /// dedup_mutex -> DataPartsLock, so that dedup does not block reads.
+    /// The returned std::any holds the dedup lock (UniqueProcessLock RAII guard);
+    /// it must stay alive until commit(lock) completes.
+    std::any pre_lock_guard;
+    if (data.transaction_pre_lock_hook && !isEmpty())
+        pre_lock_guard = data.transaction_pre_lock_hook(precommitted_parts, commit_operation);
+
     auto lock = data.lockParts();
     return commit(lock);
 }
@@ -8633,6 +8640,9 @@ MergeTreeData::DataPartsVector MergeTreeData::Transaction::commit(DataPartsLock 
                     add_bytes += part->getBytesOnDisk();
                     add_rows += part->rows_count;
                     ++add_parts;
+
+                    if (data.supportsUpsert())
+                        data.dedup_manager->commitDeleteMarkBuffers(acquired_parts_lock);
 
                     data.modifyPartState(part, DataPartState::Active, acquired_parts_lock);
                     data.addPartContributionToColumnAndSecondaryIndexSizes(part);
@@ -10522,23 +10532,17 @@ MergeTreeData::PartitionIdToMinBlockPtr MergeTreeData::getMinDataVersionForEachP
     return std::make_shared<PartitionIdToMinBlock>(std::move(partition_to_min_data_version));
 }
 
-MergeTreeSettingsPtr MergeTreeData::getSettings(ProjectionDescriptionRawPtr projection) const
+MergeTreeSettingsPtr MergeTreeData::getSettings(const SettingsChanges * settings_changes) const
 {
     auto data_settings = storage_settings.get();
-    if (projection)
+
+    if (settings_changes)
     {
-        if ((projection->index_granularity && (*projection->index_granularity != (*data_settings)[MergeTreeSetting::index_granularity]))
-            || (projection->index_granularity_bytes
-                && (*projection->index_granularity_bytes != (*data_settings)[MergeTreeSetting::index_granularity_bytes])))
-        {
-            auto new_data_settings = std::make_shared<MergeTreeSettings>(*data_settings);
-            if (projection->index_granularity)
-                (*new_data_settings)[MergeTreeSetting::index_granularity] = *projection->index_granularity;
-            if (projection->index_granularity_bytes)
-                (*new_data_settings)[MergeTreeSetting::index_granularity_bytes] = *projection->index_granularity_bytes;
-            data_settings = new_data_settings;
-        }
+        auto new_data_settings = std::make_shared<MergeTreeSettings>(*data_settings);
+        new_data_settings->applyChanges(*settings_changes);
+        return new_data_settings;
     }
+
     return data_settings;
 }
 
@@ -10564,6 +10568,20 @@ StorageMetadataPtr MergeTreeData::getInMemoryMetadataPtr(bool bypass_metadata_ca
     return cache->emplace(this, IStorage::getInMemoryMetadataPtr(bypass_metadata_cache)).first->second;
 }
 
+
+StorageSnapshot::DataPtr MergeTreeData::getStorageSnapshotDataAttachPartsOnMerge(DataPartsVector & parts)
+{
+    assert(supportsUpsert());
+    auto snapshot_data = std::make_unique<SnapshotData>();
+    auto lock = lockParts();
+    for (const auto & part : parts)
+    {
+        if (part->delete_mark_bitmap)
+            snapshot_data->delete_mark_buffer_map[part->name] = part->delete_mark_bitmap;
+    }
+    return snapshot_data;
+}
+
 StorageSnapshotPtr
 MergeTreeData::createStorageSnapshot(const StorageMetadataPtr & metadata_snapshot, ContextPtr query_context, bool without_data) const
 {
@@ -10578,6 +10596,25 @@ MergeTreeData::createStorageSnapshot(const StorageMetadataPtr & metadata_snapsho
 
     bool apply_mutations_on_fly = query_context->getSettingsRef()[Setting::apply_mutations_on_fly];
     bool apply_patch_parts = query_context->getSettingsRef()[Setting::apply_patch_parts];
+
+    if (supportsUpsert())
+    {
+        auto parts = std::make_shared<RangesInDataParts>(*query_ranges);
+
+        std::erase_if(*parts, [](const auto & part)
+        {
+            return part.data_part->rows_count == 0
+                || part.data_part->rows_count == part.data_part->getDeleteMarksCount();
+        });
+
+        for (const auto & part : *parts)
+        {
+            if (part.data_part->delete_mark_bitmap)
+                snapshot_data->delete_mark_buffer_map[part.data_part->name] = part.data_part->delete_mark_bitmap;
+        }
+
+        snapshot_data->parts = std::move(parts);
+    }
 
     IMutationsSnapshot::Params params
     {

@@ -565,7 +565,14 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare() const
         global_ctx->temporary_directory_lock = global_ctx->data->getTemporaryPartDirectoryHolder(local_tmp_part_basename);
 
     global_ctx->storage_columns = global_ctx->metadata_snapshot->getColumns().getAllPhysical();
-    global_ctx->storage_snapshot = std::make_shared<StorageSnapshot>(*global_ctx->data, global_ctx->metadata_snapshot);
+    if (global_ctx->data->supportsUpsert())
+    {
+        // Create storage snapshot data under `lockParts.
+        auto storage_snapshot_data = global_ctx->data->getStorageSnapshotDataAttachPartsOnMerge(global_ctx->future_part->parts);
+        global_ctx->storage_snapshot = std::make_shared<StorageSnapshot>(*global_ctx->data, global_ctx->metadata_snapshot, std::move(storage_snapshot_data));
+    }
+    else
+        global_ctx->storage_snapshot = std::make_shared<StorageSnapshot>(*global_ctx->data, global_ctx->metadata_snapshot);
 
     ctx->need_remove_expired_values = false;
     ctx->force_ttl = false;

@@ -22,7 +22,11 @@
 #include <Processors/Merges/Algorithms/MergeTreeReadInfo.h>
 #include <Storages/MergeTree/MergedPartOffsets.h>
 #include <Storages/MergeTree/checkDataPart.h>
+#include <Storages/MergeTree/ProjectionIndex/ProjectionIndexUnique.h>
+#include <Columns/ColumnTuple.h>
 #include <Common/ThrottlerArray.h>
+
+#include <unordered_set>
 
 namespace DB
 {
@@ -178,6 +182,7 @@ MergeTreeSequentialSource::MergeTreeSequentialSource(
         .reader_settings = MergeTreeReaderSettings::createForMergeMutation(std::move(read_settings)),
         .storage_snapshot = storage_snapshot,
     };
+    extras.reader_settings.enable_upsert = storage.supportsUpsert();
 
     readers = MergeTreeReadTask::createReaders(read_task_info, extras, mark_ranges, patch_ranges);
 
@@ -242,15 +247,28 @@ try
         auto pos = reader_header.getPositionByName(name);
         auto & result_column = result_columns.emplace_back(std::move(read_result.columns[pos]));
 
-        /// When read_task_info->merged_part_offsets we need to adjust parent part offset in projection because it will
-        /// be different when parent has order by column and merge will change order of rows.
-        if (read_task_info->merged_part_offsets && read_task_info->data_part->isProjectionPart() && name == "_parent_part_offset")
+        /// When `merged_part_offsets` is set we need to adjust parent-part offsets
+        /// in projection columns because merge may reorder rows.
+        /// Both `_parent_part_offset` and the second sub-column of `_unique_kv` are UInt64 offsets
+        ///
+        static const std::unordered_set<String> offset_columns = {"_parent_part_offset", ProjectionIndexUnique::kv_column_name};
+        if (read_task_info->merged_part_offsets && read_task_info->data_part->isProjectionPart()
+            && offset_columns.contains(name))
         {
             chassert(read_task_info->merged_part_offsets->isFinalized());
-
             result_column = result_column->convertToFullColumnIfSparse();
-            auto & column = result_column->assumeMutableRef();
-            auto & offset_data = assert_cast<ColumnUInt64 &>(column).getData();
+            std::span<UInt64> offset_data;
+            if (name == "_parent_part_offset")
+            {
+                offset_data = assert_cast<ColumnUInt64 &>(result_column->assumeMutableRef()).getData();
+            }
+            else if (name == ProjectionIndexUnique::kv_column_name)
+            {
+                offset_data = assert_cast<ColumnUInt64 &>(
+                    assert_cast<ColumnTuple &>(result_column->assumeMutableRef())
+                        .getColumn(1).assumeMutableRef()).getData();
+            }
+
             if (read_task_info->merged_part_offsets->isMappingEnabled())
             {
                 for (auto & offset : offset_data)

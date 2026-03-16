@@ -327,9 +327,36 @@ std::vector<std::string> MergeTreeSink::commitPart(MergeTreeMutableDataPartPtr &
     /// It's important to create it outside of lock scope because
     /// otherwise it can lock parts in destructor and deadlock is possible.
     MergeTreeData::Transaction transaction(storage, context->getCurrentTransaction().get());
+
+    std::unique_ptr<PlainCommittingBlockHolder> block_holder;
+    std::any dedup_lock_guard;
+
+    if (storage.supportsUpsert())
+    {
+        /// For UniqueMergeTree the dedup logic needs the part's block number
+        /// (used as version) to be assigned BEFORE `dedupUniqueIndex` runs.
+        /// Allocate the block number under DataPartsLock first, then release
+        /// the lock so that `invokePreLockHook` can acquire dedup_mutex without
+        /// violating the lock ordering (dedup_mutex -> DataPartsLock).
+        {
+            auto lock = storage.lockParts();
+            block_holder = storage.fillNewPartName(part, lock);
+        }
+
+        /// Now invoke the pre-lock hook which acquires dedup_mutex and runs
+        /// cross-part dedup. The returned guard keeps dedup_mutex held until
+        /// this function returns, preventing concurrent dedup races.
+        MergeTreeData::MutableDataParts parts_for_hook;
+        parts_for_hook.insert(part);
+        dedup_lock_guard = storage.invokePreLockHook(parts_for_hook);
+    }
+
     {
         auto lock = storage.lockParts();
-        auto block_holder = storage.fillNewPartName(part, lock);
+
+        /// For non-upsert tables, allocate block number in the normal position.
+        if (!block_holder)
+            block_holder = storage.fillNewPartName(part, lock);
 
         if (!deduplication_hashes.empty())
         {

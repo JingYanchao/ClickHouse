@@ -18,16 +18,87 @@ extern const int LOGICAL_ERROR;
 
 namespace
 {
+class ReadBufferWrapper
+{
+public:
+    /// Storage mode: owns the buffer, can release and re-create it.
+    ReadBufferWrapper(std::unique_ptr<ReadBufferFromFileBase> buffer_, const String & file_path_, DataPartStoragePtr storage_)
+        : owned_buffer(std::move(buffer_)), file_path(file_path_), storage(std::move(storage_))
+    {
+    }
+
+    /// Raw mode: wraps a non-owning SeekableReadBuffer with a base offset and region size.
+    /// The caller is responsible for the lifetime of raw_buffer.
+    ReadBufferWrapper(SeekableReadBuffer * raw_buffer, uint64_t base_offset, uint64_t region_size)
+        : raw_read_buffer(raw_buffer), raw_base_offset(base_offset), raw_region_size(region_size)
+    {
+    }
+
+    void release()
+    {
+        std::scoped_lock lock(mutex);
+        /// Only release owned buffers; raw mode is non-owning.
+        if (raw_read_buffer)
+            return;
+        owned_buffer.reset();
+    }
+
+    /// Atomic seek + read: both operations are performed under a single lock
+    /// to prevent race conditions when multiple threads share the same buffer
+    /// (e.g. RocksDB's RandomAccessFile::Read from parallel dedup threads).
+    size_t seekAndRead(off_t offset, int whence, char * to, size_t n) const
+    {
+        std::scoped_lock lock(mutex);
+        seekImpl(offset, whence);
+        if (raw_read_buffer)
+            return raw_read_buffer->read(to, n);
+        checkOrCreateReadBuffer();
+        return owned_buffer->read(to, n);
+    }
+
+private:
+    void seekImpl(off_t offset, int whence) const
+    {
+        if (raw_read_buffer)
+        {
+            /// In raw mode, all offsets are relative to raw_base_offset.
+            if (whence == SEEK_SET)
+                raw_read_buffer->seek(raw_base_offset + offset, SEEK_SET);
+            else if (whence == SEEK_END)
+                raw_read_buffer->seek(raw_base_offset + raw_region_size + offset, SEEK_SET);
+            else
+                raw_read_buffer->seek(offset, whence);
+            return;
+        }
+        checkOrCreateReadBuffer();
+        owned_buffer->seek(offset, whence);
+    }
+
+    void checkOrCreateReadBuffer() const
+    {
+        if (!owned_buffer && storage)
+            owned_buffer = storage->readFile(file_path, ReadSettings(), std::nullopt);
+    }
+
+    mutable std::unique_ptr<ReadBufferFromFileBase> owned_buffer;
+    String file_path;
+    DataPartStoragePtr storage;
+
+    /// Raw (non-owning) mode fields
+    SeekableReadBuffer * raw_read_buffer = nullptr;
+    uint64_t raw_base_offset = 0;
+    uint64_t raw_region_size = 0;
+
+    mutable std::mutex mutex;
+};
+using ReadBufferWrapperPtr = std::shared_ptr<ReadBufferWrapper>;
 class ReadBufferBasedSequentialFile : public rocksdb::FSSequentialFile
 {
 public:
-    ReadBufferBasedSequentialFile(SeekableReadBuffer & read_buffer_, uint64_t base_offset_, uint64_t region_size_)
+    explicit ReadBufferBasedSequentialFile(const ReadBufferWrapperPtr & read_buffer_)
         : read_buffer(read_buffer_)
-        , base_offset(base_offset_)
-        , region_size(region_size_)
-        , current_offset(0)
+        , position(0)
     {
-        read_buffer.seek(base_offset, SEEK_SET);
     }
 
     rocksdb::IOStatus Read(
@@ -37,37 +108,28 @@ public:
         char * scratch,
         rocksdb::IODebugContext *) override
     {
-        size_t remaining = (current_offset < region_size) ? (region_size - current_offset) : 0;
-        size_t to_read = std::min(n, remaining);
-        auto read = read_buffer.read(scratch, to_read);
-        current_offset += read;
-        *result = rocksdb::Slice(scratch, read);
+        auto bytes_read = read_buffer->seekAndRead(position, SEEK_SET, scratch, n);
+        position += bytes_read;
+        *result = rocksdb::Slice(scratch, bytes_read);
         return rocksdb::IOStatus::OK();
     }
 
     rocksdb::IOStatus Skip(uint64_t n) override
     {
-        size_t remaining = (current_offset < region_size) ? (region_size - current_offset) : 0;
-        size_t to_skip = std::min(static_cast<size_t>(n), remaining);
-        read_buffer.ignore(to_skip);
-        current_offset += to_skip;
+        position += n;
         return rocksdb::IOStatus::OK();
     }
 
 private:
-    SeekableReadBuffer & read_buffer;
-    uint64_t base_offset;
-    uint64_t region_size;
-    uint64_t current_offset;
+    ReadBufferWrapperPtr read_buffer;
+    uint64_t position;
 };
 
 class ReadBufferBasedRandomAccessFile : public rocksdb::FSRandomAccessFile
 {
 public:
-    ReadBufferBasedRandomAccessFile(SeekableReadBuffer & read_buffer_, uint64_t base_offset_, uint64_t region_size_)
+    explicit ReadBufferBasedRandomAccessFile(const ReadBufferWrapperPtr & read_buffer_)
         : read_buffer(read_buffer_)
-        , base_offset(base_offset_)
-        , region_size(region_size_)
     {
     }
 
@@ -79,20 +141,13 @@ public:
         char * scratch,
         rocksdb::IODebugContext *) const override
     {
-        size_t remaining = (offset < region_size) ? (region_size - offset) : 0;
-        size_t to_read = std::min(n, remaining);
-
-        auto & mutable_buffer = const_cast<SeekableReadBuffer &>(read_buffer);
-        mutable_buffer.seek(base_offset + offset, SEEK_SET);
-        auto read = mutable_buffer.read(scratch, to_read);
-        *result = rocksdb::Slice(scratch, read);
+        auto bytes_read = read_buffer->seekAndRead(offset, SEEK_SET, scratch, n);
+        *result = rocksdb::Slice(scratch, bytes_read);
         return rocksdb::IOStatus::OK();
     }
 
 private:
-    SeekableReadBuffer & read_buffer;
-    uint64_t base_offset;
-    uint64_t region_size;
+    ReadBufferWrapperPtr read_buffer;
 };
 
 class WriteBufferWritableFile : public rocksdb::FSWritableFile
@@ -217,33 +272,48 @@ private:
 class ReadBufferFileSystem : public rocksdb::FileSystem
 {
 public:
+    /// Construct from DataPartStorage: files are opened by name through the storage layer.
+    explicit ReadBufferFileSystem(const DataPartStoragePtr & storage_)
+        : storage(storage_)
+    {
+    }
+
+    /// Construct from a raw SeekableReadBuffer: a single pre-opened buffer is used for all reads.
+    /// FileExists always succeeds; GetFileSize returns the supplied region_size.
     ReadBufferFileSystem(SeekableReadBuffer * read_buffer_, uint64_t base_offset_, uint64_t region_size_)
-        : read_buffer(read_buffer_)
-        , base_offset(base_offset_)
-        , region_size(region_size_)
+        : raw_read_buffer(read_buffer_), raw_base_offset(base_offset_), raw_region_size(region_size_)
     {
     }
 
     const char* Name() const override { return "ReadBufferFileSystem"; }
 
+    /// Release all ReadBuffer memory from created files
+    void releaseAllBufferMemory()
+    {
+        std::scoped_lock lock(read_buffers_manage_mutex);
+        for (const auto & wrapper : created_buffer_wrappers)
+        {
+            if (wrapper)
+                wrapper->release();
+        }
+    }
+
     rocksdb::IOStatus NewSequentialFile(
-        const std::string &,
+        const std::string & f,
         const rocksdb::FileOptions &,
         std::unique_ptr<rocksdb::FSSequentialFile> * r,
         rocksdb::IODebugContext *) override
     {
-        *r = std::make_unique<ReadBufferBasedSequentialFile>(*read_buffer, base_offset, region_size);
-        return rocksdb::IOStatus::OK();
+        return createFile<ReadBufferBasedSequentialFile>(f, r);
     }
 
     rocksdb::IOStatus NewRandomAccessFile(
-        const std::string &,
+        const std::string & f,
         const rocksdb::FileOptions &,
         std::unique_ptr<rocksdb::FSRandomAccessFile> * r,
         rocksdb::IODebugContext *) override
     {
-        *r = std::make_unique<ReadBufferBasedRandomAccessFile>(*read_buffer, base_offset, region_size);
-        return rocksdb::IOStatus::OK();
+        return createFile<ReadBufferBasedRandomAccessFile>(f, r);
     }
 
     rocksdb::IOStatus NewLogger(
@@ -257,21 +327,31 @@ public:
     }
 
     rocksdb::IOStatus FileExists(
-        const std::string &,
+        const std::string & f,
         const rocksdb::IOOptions &,
         rocksdb::IODebugContext *) override
     {
+        if (storage)
+        {
+            if (storage->existsFile(f))
+                return rocksdb::IOStatus::OK();
+            else
+                return rocksdb::IOStatus::NotFound();
+        }
+        /// Raw buffer mode: the file always "exists"
         return rocksdb::IOStatus::OK();
     }
 
     rocksdb::IOStatus GetFileSize(
-        const std::string &,
+        const std::string & f,
         const rocksdb::IOOptions &,
-        uint64_t * file_size,
+        uint64_t * res,
         rocksdb::IODebugContext *) override
     {
-        if (file_size)
-            *file_size = region_size;
+        if (storage)
+            *res = storage->getFileSize(f);
+        else
+            *res = raw_region_size;
         return rocksdb::IOStatus::OK();
     }
 
@@ -341,9 +421,35 @@ public:
         bool *,
         rocksdb::IODebugContext *) override { return rocksdb::IOStatus::NotSupported(); }
 private:
-    SeekableReadBuffer * read_buffer = nullptr;
-    uint64_t base_offset = 0;
-    uint64_t region_size = 0;
+    template <typename ReadBufferFileType>
+    rocksdb::IOStatus createFile(
+        const std::string & file_path,
+        auto * result)
+    {
+        ReadBufferWrapperPtr read_buffer_wrapper;
+        if (storage)
+        {
+            auto buf = storage->readFile(file_path, ReadSettings(), std::nullopt);
+            read_buffer_wrapper = std::make_shared<ReadBufferWrapper>(std::move(buf), file_path, storage);
+        }
+        else
+        {
+            /// Raw buffer mode: wrap the pre-opened SeekableReadBuffer (non-owning).
+            read_buffer_wrapper = std::make_shared<ReadBufferWrapper>(raw_read_buffer, raw_base_offset, raw_region_size);
+        }
+        {
+            std::scoped_lock lock(read_buffers_manage_mutex);
+            created_buffer_wrappers.emplace_back(read_buffer_wrapper);
+        }
+        *result = std::make_unique<ReadBufferFileType>(read_buffer_wrapper);
+        return rocksdb::IOStatus::OK();
+    }
+    DataPartStoragePtr storage;
+    SeekableReadBuffer * raw_read_buffer = nullptr;
+    uint64_t raw_base_offset = 0;
+    uint64_t raw_region_size = 0;
+    std::mutex read_buffers_manage_mutex;
+    std::vector<ReadBufferWrapperPtr> created_buffer_wrappers;
 };
 
 class WriteBufferFileSystem : public rocksdb::FileSystem
@@ -534,15 +640,13 @@ std::unique_ptr<rocksdb::Env> createWriteBufferFileSystemEnv(WriteBuffer * write
     return rocksdb::NewCompositeEnv(std::make_shared<WriteBufferFileSystem>(write_buffer));
 }
 
-std::unique_ptr<rocksdb::Env> createReadBufferFileSystemEnv(SeekableReadBuffer * read_buffer, uint64_t base_offset, uint64_t region_size)
+std::unique_ptr<rocksdb::Env> createReadBufferFileSystemEnv(const DataPartStoragePtr & storage)
 {
-    return rocksdb::NewCompositeEnv(std::make_shared<ReadBufferFileSystem>(read_buffer, base_offset, region_size));
+    return rocksdb::NewCompositeEnv(std::make_shared<ReadBufferFileSystem>(storage));
 }
 
-SSTFileReader::SSTFileReader(SeekableReadBuffer * read_buffer, uint64_t base_offset, uint64_t region_size)
+void SSTFileReader::init(const String & file_name)
 {
-    sst_env = createReadBufferFileSystemEnv(read_buffer, base_offset, region_size);
-
     rocksdb::Options options;
     options.env = sst_env.get();
 
@@ -551,17 +655,17 @@ SSTFileReader::SSTFileReader(SeekableReadBuffer * read_buffer, uint64_t base_off
     options.table_factory.reset(NewBlockBasedTableFactory(table_options));
 
     auto local_reader = std::make_unique<rocksdb::SstFileReader>(options);
-    auto status = local_reader->Open("");
+    auto status = local_reader->Open(file_name);
     if (!status.ok())
-        throw Exception(ErrorCodes::INCORRECT_DATA, "Failed to open SST reader from ReadBuffer: {}", status.ToString());
+        throw Exception(ErrorCodes::INCORRECT_DATA, "Failed to open SST reader for {}: {}", file_name, status.ToString());
 
     status = local_reader->VerifyChecksum();
     if (!status.ok())
-        throw Exception(ErrorCodes::INCORRECT_DATA, "Failed to verify SST checksum: {}", status.ToString());
+        throw Exception(ErrorCodes::INCORRECT_DATA, "Failed to verify SST checksum for {}: {}", file_name, status.ToString());
 
     index_reader = std::move(local_reader);
 
-    // Load min max key
+    /// Load min/max key range
     rocksdb::ReadOptions read_opts;
     read_opts.fill_cache = false;
     auto iter = newIterator(read_opts);
@@ -572,6 +676,58 @@ SSTFileReader::SSTFileReader(SeekableReadBuffer * read_buffer, uint64_t base_off
         iter->SeekToLast();
         auto max_key = iter->key().ToString();
         key_range = std::make_pair(std::move(min_key), std::move(max_key));
+    }
+}
+
+SSTFileReader::SSTFileReader(SeekableReadBuffer * read_buffer, uint64_t base_offset, uint64_t region_size)
+{
+    sst_env = rocksdb::NewCompositeEnv(
+        std::make_shared<ReadBufferFileSystem>(read_buffer, base_offset, region_size));
+    init("");
+}
+
+SSTFileReader::SSTFileReader(const DataPartStoragePtr & storage, const String & sst_file_name)
+{
+    sst_env = rocksdb::NewCompositeEnv(std::make_shared<ReadBufferFileSystem>(storage));
+    init(sst_file_name);
+}
+
+void SSTFileReader::releaseBufferMemory() const
+{
+    if (!sst_env)
+        return;
+
+    auto * fs = static_cast<ReadBufferFileSystem *>(sst_env->GetFileSystem().get());
+    if (fs)
+    {
+        /// Release all ReadBuffer memory (1MB per file).
+        /// Bloom filter and block cache remain.
+        fs->releaseAllBufferMemory();
+    }
+}
+
+bool SSTFileReader::get(const rocksdb::Slice & key, std::string * value_out) const
+{
+    std::vector<rocksdb::Slice> keys = {key};
+    std::vector<std::string> values;
+    auto statuses = index_reader->MultiGet(rocksdb::ReadOptions(), keys, &values);
+
+    if (statuses.empty())
+        throw Exception(ErrorCodes::INCORRECT_DATA, "MultiGet returned empty statuses for single key lookup");
+
+    if (statuses[0].ok())
+    {
+        if (value_out)
+            *value_out = std::move(values[0]);
+        return true;
+    }
+    else if (statuses[0].IsNotFound())
+    {
+        return false;
+    }
+    else
+    {
+        throw Exception(ErrorCodes::INCORRECT_DATA, "Failed to get key from unique index: {}", statuses[0].ToString());
     }
 }
 

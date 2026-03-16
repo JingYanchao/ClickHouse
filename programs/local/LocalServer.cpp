@@ -956,6 +956,10 @@ void LocalServer::processConfig()
     }
     global_context->setMarkCache(mark_cache_policy, mark_cache_size, mark_cache_size_ratio);
 
+    /// SST file reader cache for unique dedup — uses a fixed default size for now.
+    constexpr size_t sst_reader_cache_size = 128 * 1024 * 1024;
+    global_context->setSSTFileReaderCache("SLRU", sst_reader_cache_size, 0.5);
+
     String index_uncompressed_cache_policy = server_settings[ServerSetting::index_uncompressed_cache_policy];
     size_t index_uncompressed_cache_size = server_settings[ServerSetting::index_uncompressed_cache_size];
     double index_uncompressed_cache_size_ratio = server_settings[ServerSetting::index_uncompressed_cache_size_ratio];

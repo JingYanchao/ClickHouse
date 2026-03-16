@@ -5,6 +5,8 @@
 #include <Storages/MergeTree/extractZooKeeperPathFromReplicatedTableDef.h>
 #include <Storages/StorageFactory.h>
 #include <Storages/StorageMergeTree.h>
+#include <Storages/StorageUniqueMergeTree.h>
+#include <Storages/MergeTree/ProjectionIndex/ProjectionIndexUnique.h>
 #include <Storages/StorageReplicatedMergeTree.h>
 #include <Storages/TableZnodeInfo.h>
 
@@ -419,6 +421,8 @@ static StoragePtr create(const StorageFactory::Arguments & args)
         merging_params.mode = MergeTreeData::MergingParams::Graphite;
     else if (name_part == "VersionedCollapsing")
         merging_params.mode = MergeTreeData::MergingParams::VersionedCollapsing;
+    else if (name_part == "Unique")
+        merging_params.mode = MergeTreeData::MergingParams::Ordinary;
     else if (!name_part.empty())
         throw Exception(ErrorCodes::UNKNOWN_STORAGE, "Unknown storage {}",
             args.engine_name + verbose_help_message);
@@ -464,6 +468,15 @@ static StoragePtr create(const StorageFactory::Arguments & args)
         add_optional_param("sampling element of primary key");
         add_mandatory_param("primary key expression");
         add_mandatory_param("index granularity");
+    }
+
+    /// UniqueMergeTree has its own optional parameters parsed separately below.
+    bool is_unique = (name_part == "Unique");
+
+    if (is_unique && is_extended_storage_def)
+    {
+        add_optional_param("version column");
+        add_optional_param("unique projection name");
     }
 
     switch (merging_params.mode)
@@ -625,6 +638,70 @@ static StoragePtr create(const StorageFactory::Arguments & args)
         merging_param_key_arg = merging_params.version_column;
     }
 
+    /// UniqueMergeTree optional parameters: ('projection_name', 'version_column')
+    /// Both are optional string literals. If omitted:
+    ///   - projection_name: defaults to "__unique_index"
+    ///   - version_column: defaults to _block_number
+    String unique_projection_name;
+    String unique_version_column;
+
+    if (is_unique && is_extended_storage_def)
+    {
+        /// Parse from the end: version_column last (if present), then projection_name.
+        /// UniqueMergeTree('__unique_index', 'ver')  -> 2 args
+        /// UniqueMergeTree('__unique_index')          -> 1 arg (projection only)
+        /// UniqueMergeTree()                          -> 0 args (both default)
+
+        size_t unique_args = arg_cnt - arg_num;
+        if (unique_args >= 2)
+        {
+            if (const auto * ast = engine_args[arg_cnt - 1]->as<ASTLiteral>())
+            {
+                if (ast->value.getType() != Field::Types::String)
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                        "Second parameter of UniqueMergeTree (version column) must be a string literal{}",
+                        verbose_help_message);
+                unique_version_column = ast->value.safeGet<String>();
+            }
+            else
+            {
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Second parameter of UniqueMergeTree (version column) must be a string literal{}",
+                    verbose_help_message);
+            }
+            --arg_cnt;
+        }
+
+        unique_args = arg_cnt - arg_num;
+        if (unique_args >= 1)
+        {
+            if (const auto * ast = engine_args[arg_cnt - 1]->as<ASTLiteral>())
+            {
+                if (ast->value.getType() != Field::Types::String)
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                        "First parameter of UniqueMergeTree (projection name) must be a string literal{}",
+                        verbose_help_message);
+                unique_projection_name = ast->value.safeGet<String>();
+            }
+            else
+            {
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "First parameter of UniqueMergeTree (projection name) must be a string literal{}",
+                    verbose_help_message);
+            }
+            --arg_cnt;
+        }
+
+        /// Default projection name to __unique_index if not specified.
+        if (unique_projection_name.empty())
+            unique_projection_name = ProjectionIndexUnique::default_projection_name;
+
+        /// Store the version column into merging_params so that
+        /// StorageUniqueMergeTree can access it via the inherited merging_params.
+        if (!unique_version_column.empty())
+            merging_params.version_column = unique_version_column;
+    }
+
     String date_column_name;
 
     StorageInMemoryMetadata metadata;
@@ -773,15 +850,40 @@ static StoragePtr create(const StorageFactory::Arguments & args)
 
         if (args.query.columns_list && args.query.columns_list->projections)
         {
+            LOG_DEBUG(getLogger("registerStorageMergeTree"),
+                "Parsing {} projections from columns_list",
+                args.query.columns_list->projections->children.size());
+
             for (auto & projection_ast : args.query.columns_list->projections->children)
             {
+                LOG_DEBUG(getLogger("registerStorageMergeTree"),
+                    "Parsing projection: {}", projection_ast->formatForErrorMessage());
                 try
                 {
                     auto projection = ProjectionDescription::getProjectionFromAST(projection_ast, columns, context);
                     metadata.projections.add(std::move(projection));
+                    LOG_DEBUG(getLogger("registerStorageMergeTree"),
+                        "Successfully added projection, total now: {}", metadata.projections.size());
+                }
+                catch (Exception & e)
+                {
+                    LOG_ERROR(getLogger("registerStorageMergeTree"),
+                        "Exception while parsing projection '{}': code={}, message='{}', stack='{}'",
+                        projection_ast->formatForErrorMessage(),
+                        e.code(), e.message(), e.getStackTraceString());
+                    if (args.mode < LoadingStrictnessLevel::FORCE_ATTACH)
+                        throw;
+                    tryLogCurrentException(__PRETTY_FUNCTION__, fmt::format(
+                        "Cannot parse projection {} during server startup, skipping it. "
+                        "It may be caused by a dependency on a dropped dictionary or a missing object. "
+                        "Consider recreating the projection or dropping and recreating the table.",
+                        projection_ast->formatForErrorMessage()));
                 }
                 catch (...)
                 {
+                    LOG_ERROR(getLogger("registerStorageMergeTree"),
+                        "Unknown exception while parsing projection '{}'",
+                        projection_ast->formatForErrorMessage());
                     if (args.mode < LoadingStrictnessLevel::FORCE_ATTACH)
                         throw;
                     tryLogCurrentException(__PRETTY_FUNCTION__, fmt::format(
@@ -791,6 +893,13 @@ static StoragePtr create(const StorageFactory::Arguments & args)
                         projection_ast->formatForErrorMessage()));
                 }
             }
+        }
+        else
+        {
+            LOG_DEBUG(getLogger("registerStorageMergeTree"),
+                "No projections found in columns_list: columns_list={}, projections={}",
+                args.query.columns_list != nullptr,
+                args.query.columns_list ? (args.query.columns_list->projections != nullptr) : false);
         }
 
         auto column_ttl_asts = columns.getColumnTTLs();
@@ -922,6 +1031,22 @@ static StoragePtr create(const StorageFactory::Arguments & args)
             create_query_zk_retries_info);
     }
 
+    /// UniqueMergeTree engine — uses StorageUniqueMergeTree which inherits StorageMergeTree
+    /// and injects dedup logic via TransactionPreLockHook.
+    if (name_part == "Unique")
+    {
+        return std::make_shared<StorageUniqueMergeTree>(
+            args.table_id,
+            args.relative_data_path,
+            metadata,
+            args.mode,
+            context,
+            date_column_name,
+            merging_params,
+            std::move(storage_settings),
+            unique_projection_name);
+    }
+
     return std::make_shared<StorageMergeTree>(
         args.table_id,
         args.relative_data_path,
@@ -947,6 +1072,7 @@ void registerStorageMergeTree(StorageFactory & factory)
     };
 
     factory.registerStorage("MergeTree", create, features);
+    factory.registerStorage("UniqueMergeTree", create, features);
     factory.registerStorage("CollapsingMergeTree", create, features);
     factory.registerStorage("ReplacingMergeTree", create, features);
     factory.registerStorage("CoalescingMergeTree", create, features);

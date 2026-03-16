@@ -347,6 +347,8 @@
     M(DNSAddressesCacheSize, "Number of cached DNS addresses") \
     M(MarkCacheBytes, "Total size of mark cache in bytes") \
     M(MarkCacheFiles, "Total number of mark files cached in the mark cache") \
+    M(SSTReaderCacheBytes, "Total size of the SST reader cache in bytes") \
+    M(SSTReaderCacheFiles, "Total number of SST file readers cached in the SST reader cache") \
     M(NamedCollection, "Number of named collections") \
     M(PrimaryIndexCacheBytes, "Total size of primary index cache in bytes") \
     M(PrimaryIndexCacheFiles, "Total number of index files cached in the primary index cache") \

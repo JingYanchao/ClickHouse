@@ -1,8 +1,10 @@
 #include <DataTypes/Serializations/SerializationSortedStringKV.h>
 #include <Storages/MergeTree/SSTFileUtil.h>
 #include <Storages/MergeTree/MergeTreeReaderStream.h>
+#include <Storages/MergeTree/ProjectionIndex/ProjectionIndexUnique.h>
 #include <Columns/ColumnTuple.h>
 #include <Columns/ColumnString.h>
+#include <Columns/ColumnsNumber.h>
 #include <Common/assert_cast.h>
 #include <Common/logger_useful.h>
 #include <IO/ReadHelpers.h>
@@ -58,7 +60,8 @@ void SerializationSortedStringKV::serializeBinaryBulkWithMultipleStreams(
 
     const auto & tuple_col = assert_cast<const ColumnTuple &>(column);
     const auto & key_col = assert_cast<const ColumnString &>(tuple_col.getColumn(0));
-    const auto & value_col = assert_cast<const ColumnString &>(tuple_col.getColumn(1));
+    /// Value column is UInt64 — part_offset
+    const auto & offset_col = assert_cast<const ColumnUInt64 &>(tuple_col.getColumn(1));
 
     size_t size = key_col.size();
     size_t end = limit ? std::min(offset + limit, size) : size;
@@ -92,11 +95,14 @@ void SerializationSortedStringKV::serializeBinaryBulkWithMultipleStreams(
     for (size_t i = offset; i < end; ++i)
     {
         const auto key = key_col.getDataAt(i);
-        const auto val = value_col.getDataAt(i);
+
+        /// Encode UInt64 -> UniqueValueEntry -> 8-byte big-endian string
+        UniqueValueEntry entry{offset_col.getData()[i]};
+        String encoded_value = entry.encode();
 
         sst_state->sst_file_writer->put(
             rocksdb::Slice(key),
-            rocksdb::Slice(val));
+            rocksdb::Slice(encoded_value));
     }
 
     /// Write row offset at granule boundary for seek
@@ -144,7 +150,8 @@ void SerializationSortedStringKV::deserializeBinaryBulkWithMultipleStreams(
     auto mutable_column = column->assumeMutable();
     auto & tuple_col = assert_cast<ColumnTuple &>(*mutable_column);
     auto & key_col = assert_cast<ColumnString &>(tuple_col.getColumn(0));
-    auto & value_col = assert_cast<ColumnString &>(tuple_col.getColumn(1));
+    /// Value column is UInt64 — part_offset
+    auto & offset_col = assert_cast<ColumnUInt64 &>(tuple_col.getColumn(1));
 
     auto * sst_state = checkAndGetState<DeserializeBinaryBulkStateSortedStringKV>(state);
 
@@ -222,7 +229,12 @@ void SerializationSortedStringKV::deserializeBinaryBulkWithMultipleStreams(
     while (iter->Valid() && rows_read < limit)
     {
         key_col.insertData(iter->key().data(), iter->key().size());
-        value_col.insertData(iter->value().data(), iter->value().size());
+
+        /// Decode 8-byte big-endian UniqueValueEntry -> UInt64 part_offset
+        const auto & value_slice = iter->value();
+        auto entry = UniqueValueEntry::decode(value_slice.data(), value_slice.size());
+        offset_col.insertValue(entry.part_offset);
+
         ++rows_read;
         ++sst_state->current_row_position;
 

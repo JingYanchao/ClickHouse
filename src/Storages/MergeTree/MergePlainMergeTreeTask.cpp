@@ -155,6 +155,7 @@ void MergePlainMergeTreeTask::finish()
 
     MergeTreeData::Transaction transaction(storage, txn.get());
     storage.merger_mutator.renameMergedTemporaryPart(new_part, future_part->parts, txn, transaction);
+    transaction.setCommitOperation(MergeTreeData::CommitOperation::Merge);
     transaction.commit();
 
     ThreadFuzzer::maybeInjectSleep();

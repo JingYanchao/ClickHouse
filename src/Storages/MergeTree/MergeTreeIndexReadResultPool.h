@@ -93,11 +93,21 @@ struct ProjectionIndexBitmap
     template <typename Offset>
     bool contains(std::type_identity_t<Offset> value);
 
+    /// Type-dispatching overload: automatically calls Bitmap32 or Bitmap64 based on internal type.
+    bool contains(UInt64 value);
+
     template <typename Offset>
     void add(std::type_identity_t<Offset> value);
 
+    /// Type-dispatching overload: automatically calls Bitmap32 or Bitmap64 based on internal type.
+    void add(UInt64 value);
+
     template <typename Offset>
     void addBulk(const std::type_identity_t<Offset> * values, size_t size);
+
+    /// Flips all bits in the range [begin, end).
+    /// After flipping, bits that were 0 become 1 and vice versa.
+    void flipRange(size_t begin, size_t end);
 
     /// Checks whether the bitmap has no bits set in the range [begin, end).
     bool rangeAllZero(size_t begin, size_t end) const;

@@ -35,7 +35,7 @@ public:
     /// Read state: SST reader with lazy initialization (clone-safe)
     struct DeserializeBinaryBulkStateSortedStringKV : public DeserializeBinaryBulkState
     {
-        std::shared_ptr<SSTFileReader> sst_file_reader;
+        std::shared_ptr<const SSTFileReader> sst_file_reader;
         std::unique_ptr<rocksdb::Iterator> sst_file_iterator;
         UInt64 current_row_position = 0;
 

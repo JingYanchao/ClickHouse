@@ -16,6 +16,7 @@
 #include <IO/SharedThreadPools.h>
 #include <Compression/CachedCompressedReadBuffer.h>
 #include <DataTypes/DataTypeSortedStringKV.h>
+#include <Storages/MergeTree/MergeTreeVirtualColumns.h>
 
 namespace DB
 {
@@ -589,6 +590,12 @@ void MergeTreeReaderWide::readData(
 {
     ISerialization::DeserializeBinaryBulkSettings deserialize_settings;
     deserialize_settings.data_part_type = MergeTreeDataPartType::Wide;
+
+    if (settings.enable_upsert && name_and_type.name == RowExistsColumn::name)
+    {
+        fillMemoryRowExistsColumn(column, max_rows_to_read);
+        return;
+    }
 
     deserializePrefix(serialization, name_and_type, from_mark, current_task_last_mark, deserialize_binary_bulk_state_map, cache, deserialize_states_cache, {});
 

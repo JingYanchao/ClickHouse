@@ -433,6 +433,7 @@ ReadFromMergeTree::ReadFromMergeTree(
     setStepDescription(description, context->getSettingsRef()[Setting::query_plan_max_step_description_length]);
     enable_vertical_final = query_info.isFinal() && context->getSettingsRef()[Setting::enable_vertical_final]
         && data.merging_params.mode == MergeTreeData::MergingParams::Replacing;
+    reader_settings.enable_upsert = data.supportsUpsert();
 }
 
 std::unique_ptr<ReadFromMergeTree> ReadFromMergeTree::createLocalParallelReplicasReadingStep(
@@ -3273,7 +3274,7 @@ void ReadFromMergeTree::initializePipeline(QueryPipelineBuilder & pipeline, cons
 {
     auto & result = getAnalysisResult();
 
-    if (enable_remove_parts_from_snapshot_optimization)
+    if (enable_remove_parts_from_snapshot_optimization && !data.supportsUpsert())
     {
         /// Do not keep data parts in snapshot.
         /// They are stored separately, and some could be released after PK analysis.

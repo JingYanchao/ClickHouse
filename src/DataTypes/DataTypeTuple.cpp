@@ -391,7 +391,7 @@ SerializationPtr DataTypeTuple::getSerialization(const SerializationInfo & info)
     std::erase(kinds, ISerialization::Kind::SPARSE);
 
     if (custom_serialization)
-        return IDataType::getSerialization(kinds, info.getSettings(), custom_serialization);
+        return wrapSerializationBasedOnKindStack(custom_serialization, kinds, info.getSettings());
 
     return wrapSerializationBasedOnKindStack(SerializationTuple::create(std::move(serializations), has_explicit_names), kinds, info.getSettings());
 }

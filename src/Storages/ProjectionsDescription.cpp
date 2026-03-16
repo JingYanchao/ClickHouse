@@ -1,5 +1,6 @@
 #include <Storages/ProjectionsDescription.h>
 
+#include <Access/AccessControl.h>
 #include <Columns/ColumnConst.h>
 #include <Common/iota.h>
 #include <Core/Defines.h>
@@ -34,6 +35,8 @@
 #include <QueryPipeline/Pipe.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include <Storages/IStorage.h>
+#include <Storages/MergeTree/MergeTreeBackgroundExecutor.h>
+#include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/MergeTree/MergeTreeVirtualColumns.h>
 #include <Storages/StorageInMemoryMetadata.h>
 
@@ -96,8 +99,8 @@ ProjectionDescription ProjectionDescription::clone() const
     other.with_block_number = with_block_number;
     other.with_block_offset = with_block_offset;
     other.index = index;
-    other.index_granularity = index_granularity;
-    other.index_granularity_bytes = index_granularity_bytes;
+    other.settings_changes = settings_changes;
+    other.has_index_granularity_overrides = has_index_granularity_overrides;
 
     return other;
 }
@@ -226,33 +229,8 @@ private:
 
 }
 
-void ProjectionDescription::loadSettings(const SettingsChanges & changes)
-{
-    for (const auto & [setting, value] : changes)
-    {
-        if (setting == "index_granularity")
-            index_granularity = value.safeGet<UInt64>();
-        else if (setting == "index_granularity_bytes")
-            index_granularity_bytes = value.safeGet<UInt64>();
-        else
-            throw Exception(ErrorCodes::UNKNOWN_SETTING, "Unknown setting '{}' for projections", setting);
-    }
-
-    /// These checks are permanent sensible safeguards: they apply both to projection creation and projection loading,
-    /// and are not expected to change in the future. Keeping them unconditional simplifies the implementation.
-
-    if (index_granularity && *index_granularity < 1)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "projection index_granularity: value {} makes no sense", *index_granularity);
-
-    if (index_granularity_bytes && *index_granularity_bytes > 0 && *index_granularity_bytes < 1024)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "projection index_granularity_bytes: {} is lower than 1024", *index_granularity_bytes);
-
-    if (index_granularity_bytes && *index_granularity_bytes == 0)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "projection index_granularity_bytes cannot be 0, which leads to fixed granularity");
-}
-
-ProjectionDescription
-ProjectionDescription::getProjectionFromAST(const ASTPtr & definition_ast, const ColumnsDescription & columns, ContextPtr query_context)
+ProjectionDescription ProjectionDescription::getProjectionFromAST(
+    const ASTPtr & definition_ast, const ColumnsDescription & columns, ContextPtr query_context, LoadingStrictnessLevel mode)
 {
     const auto * projection_definition = definition_ast->as<ASTProjectionDeclaration>();
 
@@ -271,15 +249,35 @@ ProjectionDescription::getProjectionFromAST(const ASTPtr & definition_ast, const
         chassert(projection_definition->type);
         result.index = ProjectionIndexFactory::instance().get(*projection_definition);
         result.index->fillProjectionDescription(result, projection_definition->index, columns, query_context);
-        if (projection_definition->with_settings)
-            result.loadSettings(projection_definition->with_settings->changes);
-        return result;
+    }
+    else
+    {
+        fillProjectionDescriptionByQuery(result, projection_definition->query->as<ASTProjectionSelectQuery &>(), columns, query_context);
     }
 
+    auto merge_tree_settings = result.index ? result.index->getDefaultSettings() : std::make_shared<MergeTreeSettings>();
     if (projection_definition->with_settings)
-        result.loadSettings(projection_definition->with_settings->changes);
+        merge_tree_settings->applyChanges(projection_definition->with_settings->changes);
+    result.settings_changes = merge_tree_settings->changes();
 
-    fillProjectionDescriptionByQuery(result, projection_definition->query->as<ASTProjectionSelectQuery &>(), columns, query_context);
+    if (mode <= LoadingStrictnessLevel::CREATE)
+    {
+        static const std::unordered_set<std::string_view> ALLOWED_PROJECTION_SETTINGS = {
+            "index_granularity",
+            "index_granularity_bytes"
+        };
+
+        for (const auto & change : result.settings_changes)
+        {
+            if (!ALLOWED_PROJECTION_SETTINGS.contains(change.name))
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Setting {} is not allowed for projections", change.name);
+        }
+
+        const auto & ac = query_context->getAccessControl();
+        bool allow_experimental = ac.getAllowExperimentalTierSettings();
+        bool allow_beta = ac.getAllowBetaTierSettings();
+        merge_tree_settings->sanityCheck(query_context->getMergeMutateExecutor()->getMaxTasksCount(), allow_experimental, allow_beta);
+    }
     return result;
 }
 

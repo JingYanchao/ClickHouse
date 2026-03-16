@@ -5,6 +5,7 @@
 #include <Storages/MergeTree/MergeTreeReadTask.h>
 #include <Storages/MergeTree/MergeTreeVirtualColumns.h>
 #include <Storages/MergeTree/LoadedMergeTreeDataPartInfoForReader.h>
+#include <Storages/MergeTree/MergeTreeIndexReadResultPool.h>
 #include <DataTypes/NestedUtils.h>
 #include <DataTypes/DataTypeNested.h>
 #include <Common/escapeForFileName.h>
@@ -73,6 +74,18 @@ IMergeTreeReader::IMergeTreeReader(
             NameAndTypePair requested_column_in_storage{column.getNameInStorage(), column.getTypeInStorage()};
             serializations_of_full_columns.emplace(column_to_read.getNameInStorage(), getSerializationInPart(requested_column_in_storage));
         }
+    }
+
+    if (settings.enable_upsert)
+    {
+        size_t left_mark = std::numeric_limits<size_t>::max();
+        for (auto r : all_mark_ranges)
+        {
+            if (left_mark > r.begin)
+                left_mark = r.begin;
+        }
+        const auto & index_granularity = data_part_info_for_read->getIndexGranularity();
+        offset_for_memory_row_exists = static_cast<UInt32>(index_granularity.getMarkStartingRow(left_mark));
     }
 }
 
@@ -612,6 +625,58 @@ std::unique_ptr<SSTFileReadStream> IMergeTreeReader::createSSTReadStream(
         /*marks_loader=*/nullptr,
         profile_callback_,
         clock_type_);
+}
+
+void IMergeTreeReader::fillMemoryRowExistsColumn(ColumnPtr column, size_t max_rows_to_read)
+{
+    chassert(settings.enable_upsert);
+    auto mutable_column = column->assumeMutable();
+    auto * derived_column = dynamic_cast<ColumnVector<UInt8> *>(mutable_column.get());
+    if (!derived_column)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Column _row_exists should be a UInt8 column, but got {}", column->getName());
+
+    const auto * loaded_part_info = typeid_cast<const LoadedMergeTreeDataPartInfoForReader *>(data_part_info_for_read.get());
+    if (!loaded_part_info)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "fillMemoryRowExistsColumn is only supported for LoadedMergeTreeDataPartInfoForReader");
+
+    auto delete_bitmap = loaded_part_info->getDataPart()->getDeleteMarkBitmap();
+
+    typename ColumnVector<UInt8>::Container & container = derived_column->getData();
+    auto initial_size = container.size();
+    container.resize(initial_size + max_rows_to_read);
+    UInt8 * data_ptr = container.data() + initial_size;
+
+    /// Early exit: no deleted marks at all
+    if (!delete_bitmap || delete_bitmap->empty())
+    {
+        memset(data_ptr, 1, max_rows_to_read);
+        offset_for_memory_row_exists += max_rows_to_read;
+        column = std::move(mutable_column);
+        return;
+    }
+
+    const UInt32 start = offset_for_memory_row_exists;
+    const UInt32 end = start + static_cast<UInt32>(max_rows_to_read);
+
+    /// Fast path: no deleted rows in this range
+    if (delete_bitmap->rangeAllZero(start, end))
+    {
+        memset(data_ptr, 1, max_rows_to_read);
+    }
+    else
+    {
+        /// General case: check each row against the delete bitmap.
+        /// Set all to 1 (exists), then mark deleted rows as 0.
+        memset(data_ptr, 1, max_rows_to_read);
+        for (UInt32 i = 0; i < static_cast<UInt32>(max_rows_to_read); ++i)
+        {
+            if (delete_bitmap->contains<UInt32>(start + i))
+                data_ptr[i] = 0;
+        }
+    }
+
+    offset_for_memory_row_exists += max_rows_to_read;
+    column = std::move(mutable_column);
 }
 
 }
