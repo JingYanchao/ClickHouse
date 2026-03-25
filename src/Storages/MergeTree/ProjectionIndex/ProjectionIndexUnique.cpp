@@ -201,7 +201,9 @@ void ProjectionIndexUnique::fillProjectionDescription(
     result.with_parent_part_offset = true;
 
     /// 5. Unique projection is Aggregate type — SortedStringKV column uses
-    ///    SimpleAggregateFunction(max, UInt64) for value deduplication during merge.
+    ///    SimpleAggregateFunction(max, ...) for value deduplication during merge.
+    ///    Non-versioned: max(UInt64) on part_offset.
+    ///    Versioned:     max(Tuple(UInt64, UInt64)) on (version, part_offset).
     result.type = ProjectionDescription::Type::Aggregate;
     result.key_size = 1;
 

@@ -249,8 +249,9 @@ try
 
         /// When `merged_part_offsets` is set we need to adjust parent-part offsets
         /// in projection columns because merge may reorder rows.
-        /// Both `_parent_part_offset` and the second sub-column of `_unique_kv` are UInt64 offsets
-        ///
+        /// `_parent_part_offset` is a plain UInt64; `_unique_kv` stores part_offset in its
+        /// value sub-column (either UInt64 for non-versioned, or Tuple(version, part_offset)
+        /// for versioned mode — only the part_offset element needs translation).
         static const std::unordered_set<String> offset_columns = {"_parent_part_offset", ProjectionIndexUnique::kv_column_name};
         if (read_task_info->merged_part_offsets && read_task_info->data_part->isProjectionPart()
             && offset_columns.contains(name))
@@ -264,9 +265,23 @@ try
             }
             else if (name == ProjectionIndexUnique::kv_column_name)
             {
-                offset_data = assert_cast<ColumnUInt64 &>(
-                    assert_cast<ColumnTuple &>(result_column->assumeMutableRef())
-                        .getColumn(1).assumeMutableRef()).getData();
+                /// The outer Tuple is (key: String, value: ...).
+                /// `value` is either:
+                ///   - ColumnUInt64                       (non-versioned: part_offset)
+                ///   - ColumnTuple(UInt64, UInt64)        (versioned:    (version, part_offset))
+                /// Only the part_offset sub-column needs offset translation.
+                auto & outer_tuple = assert_cast<ColumnTuple &>(result_column->assumeMutableRef());
+                auto & value_col = outer_tuple.getColumn(1).assumeMutableRef();
+                if (const auto * inner_tuple = typeid_cast<ColumnTuple *>(&value_col))
+                {
+                    /// Versioned layout: Tuple(version, part_offset) — translate part_offset only (index 1).
+                    offset_data = assert_cast<ColumnUInt64 &>(inner_tuple->getColumn(1).assumeMutableRef()).getData();
+                }
+                else
+                {
+                    /// Non-versioned layout: plain UInt64 part_offset.
+                    offset_data = assert_cast<ColumnUInt64 &>(value_col).getData();
+                }
             }
 
             if (read_task_info->merged_part_offsets->isMappingEnabled())

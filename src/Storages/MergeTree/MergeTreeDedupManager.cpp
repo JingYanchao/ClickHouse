@@ -71,6 +71,11 @@ static void dedupKeyRange(
     auto input_iter = input_sst.newIterator(opts);
     input_iter->Seek(rocksdb::Slice(start_key));
 
+    /// Determine once whether the SST uses row-level versioning (16-byte values)
+    /// or part-level versioning (8-byte values). All entries in a single SST
+    /// share the same format, so we detect it from the first valid entry.
+    std::optional<bool> has_row_version;
+
     size_t processed = 0;
     for (; input_iter->Valid() && processed < num_keys; input_iter->Next(), ++processed)
     {
@@ -83,8 +88,8 @@ static void dedupKeyRange(
         const auto & value_slice = input_iter->value();
         auto input_entry = UniqueValueEntry::decode(value_slice.data(), value_slice.size());
 
-        /// Determine if entries carry row-level version (16-byte encoded value).
-        const bool has_row_version = (value_slice.size() == 16);
+        if (!has_row_version.has_value())
+            has_row_version = (value_slice.size() == 16);
 
         auto key = input_iter->key();
 
@@ -120,7 +125,7 @@ static void dedupKeyRange(
             /// When row-level version is available (versioned mode), use (version, part_offset)
             /// from the entry directly. Otherwise, fall back to part-level version.
             bool input_wins;
-            if (has_row_version)
+            if (has_row_version.value_or(false))
             {
                 /// Row-level version comparison: higher version wins;
                 /// on tie, higher part_offset wins (more recent insertion).

@@ -647,7 +647,6 @@ static StoragePtr create(const StorageFactory::Arguments & args)
     {
         /// UniqueMergeTree('__unique_index')  -> 1 arg (projection name)
         /// UniqueMergeTree()                   -> 0 args (default)
-
         size_t unique_args = arg_cnt - arg_num;
         if (unique_args >= 1)
         {
