@@ -13,45 +13,84 @@
 namespace DB
 {
 
-static DataTypePtr create(const ASTPtr & /* arguments */)
+namespace ErrorCodes
 {
-    auto key_type = std::make_shared<DataTypeString>();
+extern const int LOGICAL_ERROR;
+}
 
-    /// Value type: SimpleAggregateFunction(max, UInt64)
-    /// Stores _parent_part_offset. Using max semantics ensures that during
-    /// merge the entry with the highest offset wins. Cross-part dedup is
-    /// handled by the rebuild path (with_parent_part_offset = true), so
-    /// no separate version field is needed.
-    /// At serialization time, the UInt64 is encoded into UniqueValueEntry
-    /// (8-byte big-endian format) for SST storage.
-    auto uint64_type = std::make_shared<DataTypeUInt64>();
-
+/// Build the value DataType for a given ValueType.
+///   PartOffset          -> SimpleAggregateFunction(max, UInt64)
+///   VersionedPartOffset -> SimpleAggregateFunction(max, Tuple(UInt64, UInt64))
+template <ValueType V>
+static DataTypePtr makeValueType()
+{
     AggregateFunctionProperties properties;
     auto action = NullsAction::EMPTY;
-    DataTypes arg_types = {uint64_type};
-    auto max_func = AggregateFunctionFactory::instance().get("max", action, arg_types, {}, properties);
-    auto value_type = createSimpleAggregateFunctionType(max_func, arg_types, {});
+
+    if constexpr (V == ValueType::PartOffset)
+    {
+        auto uint64_type = std::make_shared<DataTypeUInt64>();
+        DataTypes arg_types = {uint64_type};
+        auto max_func = AggregateFunctionFactory::instance().get("max", action, arg_types, {}, properties);
+        return createSimpleAggregateFunctionType(max_func, arg_types, {});
+    }
+    else if constexpr (V == ValueType::VersionedPartOffset)
+    {
+        /// Tuple max uses lexicographic comparison:
+        /// first compares version, then part_offset as tie-breaker.
+        auto inner_tuple_type = std::make_shared<DataTypeTuple>(
+            DataTypes{std::make_shared<DataTypeUInt64>(), std::make_shared<DataTypeUInt64>()});
+        DataTypes arg_types = {inner_tuple_type};
+        auto max_func = AggregateFunctionFactory::instance().get("max", action, arg_types, {}, properties);
+        return createSimpleAggregateFunctionType(max_func, arg_types, {});
+    }
+    else
+    {
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Unsupported SortedStringKV ValueType");
+    }
+}
+
+/// Build a SortedStringKV DataType with the specified value layout.
+/// The key is always String; the value structure is determined by template parameter V.
+template <ValueType V>
+static DataTypePtr createSortedStringKVType()
+{
+    auto key_type = std::make_shared<DataTypeString>();
+    auto value_type_dt = makeValueType<V>();
 
     DataTypePtr type = std::make_shared<DataTypeTuple>(
-        DataTypes{key_type, value_type},
+        DataTypes{key_type, value_type_dt},
         Strings{"key", "value"});
 
     auto key_ser = std::static_pointer_cast<const SerializationNamed>(
         SerializationNamed::create(key_type->getDefaultSerialization(), "key", SubstreamType::TupleElement));
     auto val_ser = std::static_pointer_cast<const SerializationNamed>(
-        SerializationNamed::create(value_type->getDefaultSerialization(), "value", SubstreamType::TupleElement));
-    SerializationSortedStringKV::ElementSerializations elems = {key_ser, val_ser};
+        SerializationNamed::create(value_type_dt->getDefaultSerialization(), "value", SubstreamType::TupleElement));
+    typename SerializationSortedStringKV<V>::ElementSerializations elems = {key_ser, val_ser};
+
+    auto custom_name = std::make_unique<DataTypeSortedStringKV<V>>();
 
     type->setCustomization(std::make_unique<DataTypeCustomDesc>(
-        std::make_unique<DataTypeSortedStringKV>(),
-        std::make_shared<SerializationSortedStringKV>(elems, true /* has_explicit_names */)));
+        std::move(custom_name),
+        std::make_shared<SerializationSortedStringKV<V>>(elems, true /* has_explicit_names */)));
 
     return type;
+}
+
+static DataTypePtr create(const ASTPtr & /* arguments */)
+{
+    return createSortedStringKVType<ValueType::PartOffset>();
+}
+
+static DataTypePtr createVersioned(const ASTPtr & /* arguments */)
+{
+    return createSortedStringKVType<ValueType::VersionedPartOffset>();
 }
 
 void registerDataTypeSortedStringKV(DataTypeFactory & factory)
 {
     factory.registerDataType("SortedStringKV", create);
+    factory.registerDataType("VersionedSortedStringKV", createVersioned);
 }
 
 }

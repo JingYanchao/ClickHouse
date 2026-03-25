@@ -1,4 +1,3 @@
-
 #pragma once
 
 #include <Storages/MergeTree/ProjectionIndex/IProjectionIndex.h>
@@ -15,22 +14,28 @@ namespace DB
 {
 
 /// Big-endian encoded value stored in the SortedStringKV column.
-/// Layout: [8 bytes part_offset BE]
+///
+/// Two layouts are supported:
+///   Without version: [8 bytes part_offset BE]             = 8 bytes
+///   With version:    [8 bytes version BE][8 bytes part_offset BE] = 16 bytes
 ///
 /// Lexicographic comparison on the encoded string == numeric comparison,
-/// which is required by SimpleAggregateFunction(max, String) dedup semantics.
-///
-/// During merge, cross-part dedup is handled by the rebuild path:
-/// with_parent_part_offset = true forces rebuild, so version comparison
-/// is implicit via which source part's data overwrites the other.
+/// which is required by SimpleAggregateFunction(max, ...) dedup semantics.
+/// For the versioned layout, tuple(version, part_offset) comparison is
+/// equivalent to comparing version first, then part_offset as tie-breaker.
 struct UniqueValueEntry
 {
+    UInt64 version = 0;
     UInt64 part_offset = 0;
 
-    /// Encode into an 8-byte big-endian string.
-    String encode() const;
+    /// Encode into big-endian string.
+    /// Without version: 8-byte BE(part_offset)
+    /// With version: 16-byte BE(version) ++ BE(part_offset)
+    String encode(bool with_version = false) const;
 
-    /// Decode from a raw value buffer (must be >= 8 bytes).
+    /// Decode from a raw value buffer. Automatically detects format by size:
+    ///   8 bytes  -> without version (version = 0)
+    ///   16 bytes -> with version
     static UniqueValueEntry decode(const char * data, size_t size);
 
     /// Convenience overload for StringRef / std::string_view.
@@ -45,6 +50,7 @@ struct UniqueValueEntry
 /// DDL syntax:
 ///   PROJECTION unique_idx INDEX id TYPE unique
 ///   PROJECTION unique_idx INDEX (id, name) TYPE unique
+///   PROJECTION unique_idx INDEX id TYPE unique('ver')   -- with version column
 class ProjectionIndexUnique : public IProjectionIndex
 {
 public:
@@ -62,7 +68,7 @@ public:
     /// Create from AST: extracts unique key column names from the INDEX expression.
     static ProjectionIndexPtr create(const ASTProjectionDeclaration & proj);
 
-    explicit ProjectionIndexUnique(Names unique_key_columns_);
+    explicit ProjectionIndexUnique(Names unique_key_columns_, String version_column_name_ = {});
 
     String getName() const override { return name; }
 
@@ -90,10 +96,13 @@ public:
 
     UInt64 getMaxRows() const override { return std::numeric_limits<UInt32>::max(); }
 
+    const String & getVersionColumnName() const { return version_column_name; }
+
 private:
     /// Serialize unique key columns from a block row into a single comparable string.
     static String serializeKeyColumns(const Block & block, const Names & key_columns, size_t row_index);
     Names unique_key_columns;
+    String version_column_name;
     IndexDescription index_description;
     std::shared_ptr<const IMergeTreeIndex> index;
 };

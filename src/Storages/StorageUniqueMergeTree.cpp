@@ -69,6 +69,9 @@ StorageUniqueMergeTree::StorageUniqueMergeTree(
                     unique_projection_name, getStorageID().getFullTableName());
 
             found = true;
+            LOG_INFO(log, "StorageUniqueMergeTree initialized with unique projection '{}', version column '{}'",
+                     unique_projection_name,
+                     idx->getVersionColumnName().empty() ? "_block_number" : idx->getVersionColumnName());
             break;
         }
     }
@@ -92,9 +95,7 @@ StorageUniqueMergeTree::StorageUniqueMergeTree(
             return onPreLock(parts, op);
         });
 
-    LOG_INFO(log, "StorageUniqueMergeTree initialized with unique projection '{}', version column '{}'",
-             unique_projection_name,
-             merging_params.version_column.empty() ? "_block_number" : merging_params.version_column);
+    /// Create the dedup manager.
 }
 
 std::any StorageUniqueMergeTree::onPreLock(

@@ -16,7 +16,7 @@ echo "$(${CLICKHOUSE_CLIENT} --server_logs_file=/dev/null --query="CREATE TABLE 
   | grep -c 'DB::Exception:.*has index but it is not of TYPE unique\|DB::Exception:.*exists but has no index'
 ${CLICKHOUSE_CLIENT} --query="DROP TABLE IF EXISTS test_wrong_proj"
 
-# Test 3: UniqueMergeTree version column parameter must be a string literal
+# Test 3: UniqueMergeTree projection name parameter must be a string literal
 ${CLICKHOUSE_CLIENT} --query="DROP TABLE IF EXISTS test_version_param"
 echo "$(${CLICKHOUSE_CLIENT} --server_logs_file=/dev/null --query="CREATE TABLE test_version_param (x Int32, y UInt64, PROJECTION __unique_index INDEX x TYPE unique) ENGINE = UniqueMergeTree(123) ORDER BY x" 2>&1)" \
   | grep -c 'DB::Exception:.*must be a string literal'
@@ -46,8 +46,8 @@ ${CLICKHOUSE_CLIENT} --query="CREATE TABLE test_ok_multi (x Int32, y UInt64, z S
 echo "$(${CLICKHOUSE_CLIENT} --query="SELECT engine FROM system.tables WHERE name = 'test_ok_multi' AND database = currentDatabase()")"
 ${CLICKHOUSE_CLIENT} --query="DROP TABLE IF EXISTS test_ok_multi"
 
-# Test 8: Successful creation with version column
+# Test 8: Successful creation with version column specified in TYPE unique('ver')
 ${CLICKHOUSE_CLIENT} --query="DROP TABLE IF EXISTS test_ok_version"
-${CLICKHOUSE_CLIENT} --query="CREATE TABLE test_ok_version (x Int32, y UInt64, ver UInt64, PROJECTION __unique_index INDEX x TYPE unique) ENGINE = UniqueMergeTree('ver') ORDER BY x"
+${CLICKHOUSE_CLIENT} --query="CREATE TABLE test_ok_version (x Int32, y UInt64, ver UInt64, PROJECTION __unique_index INDEX x TYPE unique('ver')) ENGINE = UniqueMergeTree() ORDER BY x"
 echo "$(${CLICKHOUSE_CLIENT} --query="SELECT engine FROM system.tables WHERE name = 'test_ok_version' AND database = currentDatabase()")"
 ${CLICKHOUSE_CLIENT} --query="DROP TABLE IF EXISTS test_ok_version"

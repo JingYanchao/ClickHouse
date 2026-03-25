@@ -137,7 +137,7 @@ try
 
     for (auto & column : columns_to_read)
     {
-        if (dynamic_cast<const DataTypeSortedStringKV *>(column.type->getCustomName()))
+if (dynamic_cast<const IDataTypeSortedStringKV *>(column.type->getCustomName()))
         {
             auto stream_name = IMergeTreeDataPart::getStreamNameForColumn(
                 column, {}, SST_DATA_FILE_EXTENSION, data_part_info_for_read->getChecksums(), storage_settings);

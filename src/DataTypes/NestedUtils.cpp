@@ -216,7 +216,7 @@ static bool isFlattenableTuple(const DataTypePtr & data_type)
     const auto * tuple_type = typeid_cast<const DataTypeTuple *>(data_type.get());
     if (!tuple_type || tuple_type->getElements().empty())
         return false;
-    if (data_type->hasCustomName() && !dynamic_cast<const DataTypeSortedStringKV *>(data_type->getCustomName()))
+if (data_type->hasCustomName() && !dynamic_cast<const IDataTypeSortedStringKV *>(data_type->getCustomName()))
         return false;
     return true;
 }

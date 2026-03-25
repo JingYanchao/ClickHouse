@@ -425,7 +425,7 @@ Names MergeTreeDataPartWriterOnDisk::getSkipIndicesColumns() const
 
 void MergeTreeDataPartWriterOnDisk::createSSTFileStreamIfNeeded(const NameAndTypePair & name_and_type, const String & stream_name)
 {
-    if (!dynamic_cast<const DataTypeSortedStringKV *>(name_and_type.type->getCustomName()))
+if (!dynamic_cast<const IDataTypeSortedStringKV *>(name_and_type.type->getCustomName()))
         return;
 
     sst_file_streams.emplace(

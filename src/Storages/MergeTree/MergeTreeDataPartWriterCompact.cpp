@@ -327,7 +327,7 @@ void MergeTreeDataPartWriterCompact::writeDataBlock(const Block & block, const G
             };
 
             ISerialization::SSTWriteStreamGetter sst_write_stream_getter;
-            if (dynamic_cast<const DataTypeSortedStringKV *>(name_and_type->type->getCustomName()))
+if (dynamic_cast<const IDataTypeSortedStringKV *>(name_and_type->type->getCustomName()))
             {
                 sst_write_stream_getter
                     = [&](const ISerialization::SubstreamPath & substream_path) -> SSTFileWriteStream *

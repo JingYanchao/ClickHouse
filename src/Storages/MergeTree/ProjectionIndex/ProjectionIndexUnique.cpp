@@ -18,6 +18,7 @@
 #include <Storages/StorageInMemoryMetadata.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/MergeTree/MergeTreeIndexReadResultPool.h>
+#include <DataTypes/Serializations/SerializationSortedStringKV.h>
 
 #include <Common/logger_useful.h>
 #include <bit>
@@ -45,28 +46,57 @@ String ProjectionIndexUnique::serializeKeyColumns(const Block & block, const Nam
     return buf.str();
 }
 
-String UniqueValueEntry::encode() const
+String UniqueValueEntry::encode(bool with_version) const
 {
     /// Big-endian encoding so that lexicographic string comparison == numeric comparison.
-    String result(8, '\0');
-    UInt64 offset_be = std::byteswap(part_offset);
-    memcpy(result.data(), &offset_be, 8);
-    return result;
+    if (with_version)
+    {
+        /// 16-byte layout: [8 bytes version BE][8 bytes part_offset BE]
+        String result(16, '\0');
+        UInt64 version_be = std::byteswap(version);
+        UInt64 offset_be = std::byteswap(part_offset);
+        memcpy(result.data(), &version_be, 8);
+        memcpy(result.data() + 8, &offset_be, 8);
+        return result;
+    }
+    else
+    {
+        /// 8-byte layout: [8 bytes part_offset BE]
+        String result(8, '\0');
+        UInt64 offset_be = std::byteswap(part_offset);
+        memcpy(result.data(), &offset_be, 8);
+        return result;
+    }
 }
 
 UniqueValueEntry UniqueValueEntry::decode(const char * data, size_t size)
 {
-    if (size < 8)
+    if (size == 16)
+    {
+        /// Versioned layout: [8 bytes version BE][8 bytes part_offset BE]
+        UInt64 version_be;
+        UInt64 offset_be;
+        memcpy(&version_be, data, 8);
+        memcpy(&offset_be, data + 8, 8);
+        return UniqueValueEntry{std::byteswap(version_be), std::byteswap(offset_be)};
+    }
+    else if (size >= 8)
+    {
+        /// Non-versioned layout: [8 bytes part_offset BE]
+        UInt64 offset_be;
+        memcpy(&offset_be, data, 8);
+        return UniqueValueEntry{0, std::byteswap(offset_be)};
+    }
+    else
+    {
         throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "Unique projection SST value too short: expected 8 bytes, got {}", size);
-
-    UInt64 offset_be;
-    memcpy(&offset_be, data, 8);
-    return UniqueValueEntry{std::byteswap(offset_be)};
+            "Unique projection SST value too short: expected at least 8 bytes, got {}", size);
+    }
 }
 
-ProjectionIndexUnique::ProjectionIndexUnique(Names unique_key_columns_)
+ProjectionIndexUnique::ProjectionIndexUnique(Names unique_key_columns_, String version_column_name_)
     : unique_key_columns(std::move(unique_key_columns_))
+    , version_column_name(std::move(version_column_name_))
 {
     if (unique_key_columns.empty())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unique projection index requires at least one key column");
@@ -107,7 +137,20 @@ ProjectionIndexPtr ProjectionIndexUnique::create(const ASTProjectionDeclaration 
                 leaf->formatForErrorMessage());
     }
 
-    return std::make_shared<ProjectionIndexUnique>(std::move(key_columns));
+    /// Optionally extract version column from TYPE unique('ver') arguments.
+    /// The version column is specified directly in the DDL:
+    ///   PROJECTION __unique_index INDEX id TYPE unique('ver')
+    String version_col;
+    if (proj.type && proj.type->arguments && !proj.type->arguments->children.empty())
+    {
+        if (const auto * lit = proj.type->arguments->children[0]->as<ASTLiteral>())
+        {
+            if (lit->value.getType() == Field::Types::String)
+                version_col = lit->value.safeGet<String>();
+        }
+    }
+
+    return std::make_shared<ProjectionIndexUnique>(std::move(key_columns), std::move(version_col));
 }
 
 void ProjectionIndexUnique::fillProjectionDescription(
@@ -118,17 +161,35 @@ void ProjectionIndexUnique::fillProjectionDescription(
 {
     chassert(result.index.get() == this);
     chassert(!index);
-    /// 1. Get the SortedStringKV type directly from DataTypeFactory.
-    ///    SortedStringKV is Tuple(String, SimpleAggregateFunction(max, UInt64))
-    ///    with sorted key semantics and automatic dedup during merge.
-    auto sorted_kv_type = DataTypeFactory::instance().get("SortedStringKV");
+    /// 1. Get the SortedStringKV type from DataTypeFactory.
+    ///    The value type is determined by ValueType:
+    ///    - PartOffset:          value = SimpleAggregateFunction(max, UInt64)
+    ///    - VersionedPartOffset: value = SimpleAggregateFunction(max, Tuple(UInt64, UInt64))
+    const bool has_version = !version_column_name.empty();
+    const auto kv_value_type = has_version
+        ? ValueType::VersionedPartOffset
+        : ValueType::PartOffset;
+    /// Each ValueType maps to a registered DataType name.
+    String type_name;
+    switch (kv_value_type)
+    {
+        case ValueType::PartOffset:
+            type_name = "SortedStringKV";
+            break;
+        case ValueType::VersionedPartOffset:
+            type_name = "VersionedSortedStringKV";
+            break;
+    }
+    auto sorted_kv_type = DataTypeFactory::instance().get(type_name);
 
     /// 2. Build sample_block with a single "unique_kv" column ;
     result.sample_block.clear();
     result.sample_block.insert(ColumnWithTypeAndName{sorted_kv_type->createColumn(), sorted_kv_type, kv_column_name});
 
-    /// 3. Record required columns: unique key columns must come from the source table
+    /// 3. Record required columns: unique key columns (and version column if present)
     result.required_columns = unique_key_columns;
+    if (has_version)
+        result.required_columns.push_back(version_column_name);
 
     /// 4. Mark that this projection uses _parent_part_offset. During Merge:
     ///    - If merge_may_reduce_rows (e.g. TTL, dedup engines), the projection is routed to
@@ -191,9 +252,19 @@ Block ProjectionIndexUnique::calculate(
 
     /// Ordered map for dedup + sorted output.
     /// key: serialized unique key columns
-    /// value: part_offset (row position in sorted part)
-    /// Last-write-wins within a block: keep the entry with the larger part_offset.
-    std::map<String, UInt64> sorted_kvs;
+    /// value: UniqueValueEntry (version + part_offset)
+    /// Within a block: keep the entry with the larger (version, part_offset) pair.
+    const bool with_version = !version_column_name.empty();
+
+    std::map<String, UniqueValueEntry> sorted_kvs;
+
+    /// Optionally get the version column data.
+    const ColumnUInt64 * version_col = nullptr;
+    if (with_version)
+    {
+        const auto & ver_col_with_type = block.getByName(version_column_name);
+        version_col = assert_cast<const ColumnUInt64 *>(ver_col_with_type.column.get());
+    }
 
     /// When perm_ptr is present (INSERT path), we need the inverse permutation.
     /// perm_ptr maps sorted_pos -> original_pos, but we need original_pos -> sorted_pos
@@ -224,48 +295,52 @@ Block ProjectionIndexUnique::calculate(
             part_offset = starting_offset + i;
         }
 
+        /// Get the version value if present.
+        UInt64 ver = version_col ? version_col->getData()[i] : 0;
+
         /// Serialize the unique key
         String key = serializeKeyColumns(block, unique_key_columns, i);
 
-        /// Dedup within block: last-write-wins — keep the larger part_offset.
+        /// Dedup within block: keep the entry with larger (version, part_offset).
+        UniqueValueEntry new_entry{ver, part_offset};
         auto it = sorted_kvs.find(key);
-        if (it == sorted_kvs.end() || it->second < part_offset)
-            sorted_kvs[key] = part_offset;
-    }
-
-    /// Build the output block with a single SortedStringKV column
-    /// The column is Tuple(key String, value UInt64)
-    auto key_column = ColumnString::create();
-    auto offset_column = ColumnUInt64::create();
-
-    for (const auto & [k, offset] : sorted_kvs)
-    {
-        key_column->insertData(k.data(), k.size());
-        offset_column->insertValue(offset);
-    }
-
-    auto tuple_column = ColumnTuple::create(Columns{std::move(key_column), std::move(offset_column)});
-
-    /// Trace log: output the dedup result for debugging.
-    {
-        auto calc_log = getLogger("ProjectionIndexUnique");
-        LOG_TRACE(calc_log, "[calculate] num_rows={}, starting_offset={}, has_perm={}, deduped_keys={}",
-            num_rows, starting_offset, perm_ptr != nullptr, sorted_kvs.size());
-        if (sorted_kvs.size() <= 50)
+        if (it == sorted_kvs.end()
+            || std::tie(it->second.version, it->second.part_offset)
+               < std::tie(new_entry.version, new_entry.part_offset))
         {
-            for (const auto & [k, off] : sorted_kvs)
-            {
-                std::string hex;
-                for (size_t i = 0; i < k.size(); ++i)
-                    hex += fmt::format("{:02x}", static_cast<unsigned char>(k[i]));
-                LOG_TRACE(calc_log, "[calculate]   key_hex={}, part_offset={}", hex, off);
-            }
+            sorted_kvs[key] = new_entry;
         }
     }
 
-    Block result;
+    /// Build the output block with a single SortedStringKV column.
+    /// The value column structure is determined by ValueTraits<V>.
+    auto key_column = ColumnString::create();
+
+    /// Create an empty value column matching the expected schema, then use
+    /// ValueTraits to insert each entry at compile time.
     const auto & sample = projection_desc.sample_block;
     chassert(sample.columns() == 1);
+    const auto & sample_tuple = assert_cast<const ColumnTuple &>(*sample.getByPosition(0).column);
+    auto value_column_mut = sample_tuple.getColumn(1).cloneEmpty();
+
+    /// Runtime-to-compile-time dispatch: write entries using the correct ValueTraits.
+    auto write_entries = [&]<ValueType V>()
+    {
+        for (const auto & [k, entry] : sorted_kvs)
+        {
+            key_column->insertData(k.data(), k.size());
+            ValueTraits<V>::writeEntry(*value_column_mut, entry);
+        }
+    };
+
+    if (with_version)
+        write_entries.template operator()<ValueType::VersionedPartOffset>();
+    else
+        write_entries.template operator()<ValueType::PartOffset>();
+
+    auto tuple_column = ColumnTuple::create(Columns{std::move(key_column), std::move(value_column_mut)});
+
+    Block result;
     result.insert(ColumnWithTypeAndName{std::move(tuple_column), sample.getByPosition(0).type, sample.getByPosition(0).name});
 
     return result;

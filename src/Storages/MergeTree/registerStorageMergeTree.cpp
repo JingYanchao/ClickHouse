@@ -26,6 +26,7 @@
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTIndexDeclaration.h>
 #include <Parsers/ASTLiteral.h>
+#include <Parsers/ASTProjectionDeclaration.h>
 #include <Parsers/ASTSetQuery.h>
 
 #include <AggregateFunctions/AggregateFunctionFactory.h>
@@ -475,7 +476,6 @@ static StoragePtr create(const StorageFactory::Arguments & args)
 
     if (is_unique && is_extended_storage_def)
     {
-        add_optional_param("version column");
         add_optional_param("unique projection name");
     }
 
@@ -638,55 +638,31 @@ static StoragePtr create(const StorageFactory::Arguments & args)
         merging_param_key_arg = merging_params.version_column;
     }
 
-    /// UniqueMergeTree optional parameters: ('projection_name', 'version_column')
-    /// Both are optional string literals. If omitted:
-    ///   - projection_name: defaults to "__unique_index"
-    ///   - version_column: defaults to _block_number
+    /// UniqueMergeTree optional parameter: ('projection_name')
+    /// If omitted, defaults to "__unique_index".
+    /// Version column is specified in the projection TYPE, e.g. TYPE unique('ver').
     String unique_projection_name;
-    String unique_version_column;
 
     if (is_unique && is_extended_storage_def)
     {
-        /// Parse from the end: version_column last (if present), then projection_name.
-        /// UniqueMergeTree('__unique_index', 'ver')  -> 2 args
-        /// UniqueMergeTree('__unique_index')          -> 1 arg (projection only)
-        /// UniqueMergeTree()                          -> 0 args (both default)
+        /// UniqueMergeTree('__unique_index')  -> 1 arg (projection name)
+        /// UniqueMergeTree()                   -> 0 args (default)
 
         size_t unique_args = arg_cnt - arg_num;
-        if (unique_args >= 2)
-        {
-            if (const auto * ast = engine_args[arg_cnt - 1]->as<ASTLiteral>())
-            {
-                if (ast->value.getType() != Field::Types::String)
-                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                        "Second parameter of UniqueMergeTree (version column) must be a string literal{}",
-                        verbose_help_message);
-                unique_version_column = ast->value.safeGet<String>();
-            }
-            else
-            {
-                throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                    "Second parameter of UniqueMergeTree (version column) must be a string literal{}",
-                    verbose_help_message);
-            }
-            --arg_cnt;
-        }
-
-        unique_args = arg_cnt - arg_num;
         if (unique_args >= 1)
         {
             if (const auto * ast = engine_args[arg_cnt - 1]->as<ASTLiteral>())
             {
                 if (ast->value.getType() != Field::Types::String)
                     throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                        "First parameter of UniqueMergeTree (projection name) must be a string literal{}",
+                        "Parameter of UniqueMergeTree (projection name) must be a string literal{}",
                         verbose_help_message);
                 unique_projection_name = ast->value.safeGet<String>();
             }
             else
             {
                 throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                    "First parameter of UniqueMergeTree (projection name) must be a string literal{}",
+                    "Parameter of UniqueMergeTree (projection name) must be a string literal{}",
                     verbose_help_message);
             }
             --arg_cnt;
@@ -695,11 +671,6 @@ static StoragePtr create(const StorageFactory::Arguments & args)
         /// Default projection name to __unique_index if not specified.
         if (unique_projection_name.empty())
             unique_projection_name = ProjectionIndexUnique::default_projection_name;
-
-        /// Store the version column into merging_params so that
-        /// StorageUniqueMergeTree can access it via the inherited merging_params.
-        if (!unique_version_column.empty())
-            merging_params.version_column = unique_version_column;
     }
 
     String date_column_name;

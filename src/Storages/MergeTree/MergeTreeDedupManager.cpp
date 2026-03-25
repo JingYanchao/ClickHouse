@@ -60,7 +60,8 @@ static void dedupKeyRange(
     DeltaBitmaps & delta_bitmaps,
     std::atomic<size_t> & skip_by_key_counter)
 {
-    auto get_version = [](const DataPartPtr & part) -> UInt64
+    /// Fallback version: use part-level max_block when no row-level version is stored.
+    auto get_part_version = [](const DataPartPtr & part) -> UInt64
     {
         return static_cast<UInt64>(part->info.max_block);
     };
@@ -82,8 +83,10 @@ static void dedupKeyRange(
         const auto & value_slice = input_iter->value();
         auto input_entry = UniqueValueEntry::decode(value_slice.data(), value_slice.size());
 
+        /// Determine if entries carry row-level version (16-byte encoded value).
+        const bool has_row_version = (value_slice.size() == 16);
+
         auto key = input_iter->key();
-        const auto input_version = get_version(input_part);
 
         for (const auto & info : visible_part_infos)
         {
@@ -100,10 +103,10 @@ static void dedupKeyRange(
 
             if (unlikely(current_value.empty()))
                 continue;
-            if (unlikely(current_value.size() != 8))
+            if (unlikely(current_value.size() != 8 && current_value.size() != 16))
                 throw Exception(
                     ErrorCodes::INCORRECT_DATA,
-                    "Unexpected unique projection value size: {} (expected 8)",
+                    "Unexpected unique projection value size: {} (expected 8 or 16)",
                     current_value.size());
 
             auto current_entry = UniqueValueEntry::decode(current_value.data(), current_value.size());
@@ -113,9 +116,27 @@ static void dedupKeyRange(
             if (current_delete_bitmap && current_delete_bitmap->contains(current_entry.part_offset))
                 continue;
 
-            auto visible_version = get_version(current_part);
-            if (input_version > visible_version
-                || (input_version == visible_version && input_part->info.level > current_part->info.level))
+            /// Compare versions to determine which entry wins.
+            /// When row-level version is available (versioned mode), use (version, part_offset)
+            /// from the entry directly. Otherwise, fall back to part-level version.
+            bool input_wins;
+            if (has_row_version)
+            {
+                /// Row-level version comparison: higher version wins;
+                /// on tie, higher part_offset wins (more recent insertion).
+                input_wins = std::tie(input_entry.version, input_entry.part_offset)
+                           > std::tie(current_entry.version, current_entry.part_offset);
+            }
+            else
+            {
+                /// Part-level version comparison (legacy non-versioned mode).
+                auto input_version = get_part_version(input_part);
+                auto visible_version = get_part_version(current_part);
+                input_wins = (input_version > visible_version)
+                    || (input_version == visible_version && input_part->info.level > current_part->info.level);
+            }
+
+            if (input_wins)
             {
                 /// Input part wins — mark the visible part's row as deleted.
                 delta_bitmaps[current_part.get()].add(static_cast<uint32_t>(current_entry.part_offset));
@@ -324,7 +345,7 @@ ProjectionIndexBitmapPtr MergeTreeDedupManager::buildIntraPartDeleteMark(
         auto iter = input_sst.newIterator(opts);
         for (iter->SeekToFirst(); iter->Valid(); iter->Next())
         {
-            if (iter->value().size() == 8)
+            if (iter->value().size() >= 8)
             {
                 auto entry = UniqueValueEntry::decode(iter->value().data(), iter->value().size());
                 input_part_delete_mark->add(static_cast<UInt32>(entry.part_offset));

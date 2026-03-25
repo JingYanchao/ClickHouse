@@ -19,7 +19,45 @@ extern const int CORRUPTED_DATA;
 extern const int LOGICAL_ERROR;
 }
 
-void SerializationSortedStringKV::enumerateStreams(
+/// =====================================================================
+/// ValueTraits specialization implementations
+/// =====================================================================
+
+UniqueValueEntry ValueTraits<ValueType::PartOffset>::readEntry(const IColumn & value_column, size_t row)
+{
+    const auto & col = assert_cast<const ColumnUInt64 &>(value_column);
+    return UniqueValueEntry{0, col.getData()[row]};
+}
+
+void ValueTraits<ValueType::PartOffset>::writeEntry(IColumn & value_column, const UniqueValueEntry & entry)
+{
+    auto & col = assert_cast<ColumnUInt64 &>(value_column);
+    col.insertValue(entry.part_offset);
+}
+
+UniqueValueEntry ValueTraits<ValueType::VersionedPartOffset>::readEntry(const IColumn & value_column, size_t row)
+{
+    const auto & tuple = assert_cast<const ColumnTuple &>(value_column);
+    const auto & version_col = assert_cast<const ColumnUInt64 &>(tuple.getColumn(0));
+    const auto & offset_col = assert_cast<const ColumnUInt64 &>(tuple.getColumn(1));
+    return UniqueValueEntry{version_col.getData()[row], offset_col.getData()[row]};
+}
+
+void ValueTraits<ValueType::VersionedPartOffset>::writeEntry(IColumn & value_column, const UniqueValueEntry & entry)
+{
+    auto & tuple = assert_cast<ColumnTuple &>(value_column);
+    auto & version_col = assert_cast<ColumnUInt64 &>(tuple.getColumn(0));
+    auto & offset_col = assert_cast<ColumnUInt64 &>(tuple.getColumn(1));
+    version_col.insertValue(entry.version);
+    offset_col.insertValue(entry.part_offset);
+}
+
+/// =====================================================================
+/// SerializationSortedStringKV<V> template implementation
+/// =====================================================================
+
+template <ValueType V>
+void SerializationSortedStringKV<V>::enumerateStreams(
     EnumerateStreamsSettings & settings,
     const StreamCallback & callback,
     const SubstreamData & data) const
@@ -32,7 +70,8 @@ void SerializationSortedStringKV::enumerateStreams(
     settings.path.pop_back();
 }
 
-void SerializationSortedStringKV::serializeBinaryBulkStatePrefix(
+template <ValueType V>
+void SerializationSortedStringKV<V>::serializeBinaryBulkStatePrefix(
     const IColumn & column,
     SerializeBinaryBulkSettings & settings,
     SerializeBinaryBulkStatePtr & state) const
@@ -45,7 +84,8 @@ void SerializationSortedStringKV::serializeBinaryBulkStatePrefix(
     state = std::make_shared<SerializeBinaryBulkStateSST>();
 }
 
-void SerializationSortedStringKV::serializeBinaryBulkWithMultipleStreams(
+template <ValueType V>
+void SerializationSortedStringKV<V>::serializeBinaryBulkWithMultipleStreams(
     const IColumn & column,
     size_t offset,
     size_t limit,
@@ -60,8 +100,7 @@ void SerializationSortedStringKV::serializeBinaryBulkWithMultipleStreams(
 
     const auto & tuple_col = assert_cast<const ColumnTuple &>(column);
     const auto & key_col = assert_cast<const ColumnString &>(tuple_col.getColumn(0));
-    /// Value column is UInt64 — part_offset
-    const auto & offset_col = assert_cast<const ColumnUInt64 &>(tuple_col.getColumn(1));
+    const auto & val_col = tuple_col.getColumn(1);
 
     size_t size = key_col.size();
     size_t end = limit ? std::min(offset + limit, size) : size;
@@ -96,9 +135,10 @@ void SerializationSortedStringKV::serializeBinaryBulkWithMultipleStreams(
     {
         const auto key = key_col.getDataAt(i);
 
-        /// Encode UInt64 -> UniqueValueEntry -> 8-byte big-endian string
-        UniqueValueEntry entry{offset_col.getData()[i]};
-        String encoded_value = entry.encode();
+        /// Use ValueTraits to read UniqueValueEntry from the value column,
+        /// then encode into big-endian string for SST storage.
+        auto entry = ValueTraits<V>::readEntry(val_col, i);
+        String encoded_value = entry.encode(has_version);
 
         sst_state->sst_file_writer->put(
             rocksdb::Slice(key),
@@ -112,7 +152,8 @@ void SerializationSortedStringKV::serializeBinaryBulkWithMultipleStreams(
     sst_state->sst_file_writer->addWrittenRowCount(static_cast<UInt64>(end - offset));
 }
 
-void SerializationSortedStringKV::serializeBinaryBulkStateSuffix(
+template <ValueType V>
+void SerializationSortedStringKV<V>::serializeBinaryBulkStateSuffix(
     SerializeBinaryBulkSettings & settings,
     SerializeBinaryBulkStatePtr & state) const
 {
@@ -120,7 +161,8 @@ void SerializationSortedStringKV::serializeBinaryBulkStateSuffix(
         SerializationTuple::serializeBinaryBulkStateSuffix(settings, state);
 }
 
-void SerializationSortedStringKV::deserializeBinaryBulkStatePrefix(
+template <ValueType V>
+void SerializationSortedStringKV<V>::deserializeBinaryBulkStatePrefix(
     DeserializeBinaryBulkSettings & settings,
     DeserializeBinaryBulkStatePtr & state,
     SubstreamsDeserializeStatesCache * cache) const
@@ -133,7 +175,8 @@ void SerializationSortedStringKV::deserializeBinaryBulkStatePrefix(
     state = std::make_shared<DeserializeBinaryBulkStateSortedStringKV>();
 }
 
-void SerializationSortedStringKV::deserializeBinaryBulkWithMultipleStreams(
+template <ValueType V>
+void SerializationSortedStringKV<V>::deserializeBinaryBulkWithMultipleStreams(
     ColumnPtr & column,
     size_t rows_offset,
     size_t limit,
@@ -150,8 +193,7 @@ void SerializationSortedStringKV::deserializeBinaryBulkWithMultipleStreams(
     auto mutable_column = column->assumeMutable();
     auto & tuple_col = assert_cast<ColumnTuple &>(*mutable_column);
     auto & key_col = assert_cast<ColumnString &>(tuple_col.getColumn(0));
-    /// Value column is UInt64 — part_offset
-    auto & offset_col = assert_cast<ColumnUInt64 &>(tuple_col.getColumn(1));
+    auto & val_col = tuple_col.getColumn(1);
 
     auto * sst_state = checkAndGetState<DeserializeBinaryBulkStateSortedStringKV>(state);
 
@@ -230,10 +272,11 @@ void SerializationSortedStringKV::deserializeBinaryBulkWithMultipleStreams(
     {
         key_col.insertData(iter->key().data(), iter->key().size());
 
-        /// Decode 8-byte big-endian UniqueValueEntry -> UInt64 part_offset
+        /// Decode UniqueValueEntry from SST value (auto-detects 8 vs 16 bytes),
+        /// then use ValueTraits to write it into the appropriate value column(s).
         const auto & value_slice = iter->value();
         auto entry = UniqueValueEntry::decode(value_slice.data(), value_slice.size());
-        offset_col.insertValue(entry.part_offset);
+        ValueTraits<V>::writeEntry(val_col, entry);
 
         ++rows_read;
         ++sst_state->current_row_position;
@@ -246,5 +289,8 @@ void SerializationSortedStringKV::deserializeBinaryBulkWithMultipleStreams(
     column = std::move(mutable_column);
 }
 
-}
+/// Explicit template instantiations
+template class SerializationSortedStringKV<ValueType::PartOffset>;
+template class SerializationSortedStringKV<ValueType::VersionedPartOffset>;
 
+}

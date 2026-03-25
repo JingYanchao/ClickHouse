@@ -6,9 +6,9 @@ CREATE TABLE IF NOT EXISTS unique_merge_tree_update_version
     value1 UInt32,
     value2 UInt32,
     version UInt64,
-    PROJECTION __unique_index INDEX id TYPE unique
+    PROJECTION __unique_index INDEX id TYPE unique('version')
 )
-ENGINE = UniqueMergeTree('version')
+ENGINE = UniqueMergeTree()
 ORDER BY id;
 
 insert into unique_merge_tree_update_version select number as id, number as value1, number as value2, 1 as version from numbers(10);
