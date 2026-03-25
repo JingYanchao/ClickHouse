@@ -593,7 +593,8 @@ void MergeTreeReaderWide::readData(
 
     if (settings.enable_upsert && name_and_type.name == RowExistsColumn::name)
     {
-        fillMemoryRowExistsColumn(column, max_rows_to_read);
+        size_t start_row = data_part_info_for_read->getIndexGranularity().getMarkStartingRow(from_mark) + rows_offset;
+        fillMemoryRowExistsColumn(column, start_row, max_rows_to_read);
         return;
     }
 
@@ -659,7 +660,7 @@ void MergeTreeReaderWide::readData(
     auto & deserialize_state = deserialize_binary_bulk_state_map[name_and_type.name];
 
     serialization->deserializeBinaryBulkWithMultipleStreams(
-        column, rows_offset, max_rows_to_read, deserialize_settings, deserialize_state, &cache);
+        column, 0, max_rows_to_read, deserialize_settings, deserialize_state, &cache);
 }
 
 std::unordered_map<String, std::vector<String>> MergeTreeReaderWide::getAllColumnsSubstreams()

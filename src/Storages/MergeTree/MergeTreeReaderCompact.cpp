@@ -190,7 +190,9 @@ void MergeTreeReaderCompact::readData(
 
     if (settings.enable_upsert && name_and_type.name == RowExistsColumn::name)
     {
-        fillMemoryRowExistsColumn(column, rows_to_read);
+        /// Compact reader always seeks to exact mark + offset; compute the absolute row number directly.
+        size_t start_row = data_part_info_for_read->getIndexGranularity().getMarkStartingRow(from_mark) + rows_offset;
+        fillMemoryRowExistsColumn(column, start_row, rows_to_read);
         return;
     }
 
