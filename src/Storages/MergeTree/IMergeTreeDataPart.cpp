@@ -2076,7 +2076,7 @@ ProjectionIndexBitmapPtr IMergeTreeDataPart::getDeleteMarkBitmap() const
     return delete_mark_bitmap;
 }
 
-void IMergeTreeDataPart::setDeleteMarkBitmap(ProjectionIndexBitmapPtr bitmap)
+void IMergeTreeDataPart::setDeleteMarkBitmap(ProjectionIndexBitmapPtr bitmap) const
 {
     delete_mark_bitmap = std::move(bitmap);
 }

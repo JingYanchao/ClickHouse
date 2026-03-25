@@ -605,7 +605,7 @@ public:
     ProjectionIndexBitmapPtr getDeleteMarkBitmap() const;
 
     /// Sets the delete mark bitmap for this part.
-    void setDeleteMarkBitmap(ProjectionIndexBitmapPtr bitmap);
+    void setDeleteMarkBitmap(ProjectionIndexBitmapPtr bitmap) const;
 
     /// Returns the number of rows marked as deleted in the delete mark bitmap.
     size_t getDeleteMarksCount() const;

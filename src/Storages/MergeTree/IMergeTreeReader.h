@@ -162,7 +162,7 @@ protected:
         const String & stream_name, const ReadBufferFromFileBase::ProfileCallback & profile_callback_, clockid_t clock_type_);
 
     /// Read data from memory for column `_row_exists`.
-    void fillMemoryRowExistsColumn(ColumnPtr column, size_t start_row, size_t max_rows_to_read);
+    void fillMemoryRowExistsColumn(ColumnPtr column, size_t start_row, size_t max_rows_to_read) const;
 private:
     friend class MergeTreeReaderIndex;
     friend class MergeTreeReaderTextIndex;

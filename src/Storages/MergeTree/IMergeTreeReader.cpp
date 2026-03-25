@@ -616,7 +616,7 @@ std::unique_ptr<SSTFileReadStream> IMergeTreeReader::createSSTReadStream(
         clock_type_);
 }
 
-void IMergeTreeReader::fillMemoryRowExistsColumn(ColumnPtr column, size_t start_row, size_t max_rows_to_read)
+void IMergeTreeReader::fillMemoryRowExistsColumn(ColumnPtr column, size_t start_row, size_t max_rows_to_read) const
 {
     chassert(settings.enable_upsert);
     auto mutable_column = column->assumeMutable();

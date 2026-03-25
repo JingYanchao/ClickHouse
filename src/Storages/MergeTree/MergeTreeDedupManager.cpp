@@ -265,11 +265,11 @@ static void applyCrossPartDeleteMarks(const PartDeleteBitmapType & cross_part_ma
             existing_marks = (part_ptr->rows_count <= std::numeric_limits<UInt32>::max())
                 ? ProjectionIndexBitmap::create32()
                 : ProjectionIndexBitmap::create64();
-            const_cast<IMergeTreeDataPart *>(part_ptr)->setDeleteMarkBitmap(existing_marks);
+            part_ptr->setDeleteMarkBitmap(existing_marks);
         }
 
-        for (auto it : cross_part_marks)
-            existing_marks->add(static_cast<UInt64>(it));
+        for (const auto it : cross_part_marks)
+            existing_marks->add(it);
     }
 }
 
