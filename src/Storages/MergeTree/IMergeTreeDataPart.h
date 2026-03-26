@@ -272,7 +272,7 @@ public:
     mutable std::atomic<time_t> remove_time { std::numeric_limits<time_t>::max() };
 
     /// Delete mark bitmap for unique dedup: bits set to 1 represent deleted (deduped) rows.
-    /// Populated by MergeTreeDedupManager during dedup or rebuild.
+    /// Populated by MergeTreeDedupPartManager during dedup or rebuild.
     mutable ProjectionIndexBitmapPtr delete_mark_bitmap;
 
     /// If true, the destructor will delete the directory with the part.

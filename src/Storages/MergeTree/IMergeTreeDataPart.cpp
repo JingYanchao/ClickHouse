@@ -2115,20 +2115,19 @@ SSTFileReaderPtr IMergeTreeDataPart::getOrOpenSSTReader(const StorageMetadataPtr
 
             const auto & proj_part = *it->second;
             const auto & proj_storage = proj_part.getDataPartStorage();
-            if (!proj_storage.existsFile(ProjectionIndexUnique::sst_file_name))
+            if (!proj_storage.existsFile(ProjectionIndexUnique::getSSTFileName()))
                 return {};
 
-            auto file_size = proj_storage.getFileSize(ProjectionIndexUnique::sst_file_name);
+            auto file_size = proj_storage.getFileSize(ProjectionIndexUnique::getSSTFileName());
             if (file_size == 0)
                 return {};
 
-            return std::make_shared<SSTFileReaderPtr>(
-                std::make_shared<const SSTFileReader>(proj_part.getDataPartStoragePtr(), ProjectionIndexUnique::sst_file_name));
+            return std::make_shared<const SSTFileReader>(proj_part.getDataPartStoragePtr(), ProjectionIndexUnique::getSSTFileName());
         }
         return {};
     });
 
-    return cached ? *cached : nullptr;
+    return cached;
 }
 
 

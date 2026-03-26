@@ -112,6 +112,12 @@ struct ProjectionIndexBitmap
     /// Checks whether the bitmap has no bits set in the range [begin, end).
     bool rangeAllZero(size_t begin, size_t end) const;
 
+    /// Checks whether the bitmap contains all values in the range [begin, end).
+    bool containsRange(size_t begin, size_t end) const;
+
+    /// Returns the number of values in the bitmap within the range [begin, end).
+    size_t rangeCardinality(size_t begin, size_t end) const;
+
     /// Appends a `PaddedPODArray<UInt8>` in the range [starting_row, starting_row + num_rows)
     /// with `1`s at positions corresponding to values present in the bitmap.
     ///

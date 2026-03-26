@@ -292,6 +292,28 @@ bool ProjectionIndexBitmap::rangeAllZero(size_t begin, size_t end) const
 }
 
 
+bool ProjectionIndexBitmap::containsRange(size_t begin, size_t end) const
+{
+    if (begin >= end)
+        return true;
+
+    if (type == BitmapType::Bitmap32)
+        return roaring_bitmap_contains_range(data.bitmap32, static_cast<UInt32>(begin), static_cast<UInt32>(end));
+    else
+        return roaring64_bitmap_contains_range(data.bitmap64, begin, end);
+}
+
+size_t ProjectionIndexBitmap::rangeCardinality(size_t begin, size_t end) const
+{
+    if (begin >= end)
+        return 0;
+
+    if (type == BitmapType::Bitmap32)
+        return roaring_bitmap_range_cardinality(data.bitmap32, static_cast<UInt32>(begin), static_cast<UInt32>(end));
+    else
+        return roaring64_bitmap_range_cardinality(data.bitmap64, begin, end);
+}
+
 bool ProjectionIndexBitmap::appendToFilter(PaddedPODArray<UInt8> & filter, size_t starting_row, size_t num_rows) const
 {
     size_t old_size = filter.size();

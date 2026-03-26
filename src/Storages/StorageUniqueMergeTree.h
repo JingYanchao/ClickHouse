@@ -1,7 +1,6 @@
 #pragma once
 
 #include <Storages/StorageMergeTree.h>
-
 #include <memory>
 
 namespace DB
@@ -10,24 +9,15 @@ namespace DB
 
 /// StorageUniqueMergeTree — MergeTree with built-in row-level deduplication.
 ///
-/// It inherits from StorageMergeTree and injects dedup logic via
-/// TransactionPreLockHook. During the no-arg Transaction::commit(),
-/// the hook is called BEFORE lockParts(), ensuring lock ordering:
+/// Inherits StorageMergeTree and injects dedup logic via
+/// BeforeTransactionCommitHook. The hook is called by Transaction::commit
+/// BEFORE lockParts, ensuring lock ordering:
 ///   UniqueProcessLock -> DataPartsLock (read-friendly).
 ///
-/// The hook:
-///   1. Acquires the UniqueProcessLock via MergeTreeDedupManager to
-///      serialize concurrent commits.
-///   2. For each committing part, performs cross-part dedup against
-///      existing active parts using MergeTreeDedupManager.
-///   3. Commits delete mark buffers to persist dedup results.
-///
-/// For callers using the commit(DataPartsLock &) overload (e.g. merge,
-/// mutation, partition operations), dedup must be handled externally
-/// before acquiring the DataPartsLock.
-///
-/// The unique projection is identified by having a non-null
-/// ProjectionIndexUnique index in the ProjectionDescription.
+/// The hook acquires UniqueProcessLock to serialize concurrent commits,
+/// then deduplicates each committing part against existing active parts.
+/// Delete mark buffers are committed inside Transaction::commit under
+/// DataPartsLock to ensure atomicity with part state transitions.
 class StorageUniqueMergeTree final : public StorageMergeTree
 {
 public:
@@ -56,11 +46,8 @@ private:
     /// The name of the unique projection (from engine param or auto-detected).
     String unique_projection_name;
 
-    /// The pre-lock hook: called by the no-arg Transaction::commit()
-    /// BEFORE lockParts(), so that dedup does not block reads.
-    /// Returns a std::any holding UniqueProcessLock to keep the dedup mutex
-    /// locked until the caller finishes commit.
-    std::any onPreLock(const MutableDataParts & parts, CommitOperation op);
+    /// BeforeTransactionCommitHook implementation.
+    std::any onBeforeTransactionCommit(const MutableDataParts & parts, CommitOperation op);
 };
 
 }

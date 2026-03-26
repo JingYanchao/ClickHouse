@@ -85,12 +85,13 @@ public:
     SSTFileReader(const DataPartStoragePtr & storage, const String & sst_file_name);
 
     std::unique_ptr<rocksdb::Iterator> newIterator(const rocksdb::ReadOptions & options) const;
-    bool mayContainKey(std::string_view key) const;
     void verifyChecksums() const;
     IndexPropertiesPtr getProperties() const;
     /// Single key lookup using MultiGet internally.
     bool get(const rocksdb::Slice & key, std::string * value_out) const;
-    bool isEmpty() const;
+    /// Batch key lookup using MultiGet. Returns a vector of statuses, one per key.
+    /// For each key where status is OK, the corresponding entry in values_out is populated.
+    std::vector<rocksdb::Status> multiGet(const std::vector<rocksdb::Slice> & keys, std::vector<std::string> * values_out) const;
     /// Release ReadBuffer memory (1MB per file) to save memory.
     /// After calling this, the index reader can still be used normally.
     void releaseBufferMemory() const;
@@ -98,15 +99,13 @@ private:
     /// Common initialization logic shared by both constructors.
     void init(const String & file_name);
 
-    using MinMax = std::pair<std::string, std::string>;
     std::unique_ptr<rocksdb::Env> sst_env;
     std::unique_ptr<rocksdb::SstFileReader> index_reader;
-    MinMax key_range;
 };
 
 using SSTFileReaderPtr = std::shared_ptr<const SSTFileReader>;
 using SSTFileReaders = std::vector<SSTFileReaderPtr>;
-using SSTFileReaderCacheValue = SSTFileReaderPtr;
+using SSTFileReaderCacheValue = const SSTFileReader;
 
 class SSTFileReaderCache
     : public CacheBase<UInt128, SSTFileReaderCacheValue, UInt128TrivialHash>

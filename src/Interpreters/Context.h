@@ -112,6 +112,7 @@ class TextIndexTokensCache;
 class TextIndexHeaderCache;
 class TextIndexPostingsCache;
 class SSTFileReaderCache;
+
 class ProcessList;
 class QueryStatus;
 using QueryStatusPtr = std::shared_ptr<QueryStatus>;

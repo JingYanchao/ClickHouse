@@ -583,9 +583,8 @@ The server successfully detected this situation and will download merged part fr
     M(SharedPartsLocks, "Number of times shared data parts lock has been acquired for MergeTree tables", ValueType::Number) \
     M(UniqueProcessLockWaitMicroseconds, "Total time spent waiting for unique process lock in UniqueMergeTree dedup", ValueType::Microseconds) \
     M(UniqueProcessLockHoldMicroseconds, "Total time spent holding unique process lock in UniqueMergeTree dedup", ValueType::Microseconds) \
-    M(UniqueKeyDeduplicateSkipPartsByPart, "Number of parts skipped during unique key dedup due to non-overlapping key ranges", ValueType::Number) \
-    M(UniqueKeyDeduplicateSkipPartsByKey, "Number of keys skipped during unique key dedup due to bloom filter", ValueType::Number) \
-    M(UniqueKeyDeduplicateZeroSkip, "Number of dedup iterations where no parts or keys were skipped", ValueType::Number) \
+    M(UniqueKeyDedupBoundaryKeyScanMicroseconds, "Time spent scanning SST to sample boundary keys for parallel dedup sharding", ValueType::Microseconds) \
+    M(UniqueKeyDedupParallelProcessMicroseconds, "Time spent in parallel dedup key range processing (all shards)", ValueType::Microseconds) \
     \
     M(RealTimeMicroseconds, "Total (wall clock) time spent in processing (queries and other tasks) threads (note that this is a sum).", ValueType::Microseconds) \
     M(UserTimeMicroseconds, "Total time spent in processing (queries and other tasks) threads executing CPU instructions in user mode. This includes time CPU pipeline was stalled due to main memory access, cache misses, branch mispredictions, hyper-threading, etc.", ValueType::Microseconds) \

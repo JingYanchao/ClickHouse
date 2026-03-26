@@ -239,6 +239,9 @@
     M(MergeTreePartsCleanerThreads, "Number of threads in the MergeTree parts cleaner thread pool.") \
     M(MergeTreePartsCleanerThreadsActive, "Number of threads in the MergeTree parts cleaner thread pool running a task.") \
     M(MergeTreePartsCleanerThreadsScheduled, "Number of queued or active jobs in the MergeTree parts cleaner thread pool.") \
+    M(UniqueKeyDedupThreads, "Number of threads in the UniqueKeyDedup thread pool for parallel deduplication.") \
+    M(UniqueKeyDedupThreadsActive, "Number of threads in the UniqueKeyDedup thread pool running a task.") \
+    M(UniqueKeyDedupThreadsScheduled, "Number of queued or active jobs in the UniqueKeyDedup thread pool.") \
     M(DatabaseReplicatedCreateTablesThreads, "Number of threads in the threadpool for table creation in DatabaseReplicated.") \
     M(DatabaseReplicatedCreateTablesThreadsActive, "Number of active threads in the threadpool for table creation in DatabaseReplicated.") \
     M(DatabaseReplicatedCreateTablesThreadsScheduled, "Number of queued or active jobs in the threadpool for table creation in DatabaseReplicated.") \

@@ -45,57 +45,60 @@ private:
     std::optional<Stopwatch> lock_watch;
 };
 
-class MergeTreeDedupManager
+class MergeTreeDedupPartManager
 {
 public:
-    explicit MergeTreeDedupManager(const MergeTreeData & storage_);
-    ~MergeTreeDedupManager() = default;
+explicit MergeTreeDedupPartManager(const MergeTreeData & storage_);
+    ~MergeTreeDedupPartManager() = default;
 
-    /// Deduplicate the new_part against all active parts in the same partition.
+    /// Deduplicate new_part against all active parts in the same partition.
     /// Populates delta_deleted_rows_map with rows to be deleted.
-    /// The source parameter indicates how this part was produced (insert, merge, etc.),
-    /// enabling optimization strategies for merge-produced parts.
-    void dedupUniqueIndex(const DataPartPtr & new_part, MergeTreeData::CommitOperation op = MergeTreeData::CommitOperation::Insert);
+    /// The op parameter indicates how this part was produced (insert, merge, etc.),
+    /// enabling optimization strategies (e.g. skipping older parts for merge).
+void dedupPart(const DataPartPtr & new_part, MergeTreeData::CommitOperation op = MergeTreeData::CommitOperation::Insert);
 
     /// Apply accumulated delta delete bitmaps to each part's delete_mark_bitmap.
     /// Should be called under DataPartsLock to ensure atomicity with part state transitions.
     void commitDeleteMarkBuffers(const DataPartsLock & lock);
 
-    /// Rebuild delete marks for all active parts on startup.
+    /// Build delete marks for all active parts on startup.
     /// For each partition, parts are sorted from oldest to newest; each part is deduped
     /// against all older parts using prepareSSTReadersForDedup + dedupKeysThroughNewCommitParts.
-    void rebuildAllDeleteMarks();
+    void buildAllDeleteMarksOnStartup();
 
     UniqueProcessLock lockUniqueProcess() { return UniqueProcessLock(unique_process_mutex); }
 
     const PartDeleteBitmapType & getDeltaDeletedRowsMap() const { return delta_deleted_rows_map; }
 
-private:
-    /// Prepare SST readers for dedup: open input_part's SST reader and all visible parts' SST readers.
-    /// Returns {input_sst_reader, visible_sst_readers}. If input_part has no SST, input_sst_reader is nullptr.
+    /// SST context for dedup: holds the input part's SST reader and
+    /// pre-opened SSTFileReaders for visible parts.
     struct DedupSSTContext
     {
         SSTFileReaderPtr input_sst;
-        std::vector<SSTFileReaderPtr> visible_sst_readers;
+        /// Pre-opened SSTFileReaders for visible parts (thread-safe for pread).
+        struct VisiblePartSSTMeta
+        {
+            size_t index;
+            SSTFileReaderPtr reader;
+        };
+        std::vector<VisiblePartSSTMeta> visible_sst_metas;
     };
 
+private:
     DedupSSTContext prepareSSTReadersForDedup(
         const DataPartPtr & input_part,
         const StorageMetadataPtr & metadata_snapshot,
         MergeTreeData::DataPartsVector & visible_parts);
 
-    /// Optimize visible parts list for merge-produced parts.
-    /// Filters out older parts that cannot conflict with the merge result,
-    /// and clears visible_parts entirely when the merge result contains
-    /// exactly the same effective rows as the covered source parts.
+    /// Optimize visible parts list for merge-produced parts by filtering out
+    /// parts that cannot conflict with the merge result.
     void optimizeVisiblePartsForMerge(
         const DataPartPtr & new_part,
         MergeTreeData::DataPartsVector & visible_parts);
 
     /// Build intra-part delete mark bitmap by scanning the input SST.
-    /// Rows whose part_offset is NOT present in the SST are duplicates
-    /// that lost during SST construction (last-write-wins) and must be deleted.
-    /// Returns nullptr when no intra-part duplicates exist.
+    /// Rows not present in the SST are duplicates that lost during SST
+    /// construction (last-write-wins). Returns nullptr if no duplicates.
     ProjectionIndexBitmapPtr buildIntraPartDeleteMark(
         const DataPartPtr & input_part,
         const SSTFileReader & input_sst);
@@ -105,5 +108,5 @@ private:
     PartDeleteBitmapType delta_deleted_rows_map; /// protected by unique_process_mutex
     LoggerPtr log;
 };
-using MergeTreeDedupManagerPtr = std::shared_ptr<MergeTreeDedupManager>;
+using MergeTreeDedupPartManagerPtr = std::shared_ptr<MergeTreeDedupPartManager>;
 }

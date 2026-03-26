@@ -23,27 +23,34 @@ extern const int LOGICAL_ERROR;
 /// ValueTraits specialization implementations
 /// =====================================================================
 
-UniqueValueEntry ValueTraits<ValueType::PartOffset>::readEntry(const IColumn & value_column, size_t row)
+ValueTraits<ValueType::PartOffset>::Entry
+ValueTraits<ValueType::PartOffset>::readEntry(const IColumn & value_column, size_t row)
 {
     const auto & col = assert_cast<const ColumnUInt64 &>(value_column);
-    return UniqueValueEntry{0, col.getData()[row]};
+    Entry entry;
+    entry.part_offset = col.getData()[row];
+    return entry;
 }
 
-void ValueTraits<ValueType::PartOffset>::writeEntry(IColumn & value_column, const UniqueValueEntry & entry)
+void ValueTraits<ValueType::PartOffset>::writeEntry(IColumn & value_column, const Entry & entry)
 {
     auto & col = assert_cast<ColumnUInt64 &>(value_column);
     col.insertValue(entry.part_offset);
 }
 
-UniqueValueEntry ValueTraits<ValueType::VersionedPartOffset>::readEntry(const IColumn & value_column, size_t row)
+ValueTraits<ValueType::VersionedPartOffset>::Entry
+ValueTraits<ValueType::VersionedPartOffset>::readEntry(const IColumn & value_column, size_t row)
 {
     const auto & tuple = assert_cast<const ColumnTuple &>(value_column);
     const auto & version_col = assert_cast<const ColumnUInt64 &>(tuple.getColumn(0));
     const auto & offset_col = assert_cast<const ColumnUInt64 &>(tuple.getColumn(1));
-    return UniqueValueEntry{version_col.getData()[row], offset_col.getData()[row]};
+    Entry entry;
+    entry.version = version_col.getData()[row];
+    entry.part_offset = offset_col.getData()[row];
+    return entry;
 }
 
-void ValueTraits<ValueType::VersionedPartOffset>::writeEntry(IColumn & value_column, const UniqueValueEntry & entry)
+void ValueTraits<ValueType::VersionedPartOffset>::writeEntry(IColumn & value_column, const Entry & entry)
 {
     auto & tuple = assert_cast<ColumnTuple &>(value_column);
     auto & version_col = assert_cast<ColumnUInt64 &>(tuple.getColumn(0));
@@ -138,7 +145,7 @@ void SerializationSortedStringKV<V>::serializeBinaryBulkWithMultipleStreams(
         /// Use ValueTraits to read UniqueValueEntry from the value column,
         /// then encode into big-endian string for SST storage.
         auto entry = ValueTraits<V>::readEntry(val_col, i);
-        String encoded_value = entry.encode(has_version);
+        String encoded_value = entry.encode();
 
         sst_state->sst_file_writer->put(
             rocksdb::Slice(key),
@@ -217,10 +224,10 @@ void SerializationSortedStringKV<V>::deserializeBinaryBulkWithMultipleStreams(
                 return;
             }
 
-            sst_state->sst_file_reader = std::make_shared<SSTFileReader>(sst_stream, base_offset, sst_size);
+            sst_state->sst_file_reader = std::make_shared<SSTFileReader>(
+                sst_stream, base_offset, sst_size);
 
             rocksdb::ReadOptions read_opts;
-            read_opts.fill_cache = true;
             sst_state->sst_file_iterator = sst_state->sst_file_reader->newIterator(read_opts);
             sst_state->sst_file_iterator->SeekToFirst();
             if (!sst_state->sst_file_iterator->status().ok())
@@ -272,10 +279,10 @@ void SerializationSortedStringKV<V>::deserializeBinaryBulkWithMultipleStreams(
     {
         key_col.insertData(iter->key().data(), iter->key().size());
 
-        /// Decode UniqueValueEntry from SST value (auto-detects 8 vs 16 bytes),
-        /// then use ValueTraits to write it into the appropriate value column(s).
+        /// Decode UniqueValueEntry from SST value, then use ValueTraits
+        /// to write it into the appropriate value column(s).
         const auto & value_slice = iter->value();
-        auto entry = UniqueValueEntry::decode(value_slice.data(), value_slice.size());
+        auto entry = ValueTraits<V>::Entry::decode(value_slice.data(), value_slice.size());
         ValueTraits<V>::writeEntry(val_col, entry);
 
         ++rows_read;

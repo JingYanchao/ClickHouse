@@ -1002,7 +1002,7 @@ static StoragePtr create(const StorageFactory::Arguments & args)
     }
 
     /// UniqueMergeTree engine — uses StorageUniqueMergeTree which inherits StorageMergeTree
-    /// and injects dedup logic via TransactionPreLockHook.
+    /// and injects dedup logic via BeforeTransactionCommitHook.
     if (name_part == "Unique")
     {
         return std::make_shared<StorageUniqueMergeTree>(

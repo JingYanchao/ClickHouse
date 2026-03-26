@@ -89,8 +89,8 @@ class ExpressionActions;
 using ExpressionActionsPtr = std::shared_ptr<ExpressionActions>;
 using ManyExpressionActions = std::vector<ExpressionActionsPtr>;
 class MergeTreeDeduplicationLog;
-class MergeTreeDedupManager;
-using MergeTreeDedupManagerPtr = std::shared_ptr<MergeTreeDedupManager>;
+class MergeTreeDedupPartManager;
+using MergeTreeDedupPartManagerPtr = std::shared_ptr<MergeTreeDedupPartManager>;
 using PartitionIdToMaxBlock = std::unordered_map<String, Int64>;
 
 namespace ErrorCodes
@@ -563,29 +563,14 @@ public:
 
     bool hasProjection() const override;
 
-    /// Hook called by the no-arg Transaction::commit() BEFORE lockParts().
-    /// Allows UniqueMergeTree to acquire dedup lock and perform dedup
-    /// before DataPartsLock, so dedup does not block reads.
-    /// Lock ordering: dedup_mutex -> DataPartsLock.
-    /// NOTE: Only called by no-arg commit(). Callers of commit(DataPartsLock &)
-    /// must handle dedup externally before acquiring DataPartsLock.
-    /// Returns std::any so that the caller can hold onto the returned RAII lock
-    /// (e.g. UniqueProcessLock) until commit is finished.
-    using TransactionPreLockHook = std::function<std::any(const MutableDataParts & parts, CommitOperation op)>;
+    /// Hook called by Transaction::commit BEFORE lockParts.
+    /// Used by UniqueMergeTree for dedup; returns an RAII guard
+    /// (e.g. UniqueProcessLock) that must stay alive until commit finishes.
+    using BeforeTransactionCommitHook = std::function<std::any(const MutableDataParts & parts, CommitOperation op)>;
 
-    void setTransactionPreLockHook(TransactionPreLockHook hook) { transaction_pre_lock_hook = std::move(hook); }
+    void setBeforeTransactionCommitHook(BeforeTransactionCommitHook hook) { before_transaction_commit_hook = std::move(hook); }
 
-    /// Manually invoke the pre-lock hook for callers that use commit(DataPartsLock &)
-    /// instead of the no-arg commit(). This is needed by MergeTreeSink::commitPart()
-    /// which manages lockParts() itself and would otherwise skip dedup.
-    /// The caller MUST hold the returned std::any alive until commit finishes,
-    /// because it contains the dedup mutex guard.
-    [[nodiscard]] std::any invokePreLockHook(const MutableDataParts & parts, CommitOperation op = CommitOperation::Insert)
-    {
-        if (transaction_pre_lock_hook && !parts.empty())
-            return transaction_pre_lock_hook(parts, op);
-        return {};
-    }
+    MergeTreeDedupPartManagerPtr getDedupManager() const { return dedup_manager; }
 
     bool areAsynchronousInsertsEnabled() const override;
 
@@ -1459,13 +1444,11 @@ protected:
     /// under lockForShare if rename is possible.
     String relative_data_path;
 
-    /// Hook called before lockParts() in the no-arg Transaction::commit().
-    /// Used by UniqueMergeTree for dedup (lock ordering: dedup_mutex -> DataPartsLock).
-    TransactionPreLockHook transaction_pre_lock_hook;
+    /// Hook called before lockParts in Transaction::commit.
+    BeforeTransactionCommitHook before_transaction_commit_hook;
 
-    /// Manages cross-part dedup logic and delete mark buffers.
-    /// Initialized by UniqueMergeTree; nullptr for other engine variants.
-    MergeTreeDedupManagerPtr dedup_manager;
+    /// Manages cross-part dedup and delete mark buffers (UniqueMergeTree only).
+    MergeTreeDedupPartManagerPtr dedup_manager;
 
 private:
     /// Columns and secondary indices sizes can be calculated lazily.

@@ -4,6 +4,7 @@
 #include <Storages/StorageMergeTree.h>
 #include <Storages/MergeTree/MergeTreeDataWriter.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
+#include <Storages/MergeTree/MergeTreeDedupPartManager.h>
 #include <Interpreters/InsertDeduplication.h>
 #include <Interpreters/PartLog.h>
 #include <Interpreters/Context.h>
@@ -329,26 +330,22 @@ std::vector<std::string> MergeTreeSink::commitPart(MergeTreeMutableDataPartPtr &
     MergeTreeData::Transaction transaction(storage, context->getCurrentTransaction().get());
 
     std::unique_ptr<PlainCommittingBlockHolder> block_holder;
-    std::any dedup_lock_guard;
+    std::optional<UniqueProcessLock> dedup_lock;
 
     if (storage.supportsUpsert())
     {
-        /// For UniqueMergeTree the dedup logic needs the part's block number
-        /// (used as version) to be assigned BEFORE `dedupUniqueIndex` runs.
-        /// Allocate the block number under DataPartsLock first, then release
-        /// the lock so that `invokePreLockHook` can acquire dedup_mutex without
-        /// violating the lock ordering (dedup_mutex -> DataPartsLock).
+        auto dedup_mgr = storage.getDedupManager();
+
+        /// Step 1: Acquire dedup_lock FIRST to serialize concurrent upsert commits.
+        dedup_lock.emplace(dedup_mgr->lockUniqueProcess());
+
+        /// Step 2: Allocate block number under DataPartsLock.
+        /// This ensures block_number ordering matches dedup_lock acquisition order,
         {
             auto lock = storage.lockParts();
             block_holder = storage.fillNewPartName(part, lock);
         }
-
-        /// Now invoke the pre-lock hook which acquires dedup_mutex and runs
-        /// cross-part dedup. The returned guard keeps dedup_mutex held until
-        /// this function returns, preventing concurrent dedup races.
-        MergeTreeData::MutableDataParts parts_for_hook;
-        parts_for_hook.insert(part);
-        dedup_lock_guard = storage.invokePreLockHook(parts_for_hook);
+dedup_mgr->dedupPart(part);
     }
 
     {

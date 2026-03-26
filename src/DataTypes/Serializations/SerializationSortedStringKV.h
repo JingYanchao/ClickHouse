@@ -15,7 +15,7 @@ class ReadBufferFromFileBase;
 class SeekableReadBuffer;
 class SSTFileWriter;
 class SSTFileReader;
-struct UniqueValueEntry;
+template <bool WithVersion> struct UniqueValueEntry;
 
 /// Extensible enum for different SortedStringKV value layouts.
 enum class ValueType : uint8_t
@@ -40,9 +40,10 @@ template <>
 struct ValueTraits<ValueType::PartOffset>
 {
     static constexpr bool has_version = false;
+    using Entry = UniqueValueEntry<has_version>;
 
-    static UniqueValueEntry readEntry(const IColumn & value_column, size_t row);
-    static void writeEntry(IColumn & value_column, const UniqueValueEntry & entry);
+    static Entry readEntry(const IColumn & value_column, size_t row);
+    static void writeEntry(IColumn & value_column, const Entry & entry);
 };
 
 /// VersionedPartOffset: value column is ColumnTuple(ColumnUInt64, ColumnUInt64)
@@ -51,9 +52,10 @@ template <>
 struct ValueTraits<ValueType::VersionedPartOffset>
 {
     static constexpr bool has_version = true;
+    using Entry = UniqueValueEntry<has_version>;
 
-    static UniqueValueEntry readEntry(const IColumn & value_column, size_t row);
-    static void writeEntry(IColumn & value_column, const UniqueValueEntry & entry);
+    static Entry readEntry(const IColumn & value_column, size_t row);
+    static void writeEntry(IColumn & value_column, const Entry & entry);
 };
 
 

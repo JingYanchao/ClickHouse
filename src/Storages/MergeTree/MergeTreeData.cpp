@@ -96,7 +96,7 @@
 #include <Storages/MergeTree/Compaction/MergeSelectorApplier.h>
 #include <Storages/MergeTree/PatchParts/PatchPartsUtils.h>
 #include <Storages/MergeTree/Compaction/PartsCollectors/Common.h>
-#include <Storages/MergeTree/MergeTreeDedupManager.h>
+#include <Storages/MergeTree/MergeTreeDedupPartManager.h>
 
 #include <boost/algorithm/string/join.hpp>
 
@@ -8501,14 +8501,11 @@ void MergeTreeData::Transaction::renameParts()
 
 MergeTreeData::DataPartsVector MergeTreeData::Transaction::commit()
 {
-    /// Invoke pre-lock hook if set (e.g. for unique projection dedup).
-    /// This runs BEFORE lockParts(), ensuring lock ordering:
-    /// dedup_mutex -> DataPartsLock, so that dedup does not block reads.
-    /// The returned std::any holds the dedup lock (UniqueProcessLock RAII guard);
-    /// it must stay alive until commit(lock) completes.
-    std::any pre_lock_guard;
-    if (data.transaction_pre_lock_hook && !isEmpty())
-        pre_lock_guard = data.transaction_pre_lock_hook(precommitted_parts, commit_operation);
+    /// Invoke before-commit hook (e.g. UniqueMergeTree dedup) before lockParts.
+    /// The returned guard must stay alive until commit finishes.
+    std::any before_commit_guard;
+    if (data.before_transaction_commit_hook && !isEmpty())
+        before_commit_guard = data.before_transaction_commit_hook(precommitted_parts, commit_operation);
 
     auto lock = data.lockParts();
     return commit(lock);

@@ -17,11 +17,6 @@ using IColumnPermutation = PaddedPODArray<size_t>;
 
 class ASTProjectionDeclaration;
 
-struct IndexDescription;
-
-struct IMergeTreeIndex;
-using MergeTreeIndexPtr = std::shared_ptr<const IMergeTreeIndex>;
-
 struct MergeTreeSettings;
 
 /// Base interface for projection index implementations.
@@ -46,10 +41,6 @@ public:
 
 
     virtual std::shared_ptr<MergeTreeSettings> getDefaultSettings() const;
-
-    virtual const IndexDescription * getIndexDescription() const { return nullptr; }
-
-    virtual MergeTreeIndexPtr getIndex() const { return nullptr; }
 
     /// Returns the maximum number of rows supported by this index.
     /// Some indices are limited to 32-bit row counts (approx. 4.29 billion).

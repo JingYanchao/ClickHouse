@@ -1,6 +1,7 @@
 #include <cstddef>
 #include <vector>
 #include <Storages/MergeTree/IMergeTreeReader.h>
+#include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreeIndexConditionText.h>
 #include <Storages/MergeTree/MergeTreeReadTask.h>
 #include <Storages/MergeTree/MergeTreeVirtualColumns.h>
@@ -635,20 +636,26 @@ void IMergeTreeReader::fillMemoryRowExistsColumn(ColumnPtr column, size_t max_ro
     if (!derived_column)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Column _row_exists should be a UInt8 column, but got {}", column->getName());
 
-    const auto * loaded_part_info = typeid_cast<const LoadedMergeTreeDataPartInfoForReader *>(data_part_info_for_read.get());
-    if (!loaded_part_info)
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "fillMemoryRowExistsColumn is only supported for LoadedMergeTreeDataPartInfoForReader");
-
-    auto delete_bitmap = loaded_part_info->getDataPart()->getDeleteMarkBitmap();
+    /// Retrieve the delete mark bitmap from the storage snapshot instead of directly from the part.
+    /// The snapshot captures a consistent copy of the bitmap at query start time under lockParts,
+    /// which avoids race conditions with concurrent commitDeleteMarkBuffers writes.
+    const auto & part_name = data_part_info_for_read->getPartName();
+    const auto & snapshot_data = assert_cast<const MergeTreeData::SnapshotData &>(*storage_snapshot->data);
+    const auto & delete_mark_buffer_map = snapshot_data.delete_mark_buffer_map;
+    const auto iter = delete_mark_buffer_map.find(part_name);
+    auto delete_bitmap = iter != delete_mark_buffer_map.end() ? iter->second : nullptr;
 
     typename ColumnVector<UInt8>::Container & container = derived_column->getData();
     auto initial_size = container.size();
     container.resize(initial_size + max_rows_to_read);
     UInt8 * data_ptr = container.data() + initial_size;
 
-    /// Early exit: no deleted marks at all
-    if (!delete_bitmap || delete_bitmap->empty())
+    const bool has_buffer = delete_bitmap && delete_bitmap->cardinality() > 0;
+
+    /// Early exit if no deleted marks
+    if (!has_buffer)
     {
+        /// Fast path: no deleted marks, all rows exist
         memset(data_ptr, 1, max_rows_to_read);
         offset_for_memory_row_exists += max_rows_to_read;
         column = std::move(mutable_column);
@@ -658,25 +665,61 @@ void IMergeTreeReader::fillMemoryRowExistsColumn(ColumnPtr column, size_t max_ro
     const size_t start = offset_for_memory_row_exists;
     const size_t end = start + max_rows_to_read;
 
-    /// Fast path: no deleted rows in this range
-    if (delete_bitmap->rangeAllZero(start, end))
-    {
-        memset(data_ptr, 1, max_rows_to_read);
-    }
-    else
-    {
-        /// General case: check each row against the delete bitmap.
-        /// Set all to 1 (exists), then mark deleted rows as 0.
-        memset(data_ptr, 1, max_rows_to_read);
-        for (size_t i = 0; i < max_rows_to_read; ++i)
-        {
-            if (delete_bitmap->contains(start + i))
-                data_ptr[i] = 0;
-        }
-    }
+    bool can_use_32bit_offset = data_part_info_for_read->getRowCount() <= std::numeric_limits<UInt32>::max();
 
-    offset_for_memory_row_exists += max_rows_to_read;
+    auto process_delete_buffer = [&]<typename BitmapOffset>(BitmapOffset)
+    {
+        if (delete_bitmap->containsRange(start, end))
+        {
+            /// Fast path: all rows deleted.
+            memset(data_ptr, 0, max_rows_to_read);
+            return;
+        }
+
+        if (delete_bitmap->rangeCardinality(start, end) == 0)
+        {
+            /// Fast path: all rows exist.
+            memset(data_ptr, 1, max_rows_to_read);
+            return;
+        }
+
+        /// Mixed case: some rows exist, some don't - need per-element check.
+        /// Use block-wise checking to leverage memset for homogeneous blocks.
+        /// Block size of 32 provides good balance between check overhead and memset benefit.
+        constexpr static size_t BLOCK_SIZE = 32;
+
+        for (size_t block_start = start; block_start < end; block_start += BLOCK_SIZE)
+        {
+            size_t block_end = std::min(block_start + BLOCK_SIZE, end);
+            size_t block_size = block_end - block_start;
+
+            if (delete_bitmap->containsRange(block_start, block_end))
+            {
+                /// Fast path: entire block deleted
+                memset(data_ptr, 0, block_size);
+            }
+            else if (delete_bitmap->rangeCardinality(block_start, block_end) == 0)
+            {
+                /// Fast path: entire block exists
+                memset(data_ptr, 1, block_size);
+            }
+            else /// The case of `rangeCardinality` equaling to `block_size` is covered by `containsRange` check above.
+            {
+                /// Mixed block: check each row individually
+                for (size_t i = 0; i < block_size; ++i)
+                    data_ptr[i] = !delete_bitmap->contains<BitmapOffset>(static_cast<BitmapOffset>(block_start + i));
+            }
+            data_ptr += block_size;
+        }
+    };
+
+    if (can_use_32bit_offset)
+        process_delete_buffer(UInt32{});
+    else
+        process_delete_buffer(UInt64{});
+
     column = std::move(mutable_column);
+    offset_for_memory_row_exists += max_rows_to_read;
 }
 
 void IMergeTreeReader::setMemoryRowExistsOffset(size_t offset_)

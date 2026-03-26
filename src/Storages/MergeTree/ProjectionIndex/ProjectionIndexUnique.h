@@ -5,8 +5,9 @@
 #include <Core/Block.h>
 #include <Core/Names.h>
 #include <Core/Types.h>
-#include <Storages/IndicesDescription.h>
+#include <DataTypes/Serializations/SerializationSortedStringKV.h>
 #include <Storages/MergeTree/SSTFileUtil.h>
+#include <fmt/format.h>
 
 #include <memory>
 
@@ -15,55 +16,73 @@ namespace DB
 
 /// Big-endian encoded value stored in the SortedStringKV column.
 ///
-/// Two layouts are supported:
-///   Without version: [8 bytes part_offset BE]             = 8 bytes
-///   With version:    [8 bytes version BE][8 bytes part_offset BE] = 16 bytes
+/// Template parameter `WithVersion` controls the layout:
+///   UniqueValueEntry<false>:  [8 bytes part_offset]                      =  8 bytes
+///   UniqueValueEntry<true>:   [8 bytes version] + [8 bytes part_offset]  = 16 bytes
 ///
-/// Lexicographic comparison on the encoded string == numeric comparison,
+/// Lexicographic comparison on the encoded bytes == numeric comparison,
 /// which is required by SimpleAggregateFunction(max, ...) dedup semantics.
-/// For the versioned layout, tuple(version, part_offset) comparison is
-/// equivalent to comparing version first, then part_offset as tie-breaker.
-struct UniqueValueEntry
+namespace detail
 {
-    UInt64 version = 0;
+    template <bool WithVersion>
+    struct VersionBase { UInt64 version = 0; };
+
+    template <>
+    struct VersionBase<false> {};
+}
+
+template <bool WithVersion>
+struct UniqueValueEntry : detail::VersionBase<WithVersion>
+{
     UInt64 part_offset = 0;
 
-    /// Encode into big-endian string.
-    /// Without version: 8-byte BE(part_offset)
-    /// With version: 16-byte BE(version) ++ BE(part_offset)
-    String encode(bool with_version = false) const;
+    /// Encode into big-endian bytes for SST storage.
+    String encode() const;
 
-    /// Decode from a raw value buffer. Automatically detects format by size:
-    ///   8 bytes  -> without version (version = 0)
-    ///   16 bytes -> with version
+    /// Decode from raw value buffer.
     static UniqueValueEntry decode(const char * data, size_t size);
-
-    /// Convenience overload for StringRef / std::string_view.
     static UniqueValueEntry decode(std::string_view sv) { return decode(sv.data(), sv.size()); }
+
+    /// Helper to get version value (returns 0 when WithVersion=false).
+    UInt64 getVersion() const
+    {
+        if constexpr (WithVersion)
+            return this->version;
+        else
+            return 0;
+    }
 };
 
-/// Unique Projection Index: deduplicates rows based on user-specified unique key columns.
+/// Non-template alias for runtime decode (e.g. dedup manager).
+/// Always uses the versioned layout; for 8-byte values, version = 0.
+using UniqueValueEntryFull = UniqueValueEntry<true>;
+
+/// Runtime decode that auto-detects format by value size (8 or 16 bytes).
+UniqueValueEntryFull decodeUniqueValueEntry(const char * data, size_t size);
+inline UniqueValueEntryFull decodeUniqueValueEntry(std::string_view sv) { return decodeUniqueValueEntry(sv.data(), sv.size()); }
+
+/// Unique Projection Index: deduplicates rows based on unique key columns.
 ///
 /// Each projection part stores a single SortedStringKV column mapping
-/// unique_key -> _parent_part_offset.
+/// unique_key -> part_offset (or (version, part_offset) with version column).
 ///
-/// DDL syntax:
-///   PROJECTION unique_idx INDEX id TYPE unique
-///   PROJECTION unique_idx INDEX (id, name) TYPE unique
-///   PROJECTION unique_idx INDEX id TYPE unique('ver')   -- with version column
+/// DDL examples:
+///   PROJECTION p INDEX id TYPE unique
+///   PROJECTION p INDEX (id, name) TYPE unique
+///   PROJECTION p INDEX id TYPE unique('ver')   -- with version column
 class ProjectionIndexUnique : public IProjectionIndex
 {
 public:
     static constexpr auto name = "unique";
 
-    /// Centralized naming constants for unique projection infrastructure.
-    /// All code that references these names should use these constants
-    /// instead of hardcoding strings to avoid inconsistencies.
+    /// Naming constants for unique projection infrastructure.
     static constexpr auto kv_column_name = "_unique_kv";
     static constexpr auto default_projection_name = "__unique_index";
     /// SST file name stored inside the projection part directory.
-    /// Derived from kv_column_name + SST_DATA_FILE_EXTENSION.
-    static inline const String sst_file_name = String(kv_column_name) + SST_DATA_FILE_EXTENSION;
+    static String getSSTFileName()
+    {
+        return fmt::format("{}{}", kv_column_name, SST_DATA_FILE_EXTENSION);
+    }
 
     /// Create from AST: extracts unique key column names from the INDEX expression.
     static ProjectionIndexPtr create(const ASTProjectionDeclaration & proj);
@@ -72,15 +91,15 @@ public:
 
     String getName() const override { return name; }
 
-    /// Build projection metadata: single SortedStringKV column, empty primary key, sorting by kv key.
+    /// Build projection metadata: SortedStringKV column, sorting key, etc.
     void fillProjectionDescription(
         ProjectionDescription & result,
         const IAST * index_expr,
         const ColumnsDescription & columns,
         ContextPtr query_context) const override;
 
-    /// Calculate projection block from source block: serialize unique keys,
-    /// compute version + part_offset, perform in-block dedup.
+    /// Calculate projection block from source block: serialize unique keys
+    /// and perform in-block dedup.
     Block calculate(
         const ProjectionDescription & projection_desc,
         const Block & block,
@@ -90,21 +109,13 @@ public:
 
     std::shared_ptr<MergeTreeSettings> getDefaultSettings() const override;
 
-    const IndexDescription * getIndexDescription() const override;
-
-    MergeTreeIndexPtr getIndex() const override;
-
     UInt64 getMaxRows() const override { return std::numeric_limits<UInt32>::max(); }
 
     const String & getVersionColumnName() const { return version_column_name; }
 
 private:
-    /// Serialize unique key columns from a block row into a single comparable string.
-    static String serializeKeyColumns(const Block & block, const Names & key_columns, size_t row_index);
     Names unique_key_columns;
     String version_column_name;
-    IndexDescription index_description;
-    std::shared_ptr<const IMergeTreeIndex> index;
 };
 
 }

@@ -822,6 +822,13 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare() const
     global_ctx->new_data_part->setColumns(global_ctx->storage_columns, infos, global_ctx->metadata_snapshot->getMetadataVersion());
 
     ctx->sum_input_rows_upper_bound = global_ctx->merge_list_element_ptr->total_rows_count;
+    /// For UniqueMergeTree, rows marked as deleted will be filtered out during merge,
+    /// so subtract delete marks to get a more accurate upper bound.
+    if (global_ctx->data->supportsUpsert())
+    {
+        for (const auto & part : global_ctx->future_part->parts)
+            ctx->sum_input_rows_upper_bound -= part->getDeleteMarksCount();
+    }
     ctx->sum_compressed_bytes_upper_bound = global_ctx->merge_list_element_ptr->total_size_bytes_compressed;
     ctx->sum_uncompressed_bytes_upper_bound = global_ctx->merge_list_element_ptr->total_size_bytes_uncompressed;
 
@@ -2991,7 +2998,13 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::createMergedStream() const
 
 MergeAlgorithm MergeTask::ExecuteAndFinalizeHorizontalPart::chooseMergeAlgorithm() const
 {
-    const size_t total_rows_count = global_ctx->merge_list_element_ptr->total_rows_count;
+    size_t total_rows_count = global_ctx->merge_list_element_ptr->total_rows_count;
+    /// For UniqueMergeTree, exclude delete-marked rows for a more accurate algorithm decision.
+    if (global_ctx->data->supportsUpsert())
+    {
+        for (const auto & part : global_ctx->future_part->parts)
+            total_rows_count -= part->getDeleteMarksCount();
+    }
     const size_t total_size_bytes_uncompressed = global_ctx->merge_list_element_ptr->total_size_bytes_uncompressed;
     const auto & merge_tree_settings = global_ctx->data_settings;
 

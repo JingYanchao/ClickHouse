@@ -24,6 +24,7 @@ public:
     /// Storage mode: owns the buffer, can release and re-create it.
     ReadBufferWrapper(std::unique_ptr<ReadBufferFromFileBase> buffer_, const String & file_path_, DataPartStoragePtr storage_)
         : owned_buffer(std::move(buffer_)), file_path(file_path_), storage(std::move(storage_))
+        , supports_read_at(owned_buffer && owned_buffer->supportsReadAt())
     {
     }
 
@@ -31,6 +32,7 @@ public:
     /// The caller is responsible for the lifetime of raw_buffer.
     ReadBufferWrapper(SeekableReadBuffer * raw_buffer, uint64_t base_offset, uint64_t region_size)
         : raw_read_buffer(raw_buffer), raw_base_offset(base_offset), raw_region_size(region_size)
+        , supports_read_at(raw_read_buffer && raw_read_buffer->supportsReadAt())
     {
     }
 
@@ -54,6 +56,26 @@ public:
             return raw_read_buffer->read(to, n);
         checkOrCreateReadBuffer();
         return owned_buffer->read(to, n);
+    }
+
+    /// Lock-free positional read using pread semantics (readBigAt).
+    /// Multiple threads can call this concurrently without mutex contention.
+    /// Returns the number of bytes actually read.
+    size_t readAt(uint64_t offset, char * to, size_t n) const
+    {
+        if (raw_read_buffer)
+        {
+            return raw_read_buffer->readBigAt(to, n, raw_base_offset + offset, nullptr);
+        }
+        checkOrCreateReadBuffer();
+        return owned_buffer->readBigAt(to, n, offset, nullptr);
+    }
+
+    /// Check whether the underlying buffer supports lock-free positional reads.
+    /// The result is cached at construction time for thread safety.
+    bool supportsReadAt() const
+    {
+        return supports_read_at;
     }
 
 private:
@@ -90,6 +112,8 @@ private:
     uint64_t raw_region_size = 0;
 
     mutable std::mutex mutex;
+    /// Cached at construction: whether the underlying buffer supports readBigAt.
+    bool supports_read_at = false;
 };
 using ReadBufferWrapperPtr = std::shared_ptr<ReadBufferWrapper>;
 class ReadBufferBasedSequentialFile : public rocksdb::FSSequentialFile
@@ -130,6 +154,7 @@ class ReadBufferBasedRandomAccessFile : public rocksdb::FSRandomAccessFile
 public:
     explicit ReadBufferBasedRandomAccessFile(const ReadBufferWrapperPtr & read_buffer_)
         : read_buffer(read_buffer_)
+        , use_pread(read_buffer_->supportsReadAt())
     {
     }
 
@@ -141,13 +166,27 @@ public:
         char * scratch,
         rocksdb::IODebugContext *) const override
     {
-        auto bytes_read = read_buffer->seekAndRead(offset, SEEK_SET, scratch, n);
+        size_t bytes_read;
+        if (use_pread)
+        {
+            /// Lock-free path: use pread semantics (readBigAt).
+            /// Multiple threads can call this concurrently on the same
+            /// ReadBufferWrapper without mutex contention.
+            bytes_read = read_buffer->readAt(offset, scratch, n);
+        }
+        else
+        {
+            /// Fallback: use seek+read under mutex.
+            bytes_read = read_buffer->seekAndRead(offset, SEEK_SET, scratch, n);
+        }
         *result = rocksdb::Slice(scratch, bytes_read);
         return rocksdb::IOStatus::OK();
     }
 
 private:
     ReadBufferWrapperPtr read_buffer;
+    /// Cached flag: true if the underlying buffer supports lock-free pread.
+    bool use_pread;
 };
 
 class WriteBufferWritableFile : public rocksdb::FSWritableFile
@@ -659,24 +698,7 @@ void SSTFileReader::init(const String & file_name)
     if (!status.ok())
         throw Exception(ErrorCodes::INCORRECT_DATA, "Failed to open SST reader for {}: {}", file_name, status.ToString());
 
-    status = local_reader->VerifyChecksum();
-    if (!status.ok())
-        throw Exception(ErrorCodes::INCORRECT_DATA, "Failed to verify SST checksum for {}: {}", file_name, status.ToString());
-
     index_reader = std::move(local_reader);
-
-    /// Load min/max key range
-    rocksdb::ReadOptions read_opts;
-    read_opts.fill_cache = false;
-    auto iter = newIterator(read_opts);
-    iter->SeekToFirst();
-    if (iter->Valid())
-    {
-        auto min_key = iter->key().ToString();
-        iter->SeekToLast();
-        auto max_key = iter->key().ToString();
-        key_range = std::make_pair(std::move(min_key), std::move(max_key));
-    }
 }
 
 SSTFileReader::SSTFileReader(SeekableReadBuffer * read_buffer, uint64_t base_offset, uint64_t region_size)
@@ -731,6 +753,30 @@ bool SSTFileReader::get(const rocksdb::Slice & key, std::string * value_out) con
     }
 }
 
+std::vector<rocksdb::Status> SSTFileReader::multiGet(const std::vector<rocksdb::Slice> & keys, std::vector<std::string> * values_out) const
+{
+    if (keys.empty())
+        return {};
+
+    std::vector<std::string> values;
+    auto statuses = index_reader->MultiGet(rocksdb::ReadOptions(), keys, &values);
+
+    if (statuses.size() != keys.size())
+        throw Exception(ErrorCodes::INCORRECT_DATA, "MultiGet returned {} statuses for {} keys", statuses.size(), keys.size());
+
+    /// Check for unexpected errors (not OK and not NotFound).
+    for (size_t i = 0; i < statuses.size(); ++i)
+    {
+        if (!statuses[i].ok() && !statuses[i].IsNotFound())
+            throw Exception(ErrorCodes::INCORRECT_DATA, "Failed to multiGet key from unique index: {}", statuses[i].ToString());
+    }
+
+    if (values_out)
+        *values_out = std::move(values);
+
+    return statuses;
+}
+
 std::unique_ptr<rocksdb::Iterator> SSTFileReader::newIterator(const rocksdb::ReadOptions & options) const
 {
     if (!index_reader)
@@ -738,11 +784,6 @@ std::unique_ptr<rocksdb::Iterator> SSTFileReader::newIterator(const rocksdb::Rea
     std::unique_ptr<rocksdb::Iterator> res;
     res.reset(index_reader->NewIterator(options));
     return res;
-}
-
-bool SSTFileReader::mayContainKey(std::string_view key) const
-{
-    return key >= key_range.first && key <= key_range.second;
 }
 
 void SSTFileReader::verifyChecksums() const
@@ -755,11 +796,6 @@ void SSTFileReader::verifyChecksums() const
 SSTFileReader::IndexPropertiesPtr SSTFileReader::getProperties() const
 {
     return index_reader->GetTableProperties();
-}
-
-bool SSTFileReader::isEmpty() const
-{
-    return key_range.first.empty() && key_range.second.empty();
 }
 
 SSTFileWriter::SSTFileWriter(WriteBuffer * write_buffer)
