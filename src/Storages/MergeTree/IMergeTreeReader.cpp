@@ -655,8 +655,8 @@ void IMergeTreeReader::fillMemoryRowExistsColumn(ColumnPtr column, size_t max_ro
         return;
     }
 
-    const UInt32 start = offset_for_memory_row_exists;
-    const UInt32 end = start + static_cast<UInt32>(max_rows_to_read);
+    const size_t start = offset_for_memory_row_exists;
+    const size_t end = start + max_rows_to_read;
 
     /// Fast path: no deleted rows in this range
     if (delete_bitmap->rangeAllZero(start, end))
@@ -668,9 +668,9 @@ void IMergeTreeReader::fillMemoryRowExistsColumn(ColumnPtr column, size_t max_ro
         /// General case: check each row against the delete bitmap.
         /// Set all to 1 (exists), then mark deleted rows as 0.
         memset(data_ptr, 1, max_rows_to_read);
-        for (UInt32 i = 0; i < static_cast<UInt32>(max_rows_to_read); ++i)
+        for (size_t i = 0; i < max_rows_to_read; ++i)
         {
-            if (delete_bitmap->contains<UInt32>(start + i))
+            if (delete_bitmap->contains(start + i))
                 data_ptr[i] = 0;
         }
     }

@@ -185,7 +185,8 @@ private:
     /// Fields of virtual columns that were filled in previous stages.
     VirtualFields virtual_fields;
 
-    UInt32 offset_for_memory_row_exists = 0;
+    /// Offset used to track the current read position when filling the in-memory `_row_exists` column.
+    size_t offset_for_memory_row_exists = 0;
 };
 
 using MergeTreeReaderPtr = std::unique_ptr<IMergeTreeReader>;
