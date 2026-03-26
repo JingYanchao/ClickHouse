@@ -51,9 +51,12 @@ ORDER BY id;
 insert into horizontal_upsert_table_write_version (id, value1, value2) values (1,1,1);
 insert into horizontal_upsert_table_write_version (id, value1, value2) values (2,2,2);
 insert into horizontal_upsert_table_write_version (id, value1, value2) values (3,3,3);
-select _row_version from horizontal_upsert_table_write_version order by _row_version;
+-- Before merge: 3 SST entries across 3 parts
+select count() from mergeTreeProjection(currentDatabase(), 'horizontal_upsert_table_write_version', '__unique_index');
 optimize table horizontal_upsert_table_write_version final;
-select _row_version from horizontal_upsert_table_write_version order by _row_version;
+-- After merge: still 3 entries with distinct offsets
+select count() from mergeTreeProjection(currentDatabase(), 'horizontal_upsert_table_write_version', '__unique_index');
+select count(DISTINCT tupleElement(_unique_kv, 2)) from mergeTreeProjection(currentDatabase(), 'horizontal_upsert_table_write_version', '__unique_index');
 drop table if exists horizontal_upsert_table_write_version;
 
 select '--- test vertical version ---';
@@ -72,9 +75,12 @@ SETTINGS enable_vertical_merge_algorithm = 1, vertical_merge_algorithm_min_rows_
 insert into vertical_upsert_table_write_version (id, value1, value2) values (1,1,1);
 insert into vertical_upsert_table_write_version (id, value1, value2) values (2,2,2);
 insert into vertical_upsert_table_write_version (id, value1, value2) values (3,3,3);
-select _row_version from vertical_upsert_table_write_version order by _row_version;
+-- Before merge: 3 SST entries across 3 parts
+select count() from mergeTreeProjection(currentDatabase(), 'vertical_upsert_table_write_version', '__unique_index');
 optimize table vertical_upsert_table_write_version final;
-select _row_version from vertical_upsert_table_write_version order by _row_version;
+-- After merge: still 3 entries with distinct offsets
+select count() from mergeTreeProjection(currentDatabase(), 'vertical_upsert_table_write_version', '__unique_index');
+select count(DISTINCT tupleElement(_unique_kv, 2)) from mergeTreeProjection(currentDatabase(), 'vertical_upsert_table_write_version', '__unique_index');
 drop table if exists vertical_upsert_table_write_version;
 
 select '--- test vertical (simple unique key) ---';

@@ -22,31 +22,25 @@ echo "$(${CLICKHOUSE_CLIENT} --server_logs_file=/dev/null --query="CREATE TABLE 
   | grep -c 'DB::Exception:.*must be a string literal'
 ${CLICKHOUSE_CLIENT} --query="DROP TABLE IF EXISTS test_version_param"
 
-# Test 4: _row_exists column name is reserved for persistent virtual column
-${CLICKHOUSE_CLIENT} --query="DROP TABLE IF EXISTS test_row_exists"
-echo "$(${CLICKHOUSE_CLIENT} --server_logs_file=/dev/null --query="CREATE TABLE test_row_exists (x Int32, _row_exists UInt8, PROJECTION __unique_index INDEX x TYPE unique) ENGINE = UniqueMergeTree() ORDER BY x" 2>&1)" \
-  | grep -c 'DB::Exception:.*reserved for persistent virtual column'
-${CLICKHOUSE_CLIENT} --query="DROP TABLE IF EXISTS test_row_exists"
-
-# Test 5: Unique projection index key must be simple identifiers, not expressions
+# Test 4: Unique projection index key must be simple identifiers, not expressions
 ${CLICKHOUSE_CLIENT} --query="DROP TABLE IF EXISTS test_expr_key"
 echo "$(${CLICKHOUSE_CLIENT} --server_logs_file=/dev/null --query="CREATE TABLE test_expr_key (x Int32, y UInt64, PROJECTION __unique_index INDEX x + y TYPE unique) ENGINE = UniqueMergeTree() ORDER BY x" 2>&1)" \
   | grep -c 'DB::Exception:.*must be simple identifiers'
 ${CLICKHOUSE_CLIENT} --query="DROP TABLE IF EXISTS test_expr_key"
 
-# Test 6: Successful creation with single-column unique projection
+# Test 5: Successful creation with single-column unique projection
 ${CLICKHOUSE_CLIENT} --query="DROP TABLE IF EXISTS test_ok_single"
 ${CLICKHOUSE_CLIENT} --query="CREATE TABLE test_ok_single (x Int32, y UInt64, PROJECTION __unique_index INDEX x TYPE unique) ENGINE = UniqueMergeTree() ORDER BY x"
 echo "$(${CLICKHOUSE_CLIENT} --query="SELECT engine FROM system.tables WHERE name = 'test_ok_single' AND database = currentDatabase()")"
 ${CLICKHOUSE_CLIENT} --query="DROP TABLE IF EXISTS test_ok_single"
 
-# Test 7: Successful creation with multi-column unique projection
+# Test 6: Successful creation with multi-column unique projection
 ${CLICKHOUSE_CLIENT} --query="DROP TABLE IF EXISTS test_ok_multi"
 ${CLICKHOUSE_CLIENT} --query="CREATE TABLE test_ok_multi (x Int32, y UInt64, z String, PROJECTION __unique_index INDEX x, y TYPE unique) ENGINE = UniqueMergeTree() ORDER BY x"
 echo "$(${CLICKHOUSE_CLIENT} --query="SELECT engine FROM system.tables WHERE name = 'test_ok_multi' AND database = currentDatabase()")"
 ${CLICKHOUSE_CLIENT} --query="DROP TABLE IF EXISTS test_ok_multi"
 
-# Test 8: Successful creation with version column specified in TYPE unique('ver')
+# Test 7: Successful creation with version column specified in TYPE unique('ver')
 ${CLICKHOUSE_CLIENT} --query="DROP TABLE IF EXISTS test_ok_version"
 ${CLICKHOUSE_CLIENT} --query="CREATE TABLE test_ok_version (x Int32, y UInt64, ver UInt64, PROJECTION __unique_index INDEX x TYPE unique('ver')) ENGINE = UniqueMergeTree() ORDER BY x"
 echo "$(${CLICKHOUSE_CLIENT} --query="SELECT engine FROM system.tables WHERE name = 'test_ok_version' AND database = currentDatabase()")"
