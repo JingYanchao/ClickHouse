@@ -19,7 +19,7 @@ using ParallelReplicasReadingCoordinatorPtr = std::shared_ptr<ParallelReplicasRe
 
 /** Interprets the INSERT query.
   */
-class InterpreterInsertQuery : public IInterpreter, WithMutableContext
+class InterpreterInsertQuery : public IInterpreter, public WithMutableContext
 {
 public:
     InterpreterInsertQuery(
@@ -56,7 +56,8 @@ public:
     bool supportsTransactions() const override { return true; }
 
     static bool shouldAddSquashingForStorage(const StoragePtr & table, ContextPtr context);
-
+protected:
+    virtual ASTPtr rewriteQueryIfNeed(ASTPtr query) { return query; }
 private:
     static Block getSampleBlock(
         const Names & names,

@@ -966,6 +966,7 @@ std::optional<QueryPipeline> InterpreterInsertQuery::distributedWriteIntoReplica
 
 BlockIO InterpreterInsertQuery::execute()
 {
+    query_ptr = rewriteQueryIfNeed(query_ptr);
     auto context = getContext();
     const Settings & settings = context->getSettingsRef();
     auto & query = query_ptr->as<ASTInsertQuery &>();
