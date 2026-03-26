@@ -76,6 +76,17 @@ IMergeTreeReader::IMergeTreeReader(
         }
     }
 
+    if (settings.enable_upsert)
+    {
+        size_t left_mark = std::numeric_limits<size_t>::max();
+        for (auto r : all_mark_ranges)
+        {
+            if (left_mark > r.begin)
+                left_mark = r.begin;
+        }
+        const auto & index_granularity = data_part_info_for_read->getIndexGranularity();
+        offset_for_memory_row_exists = static_cast<UInt32>(index_granularity.getMarkStartingRow(left_mark));
+    }
 }
 
 const ValueSizeMap & IMergeTreeReader::getAvgValueSizeHints() const
@@ -616,7 +627,7 @@ std::unique_ptr<SSTFileReadStream> IMergeTreeReader::createSSTReadStream(
         clock_type_);
 }
 
-void IMergeTreeReader::fillMemoryRowExistsColumn(ColumnPtr column, size_t start_row, size_t max_rows_to_read) const
+void IMergeTreeReader::fillMemoryRowExistsColumn(ColumnPtr column, size_t max_rows_to_read)
 {
     chassert(settings.enable_upsert);
     auto mutable_column = column->assumeMutable();
@@ -639,13 +650,16 @@ void IMergeTreeReader::fillMemoryRowExistsColumn(ColumnPtr column, size_t start_
     if (!delete_bitmap || delete_bitmap->empty())
     {
         memset(data_ptr, 1, max_rows_to_read);
+        offset_for_memory_row_exists += max_rows_to_read;
         column = std::move(mutable_column);
         return;
     }
 
-    const auto end = start_row + static_cast<UInt32>(max_rows_to_read);
+    const UInt32 start = offset_for_memory_row_exists;
+    const UInt32 end = start + static_cast<UInt32>(max_rows_to_read);
+
     /// Fast path: no deleted rows in this range
-    if (delete_bitmap->rangeAllZero(start_row, end))
+    if (delete_bitmap->rangeAllZero(start, end))
     {
         memset(data_ptr, 1, max_rows_to_read);
     }
@@ -654,14 +668,20 @@ void IMergeTreeReader::fillMemoryRowExistsColumn(ColumnPtr column, size_t start_
         /// General case: check each row against the delete bitmap.
         /// Set all to 1 (exists), then mark deleted rows as 0.
         memset(data_ptr, 1, max_rows_to_read);
-        for (size_t i = 0; i < max_rows_to_read; ++i)
+        for (UInt32 i = 0; i < static_cast<UInt32>(max_rows_to_read); ++i)
         {
-            if (delete_bitmap->contains<UInt32>(static_cast<UInt32>(start_row + i)))
+            if (delete_bitmap->contains<UInt32>(start + i))
                 data_ptr[i] = 0;
         }
     }
 
+    offset_for_memory_row_exists += max_rows_to_read;
     column = std::move(mutable_column);
+}
+
+void IMergeTreeReader::setMemoryRowExistsOffset(size_t offset_)
+{
+    offset_for_memory_row_exists = offset_;
 }
 
 }

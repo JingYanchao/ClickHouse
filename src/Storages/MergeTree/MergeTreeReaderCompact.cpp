@@ -190,9 +190,7 @@ void MergeTreeReaderCompact::readData(
 
     if (settings.enable_upsert && name_and_type.name == RowExistsColumn::name)
     {
-        /// Compact reader always seeks to exact mark + offset; compute the absolute row number directly.
-        size_t start_row = data_part_info_for_read->getIndexGranularity().getMarkStartingRow(from_mark) + rows_offset;
-        fillMemoryRowExistsColumn(column, start_row, rows_to_read);
+        fillMemoryRowExistsColumn(column, rows_to_read);
         return;
     }
 
@@ -275,7 +273,7 @@ if (dynamic_cast<const IDataTypeSortedStringKV *>(name_and_type.type->getCustomN
             if (has_substream_marks)
             {
                 const auto & serialization = serializations[column_idx];
-                serialization->deserializeBinaryBulkWithMultipleStreams(column, 0, rows_to_read, deserialize_settings, deserialize_binary_bulk_state_map_for_subcolumns[name], substreams_cache);
+                serialization->deserializeBinaryBulkWithMultipleStreams(column, rows_offset, rows_to_read, deserialize_settings, deserialize_binary_bulk_state_map_for_subcolumns[name], substreams_cache);
             }
             else
             {
@@ -288,7 +286,7 @@ if (dynamic_cast<const IDataTypeSortedStringKV *>(name_and_type.type->getCustomN
                 if (!temp_full_column)
                 {
                     temp_full_column = type_in_storage->createColumn(*serialization);
-                    serialization->deserializeBinaryBulkWithMultipleStreams(temp_full_column, 0, rows_to_read, deserialize_settings, deserialize_binary_bulk_state_map_for_subcolumns[name_in_storage], substreams_cache);
+                    serialization->deserializeBinaryBulkWithMultipleStreams(temp_full_column, rows_offset, rows_to_read, deserialize_settings, deserialize_binary_bulk_state_map_for_subcolumns[name_in_storage], substreams_cache);
 
                     if (columns_cache_for_subcolumns)
                         columns_cache_for_subcolumns->emplace(name_in_storage, temp_full_column);
@@ -306,7 +304,7 @@ if (dynamic_cast<const IDataTypeSortedStringKV *>(name_and_type.type->getCustomN
         else
         {
             const auto & serialization = serializations[column_idx];
-            serialization->deserializeBinaryBulkWithMultipleStreams(column, 0, rows_to_read, deserialize_settings, deserialize_binary_bulk_state_map[name], substreams_cache);
+            serialization->deserializeBinaryBulkWithMultipleStreams(column, rows_offset, rows_to_read, deserialize_settings, deserialize_binary_bulk_state_map[name], substreams_cache);
         }
 
         columns_cache[name] = column;

@@ -168,9 +168,8 @@ size_t MergeTreeRangeReader::DelayedStream::readRows(Columns & columns, size_t n
 {
     if (num_rows)
     {
-        size_t rows_offset = current_offset >= num_rows ? current_offset - num_rows : 0;
         size_t rows_read = merge_tree_reader->readRows(
-            current_mark, current_task_last_mark, continue_reading, num_rows, rows_offset, columns);
+            current_mark, current_task_last_mark, continue_reading, num_rows, 0, columns);
         continue_reading = true;
 
         /// Zero rows_read maybe either because reading has finished
@@ -1076,6 +1075,8 @@ MergeTreeRangeReader::ReadResult MergeTreeRangeReader::startReadingChain(size_t 
                 ranges.pop_front();
                 current_mark = stream.current_mark;
                 ++result.debug_num_ranges_processed;
+                if (merge_tree_reader->data_part_info_for_read->isSupportsUpsert())
+                    merge_tree_reader->setMemoryRowExistsOffset(stream.currentPartOffset());
             }
 
             if (merge_tree_reader->canSkipMark(currentMark(), stream.stream.currentTaskLastMark()))

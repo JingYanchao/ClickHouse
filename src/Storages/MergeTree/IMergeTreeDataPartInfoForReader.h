@@ -54,6 +54,8 @@ public:
 
     virtual bool hasLightweightDelete() const = 0;
 
+    virtual bool isSupportsUpsert() const = 0;
+
     virtual const String & getPartName() const = 0;
 
     virtual const MergeTreePartInfo & getPartInfo() const = 0;
