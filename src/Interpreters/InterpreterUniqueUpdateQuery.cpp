@@ -178,18 +178,9 @@ ASTPtr InterpreterUniqueUpdateQuery::rewriteQueryIfNeed(DB::ASTPtr query_ptr)
     {
         const auto updated_expr_it = column_to_update_expression.find(col.name);
         if (updated_expr_it != column_to_update_expression.end())
-        {
-            /// Wrap the update expression with an alias so that
-            /// InterpreterInsertQuery can match columns by name.
-            /// e.g. SET value = value + 1 → (value + 1) AS value
-            auto aliased = updated_expr_it->second->clone();
-            aliased->setAlias(col.name);
-            column_expressions.emplace_back(std::move(aliased));
-        }
+            column_expressions.emplace_back(updated_expr_it->second->clone());
         else
-        {
             column_expressions.push_back(make_intrusive<ASTIdentifier>(col.name));
-        }
     }
 
     /// Transform to: INSERT INTO table SELECT ... FROM table WHERE <predicate>

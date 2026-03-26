@@ -22,11 +22,11 @@ echo "$(${CLICKHOUSE_CLIENT} --server_logs_file=/dev/null --query="CREATE TABLE 
   | grep -c 'DB::Exception:.*must be a string literal'
 ${CLICKHOUSE_CLIENT} --query="DROP TABLE IF EXISTS test_version_param"
 
-# Test 4: _row_version column name is reserved for persistent virtual column
-${CLICKHOUSE_CLIENT} --query="DROP TABLE IF EXISTS test_row_version"
-echo "$(${CLICKHOUSE_CLIENT} --server_logs_file=/dev/null --query="CREATE TABLE test_row_version (x Int32, _row_version UInt64, PROJECTION __unique_index INDEX x TYPE unique) ENGINE = UniqueMergeTree() ORDER BY x" 2>&1)" \
+# Test 4: _row_exists column name is reserved for persistent virtual column
+${CLICKHOUSE_CLIENT} --query="DROP TABLE IF EXISTS test_row_exists"
+echo "$(${CLICKHOUSE_CLIENT} --server_logs_file=/dev/null --query="CREATE TABLE test_row_exists (x Int32, _row_exists UInt8, PROJECTION __unique_index INDEX x TYPE unique) ENGINE = UniqueMergeTree() ORDER BY x" 2>&1)" \
   | grep -c 'DB::Exception:.*reserved for persistent virtual column'
-${CLICKHOUSE_CLIENT} --query="DROP TABLE IF EXISTS test_row_version"
+${CLICKHOUSE_CLIENT} --query="DROP TABLE IF EXISTS test_row_exists"
 
 # Test 5: Unique projection index key must be simple identifiers, not expressions
 ${CLICKHOUSE_CLIENT} --query="DROP TABLE IF EXISTS test_expr_key"
