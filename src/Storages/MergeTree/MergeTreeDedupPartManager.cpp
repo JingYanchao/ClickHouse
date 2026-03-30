@@ -303,6 +303,15 @@ static void dedupKeysThroughNewCommitParts(
                 cross_part_delete_marks[part_ptr] |= bitmap;
         }
     }
+
+    /// Release ReadBuffer memory (~1MB per file) now that cross-part dedup is done.
+    /// Bloom filter and block cache remain in the cached SSTFileReader.
+    input_sst.releaseBufferMemory();
+    for (const auto & info : visible_sst_infos)
+    {
+        if (info.reader)
+            info.reader->releaseBufferMemory();
+    }
 }
 
 /// Merge cross-part delete marks into each affected part's persistent delete mark bitmap.
