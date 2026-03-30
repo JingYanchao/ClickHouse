@@ -645,7 +645,7 @@ void IMergeTreeReader::fillMemoryRowExistsColumn(ColumnPtr column, size_t max_ro
     const auto iter = delete_mark_buffer_map.find(part_name);
     auto delete_bitmap = iter != delete_mark_buffer_map.end() ? iter->second : nullptr;
 
-    typename ColumnVector<UInt8>::Container & container = derived_column->getData();
+    ColumnVector<UInt8>::Container & container = derived_column->getData();
     auto initial_size = container.size();
     container.resize(initial_size + max_rows_to_read);
     UInt8 * data_ptr = container.data() + initial_size;

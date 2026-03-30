@@ -345,7 +345,7 @@ std::vector<std::string> MergeTreeSink::commitPart(MergeTreeMutableDataPartPtr &
             auto lock = storage.lockParts();
             block_holder = storage.fillNewPartName(part, lock);
         }
-dedup_mgr->dedupPart(part);
+        dedup_mgr->dedupPart(part);
     }
 
     {

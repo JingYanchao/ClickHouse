@@ -10570,7 +10570,7 @@ StorageSnapshot::DataPtr MergeTreeData::getStorageSnapshotDataAttachPartsOnMerge
 {
     assert(supportsUpsert());
     auto snapshot_data = std::make_unique<SnapshotData>();
-    auto lock = lockParts();
+    auto lock = readLockParts();
     for (const auto & part : parts)
     {
         if (part->delete_mark_bitmap)
@@ -10596,6 +10596,8 @@ MergeTreeData::createStorageSnapshot(const StorageMetadataPtr & metadata_snapsho
 
     if (supportsUpsert())
     {
+        auto shared_lock = readLockParts();
+
         auto parts = std::make_shared<RangesInDataParts>(*query_ranges);
 
         std::erase_if(*parts, [](const auto & part)
