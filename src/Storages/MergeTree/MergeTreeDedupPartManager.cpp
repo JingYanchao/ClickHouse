@@ -306,6 +306,8 @@ static void dedupKeysThroughNewCommitParts(
 }
 
 /// Merge cross-part delete marks into each affected part's persistent delete mark bitmap.
+/// Uses COW (Copy-On-Write): always creates a new bitmap object so that concurrent
+/// readers holding a shared_ptr to the old bitmap are not affected.
 static void applyCrossPartDeleteMarks(const PartDeleteBitmapType & cross_part_marks_map)
 {
     for (const auto & [part_ptr, cross_part_marks] : cross_part_marks_map)
