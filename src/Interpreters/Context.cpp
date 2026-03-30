@@ -4164,6 +4164,17 @@ void Context::clearSSTFileReaderCache() const
         cache->clear();
 }
 
+void Context::updateSSTFileReaderCacheConfiguration(const Poco::Util::AbstractConfiguration & config)
+{
+    std::lock_guard lock(shared->mutex);
+
+    if (!shared->sst_file_reader_cache)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "SST file reader cache was not created yet.");
+
+    size_t max_size = config.getUInt64("sst_reader_cache_size", DEFAULT_SST_READER_CACHE_MAX_SIZE);
+    shared->sst_file_reader_cache->setMaxSizeInBytes(max_size);
+}
+
 void Context::setVectorSimilarityIndexCache(const String & cache_policy, size_t max_size_in_bytes, size_t max_entries, double size_ratio)
 {
     std::lock_guard lock(shared->mutex);

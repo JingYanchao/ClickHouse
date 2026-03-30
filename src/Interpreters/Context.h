@@ -1385,6 +1385,7 @@ public:
     void clearIndexMarkCache() const;
 
     void setSSTFileReaderCache(const String & cache_policy, size_t max_cache_size_in_bytes, double size_ratio);
+    void updateSSTFileReaderCacheConfiguration(const Poco::Util::AbstractConfiguration & config);
     std::shared_ptr<SSTFileReaderCache> getSSTFileReaderCache() const;
     void clearSSTFileReaderCache() const;
 

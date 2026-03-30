@@ -152,6 +152,9 @@ namespace ServerSetting
     extern const ServerSettingsString primary_index_cache_policy;
     extern const ServerSettingsUInt64 primary_index_cache_size;
     extern const ServerSettingsDouble primary_index_cache_size_ratio;
+    extern const ServerSettingsString sst_reader_cache_policy;
+    extern const ServerSettingsUInt64 sst_reader_cache_size;
+    extern const ServerSettingsDouble sst_reader_cache_size_ratio;
     extern const ServerSettingsUInt64 max_prefixes_deserialization_thread_pool_size;
     extern const ServerSettingsUInt64 max_prefixes_deserialization_thread_pool_free_size;
     extern const ServerSettingsUInt64 prefixes_deserialization_thread_pool_thread_pool_queue_size;
@@ -956,9 +959,10 @@ void LocalServer::processConfig()
     }
     global_context->setMarkCache(mark_cache_policy, mark_cache_size, mark_cache_size_ratio);
 
-    /// SST file reader cache for unique dedup — uses a fixed default size for now.
-    constexpr size_t sst_reader_cache_size = 128 * 1024 * 1024;
-    global_context->setSSTFileReaderCache("SLRU", sst_reader_cache_size, 0.5);
+    String sst_reader_cache_policy = server_settings[ServerSetting::sst_reader_cache_policy];
+    size_t sst_reader_cache_size = server_settings[ServerSetting::sst_reader_cache_size];
+    double sst_reader_cache_size_ratio = server_settings[ServerSetting::sst_reader_cache_size_ratio];
+    global_context->setSSTFileReaderCache(sst_reader_cache_policy, sst_reader_cache_size, sst_reader_cache_size_ratio);
 
     String index_uncompressed_cache_policy = server_settings[ServerSetting::index_uncompressed_cache_policy];
     size_t index_uncompressed_cache_size = server_settings[ServerSetting::index_uncompressed_cache_size];

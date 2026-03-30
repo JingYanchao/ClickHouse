@@ -315,17 +315,20 @@ static void applyCrossPartDeleteMarks(const PartDeleteBitmapType & cross_part_ma
         if (cross_part_marks.isEmpty())
             continue;
 
+        /// COW: create a fresh bitmap, copy existing marks if any, then add new ones.
+        auto new_marks = (part_ptr->rows_count <= std::numeric_limits<UInt32>::max())
+            ? ProjectionIndexBitmap::create32()
+            : ProjectionIndexBitmap::create64();
+
         auto existing_marks = part_ptr->getDeleteMarkBitmap();
-        if (!existing_marks)
-        {
-            existing_marks = (part_ptr->rows_count <= std::numeric_limits<UInt32>::max())
-                ? ProjectionIndexBitmap::create32()
-                : ProjectionIndexBitmap::create64();
-            part_ptr->setDeleteMarkBitmap(existing_marks);
-        }
+        if (existing_marks)
+            roaring_bitmap_or_inplace(new_marks->data.bitmap32, existing_marks->data.bitmap32);
 
         for (const auto it : cross_part_marks)
-            existing_marks->add(it);
+            new_marks->add(it);
+
+        /// Atomically replace the pointer so readers see either the old or new bitmap, never a half-modified one.
+        part_ptr->setDeleteMarkBitmap(new_marks);
     }
 }
 

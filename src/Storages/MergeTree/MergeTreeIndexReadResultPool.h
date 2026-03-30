@@ -87,6 +87,7 @@ struct ProjectionIndexBitmap
     static ProjectionIndexBitmapPtr create64();
 
     void intersectWith(const ProjectionIndexBitmap & other);
+    void unionWith(const ProjectionIndexBitmap & other);
     size_t cardinality() const;
     bool empty() const;
 
