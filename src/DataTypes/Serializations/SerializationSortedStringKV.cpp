@@ -214,7 +214,7 @@ void SerializationSortedStringKV<V>::deserializeBinaryBulkWithMultipleStreams(
             if (!sst_stream)
                 throw Exception(ErrorCodes::LOGICAL_ERROR, "SST data stream must provide a valid ReadBufferFromFileBase");
 
-            uint64_t base_offset = 0;
+            uint64_t file_offset = 0;
             auto sst_size = sst_stream->getFileSize();
 
             /// Handle empty SST file (e.g. part with zero rows after DELETE)
@@ -225,7 +225,7 @@ void SerializationSortedStringKV<V>::deserializeBinaryBulkWithMultipleStreams(
             }
 
             sst_state->sst_file_reader = std::make_shared<SSTFileReader>(
-                sst_stream, base_offset, sst_size);
+                sst_stream, file_offset, sst_size);
 
             rocksdb::ReadOptions read_opts;
             sst_state->sst_file_iterator = sst_state->sst_file_reader->newIterator(read_opts);

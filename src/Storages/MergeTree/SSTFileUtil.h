@@ -78,7 +78,7 @@ class SSTFileReader
 public:
     using IndexPropertiesPtr = std::shared_ptr<const rocksdb::TableProperties>;
 
-    SSTFileReader(SeekableReadBuffer * read_buffer, uint64_t base_offset, uint64_t region_size);
+    SSTFileReader(SeekableReadBuffer * read_buffer, uint64_t file_offset, uint64_t file_size);
     /// Construct from a DataPartStorage: automatically opens the SST file,
     /// reads file size, and manages the underlying ReadBuffer internally.
     /// This is the preferred constructor for dedup / part-level access.
