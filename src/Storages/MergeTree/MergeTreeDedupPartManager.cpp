@@ -434,12 +434,24 @@ void MergeTreeDedupPartManager::optimizeVisiblePartsForMerge(
     /// Also filter out parts whose max_block < new_part's min_block:
     /// these older parts were already deduped against the merge's source
     /// parts during prior commits and cannot conflict.
+    ///
+    /// While filtering, accumulate the effective rows (rows - delete marks)
+    /// of covered source parts. If the sum equals new_part's rows, the
+    /// merge did not introduce any new key conflicts against the remaining
+    /// visible parts, so we can skip cross-part dedup entirely.
+    size_t covered_effective_rows = 0;
     std::erase_if(visible_parts, [&](const auto & part)
     {
         /// Covered by the merged part (source parts).
         if (part->info.min_block >= new_part->info.min_block
             && part->info.max_block <= new_part->info.max_block)
+        {
+            size_t deleted = 0;
+            if (auto bm = part->getDeleteMarkBitmap())
+                deleted = bm->cardinality();
+            covered_effective_rows += (part->rows_count - deleted);
             return true;
+        }
 
         /// Older parts that cannot conflict.
         if (part->info.max_block < new_part->info.min_block)
@@ -447,6 +459,17 @@ void MergeTreeDedupPartManager::optimizeVisiblePartsForMerge(
 
         return false;
     });
+
+    /// If the covered source parts' effective rows match the merged part's
+    /// row count, the merge preserved all unique keys without introducing
+    /// new conflicts — skip cross-part dedup against remaining visible parts.
+    if (covered_effective_rows == new_part->rows_count)
+    {
+        LOG_TRACE(log, "optimizeVisiblePartsForMerge: merge part '{}' effective rows match "
+            "covered parts ({} rows), clearing visible parts to skip cross-part dedup",
+            new_part->name, new_part->rows_count);
+        visible_parts.clear();
+    }
 }
 
 void MergeTreeDedupPartManager::dedupPart(const DataPartPtr & new_part, MergeTreeData::CommitOperation op)
