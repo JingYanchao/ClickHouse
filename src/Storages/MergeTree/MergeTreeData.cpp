@@ -10597,7 +10597,6 @@ MergeTreeData::createStorageSnapshot(const StorageMetadataPtr & metadata_snapsho
     if (supportsUpsert())
     {
         auto shared_lock = readLockParts();
-
         auto parts = std::make_shared<RangesInDataParts>(*query_ranges);
 
         std::erase_if(*parts, [](const auto & part)

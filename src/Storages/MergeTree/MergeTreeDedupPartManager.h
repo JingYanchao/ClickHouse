@@ -55,7 +55,7 @@ explicit MergeTreeDedupPartManager(const MergeTreeData & storage_);
     /// Populates delta_deleted_rows_map with rows to be deleted.
     /// The op parameter indicates how this part was produced (insert, merge, etc.),
     /// enabling optimization strategies (e.g. skipping older parts for merge).
-void dedupPart(const DataPartPtr & new_part, MergeTreeData::CommitOperation op = MergeTreeData::CommitOperation::Insert);
+    void dedupPart(const DataPartPtr & new_part, MergeTreeData::CommitOperation op = MergeTreeData::CommitOperation::Insert);
 
     /// Apply accumulated delta delete bitmaps to each part's delete_mark_bitmap.
     /// Should be called under DataPartsLock to ensure atomicity with part state transitions.
@@ -70,18 +70,20 @@ void dedupPart(const DataPartPtr & new_part, MergeTreeData::CommitOperation op =
 
     const PartDeleteBitmapType & getDeltaDeletedRowsMap() const { return delta_deleted_rows_map; }
 
-    /// SST context for dedup: holds the input part's SST reader and
-    /// pre-opened SSTFileReaders for visible parts.
+    /// A data part paired with its SST reader, used uniformly for both
+    /// the input part and visible parts during dedup.
+    struct DedupPartWithSSTReader
+    {
+        DataPartPtr part;
+        SSTFileReaderPtr reader;
+    };
+
+    /// SST context for dedup: holds the input part and pre-opened
+    /// SSTFileReaders for visible parts.
     struct DedupSSTContext
     {
-        SSTFileReaderPtr input_sst;
-        /// Pre-opened SSTFileReaders for visible parts (thread-safe for pread).
-        struct VisiblePartSSTMeta
-        {
-            size_t index;
-            SSTFileReaderPtr reader;
-        };
-        std::vector<VisiblePartSSTMeta> visible_sst_metas;
+        DedupPartWithSSTReader input;
+        std::vector<DedupPartWithSSTReader> visible_parts;
     };
 
 private:

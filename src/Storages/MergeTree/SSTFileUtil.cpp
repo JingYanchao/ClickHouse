@@ -175,7 +175,7 @@ public:
     {
         /// readAt handles both fast path (lock-free pread) and slow fallback
         /// (seek+read under mutex) internally based on current buffer capabilities.
-        auto bytes_read = read_buffer->readAt(offset, scratch, n);
+        const auto bytes_read = read_buffer->readAt(offset, scratch, n);
         *result = rocksdb::Slice(scratch, bytes_read);
         return rocksdb::IOStatus::OK();
     }
