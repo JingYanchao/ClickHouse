@@ -93,7 +93,8 @@ public:
     /// For each key where status is OK, the corresponding entry in values_out is populated.
     std::vector<rocksdb::Status> multiGet(const std::vector<rocksdb::Slice> & keys, std::vector<std::string> * values_out) const;
     /// Release ReadBuffer memory (1MB per file) to save memory.
-    /// After calling this, the index reader can still be used normally.
+    /// After calling this, the index reader can still be used normally
+    /// (bloom filter and index blocks remain pinned in the TableReader).
     void releaseBufferMemory() const;
 private:
     /// Common initialization logic shared by both constructors.

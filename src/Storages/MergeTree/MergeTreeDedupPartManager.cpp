@@ -45,11 +45,11 @@ using DeltaBitmaps = PartDeleteBitmapType;
 /// Maximum number of keys to batch in a single MultiGet call.
 static constexpr size_t MULTI_GET_BATCH_SIZE = 16;
 
-using DedupPartWithSSTReader = MergeTreeDedupPartManager::DedupPartWithSSTReader;
+using PartWithSSTReader = MergeTreeDedupPartManager::PartWithSSTReader;
 
 static void deduplicateKeyByBucket(
-    const DedupPartWithSSTReader & input,
-    const std::vector<DedupPartWithSSTReader> & visible_parts,
+    const PartWithSSTReader & input,
+    const std::vector<PartWithSSTReader> & visible_parts,
     const std::string & start_key,
     size_t num_keys,
     DeltaBitmaps & delta_bitmaps,
@@ -68,7 +68,7 @@ static void deduplicateKeyByBucket(
     Stopwatch shard_watch;
 
     rocksdb::ReadOptions opts;
-    opts.fill_cache = true;
+    opts.fill_cache = false;
     auto input_iter = input.reader->newIterator(opts);
     input_iter->Seek(rocksdb::Slice(start_key));
 
@@ -217,8 +217,8 @@ static void deduplicateKeyByBucket(
 /// Splits the input SST key space into shards, processes each in a separate thread,
 /// then merges per-shard delta bitmaps into cross_part_delete_marks.
 static void dedupKeysThroughNewCommitParts(
-    const DedupPartWithSSTReader & input,
-    const std::vector<DedupPartWithSSTReader> & visible_parts,
+    const PartWithSSTReader & input,
+    const std::vector<PartWithSSTReader> & visible_parts,
     PartDeleteBitmapType & cross_part_delete_marks)
 {
     if (visible_parts.empty())
@@ -303,7 +303,7 @@ static void dedupKeysThroughNewCommitParts(
     }
 
     /// Release ReadBuffer memory (~1MB per file) now that cross-part dedup is done.
-    /// Bloom filter and block cache remain in the cached SSTFileReader.
+    /// Bloom filter and index blocks remain pinned in the cached SSTFileReader.
     input.reader->releaseBufferMemory();
     for (const auto & visible : visible_parts)
     {
@@ -502,8 +502,7 @@ void MergeTreeDedupPartManager::dedupPart(const DataPartPtr & new_part, MergeTre
 
     /// Intra-part dedup: detect rows that lost to other rows with the same
     /// unique key during SST construction (last-write-wins).
-    auto input_part_delete_mark = buildIntraPartDeleteMark(new_part, *sst_ctx.input.reader);
-    if (input_part_delete_mark)
+    if (auto input_part_delete_mark = buildIntraPartDeleteMark(new_part, *sst_ctx.input.reader))
     {
         LOG_DEBUG(log, "dedupPart: part '{}' has {} intra-part duplicate rows",
             new_part->name, input_part_delete_mark->cardinality());
@@ -552,7 +551,8 @@ void MergeTreeDedupPartManager::buildAllDeleteMarksOnStartup()
     {
         /// Sort by max_block ascending so that older parts come first.
         /// Each part only deduplicates against preceding (older) parts.
-        std::sort(partition_parts.begin(), partition_parts.end(),
+        std::ranges::sort(
+            partition_parts,
             [](const DataPartPtr & a, const DataPartPtr & b)
             {
                 return a->info.max_block < b->info.max_block;

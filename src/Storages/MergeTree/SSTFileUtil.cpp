@@ -691,6 +691,13 @@ void SSTFileReader::init(const String & file_name)
 
     rocksdb::BlockBasedTableOptions table_options;
     table_options.filter_policy.reset(rocksdb::NewBloomFilterPolicy(12));
+    /// Disable block cache for SST readers used in dedup.
+    /// All dedup read patterns (sequential scan, ordered MultiGet) are
+    /// single-pass — each data block is visited at most once and never
+    /// re-accessed, so caching it wastes memory without any hit-rate
+    /// benefit.  Bloom filter and index blocks are pinned inside the
+    /// TableReader at Open time and are NOT affected by this flag.
+    table_options.no_block_cache = true;
     options.table_factory.reset(NewBlockBasedTableFactory(table_options));
 
     auto local_reader = std::make_unique<rocksdb::SstFileReader>(options);
@@ -723,7 +730,7 @@ void SSTFileReader::releaseBufferMemory() const
     if (fs)
     {
         /// Release all ReadBuffer memory (1MB per file).
-        /// Bloom filter and block cache remain.
+        /// Bloom filter and index blocks remain pinned in the TableReader.
         fs->releaseAllBufferMemory();
     }
 }

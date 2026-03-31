@@ -68,11 +68,9 @@ explicit MergeTreeDedupPartManager(const MergeTreeData & storage_);
 
     UniqueProcessLock lockUniqueProcess() { return UniqueProcessLock(unique_process_mutex); }
 
-    const PartDeleteBitmapType & getDeltaDeletedRowsMap() const { return delta_deleted_rows_map; }
-
     /// A data part paired with its SST reader, used uniformly for both
     /// the input part and visible parts during dedup.
-    struct DedupPartWithSSTReader
+    struct PartWithSSTReader
     {
         DataPartPtr part;
         SSTFileReaderPtr reader;
@@ -82,8 +80,8 @@ explicit MergeTreeDedupPartManager(const MergeTreeData & storage_);
     /// SSTFileReaders for visible parts.
     struct DedupSSTContext
     {
-        DedupPartWithSSTReader input;
-        std::vector<DedupPartWithSSTReader> visible_parts;
+        PartWithSSTReader input;
+        std::vector<PartWithSSTReader> visible_parts;
     };
 
 private:
