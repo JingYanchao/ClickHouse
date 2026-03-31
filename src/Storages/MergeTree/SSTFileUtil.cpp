@@ -35,10 +35,9 @@ public:
 
     /// Non-owning mode: wraps an externally managed SeekableReadBuffer.
     /// Used by the deserialization path where the buffer lifetime is managed by the caller.
-    ReadBufferWrapper(SeekableReadBuffer * external_buffer, uint64_t file_offset_, uint64_t file_size_)
+    ReadBufferWrapper(SeekableReadBuffer * external_buffer, uint64_t file_offset_)
         : buffer(external_buffer)
         , file_offset(file_offset_)
-        , file_size(file_size_)
         , supports_read_at(buffer && buffer->supportsReadAt())
     {
     }
@@ -56,11 +55,11 @@ public:
     /// Atomic seek + read: both operations are performed under a single lock
     /// to prevent race conditions when multiple threads share the same buffer
     /// (e.g. RocksDB's RandomAccessFile::Read from parallel dedup threads).
-    size_t seekAndRead(off_t offset, int whence, char * to, size_t n) const
+    size_t seekAndRead(off_t offset, char * to, size_t n) const
     {
         checkOrCreateReadBuffer();
         std::scoped_lock lock(mutex);
-        seekImpl(offset, whence);
+        buffer->seek(file_offset + offset, SEEK_SET);
         return buffer->read(to, n);
     }
 
@@ -73,7 +72,6 @@ public:
     size_t readAt(uint64_t offset, char * to, size_t n) const
     {
         checkOrCreateReadBuffer();
-
         /// Fast path: if the buffer supports readBigAt, use lock-free pread.
         if (supports_read_at.load(std::memory_order_relaxed))
             return buffer->readBigAt(to, n, file_offset + offset, nullptr);
@@ -91,18 +89,6 @@ public:
     }
 
 private:
-    /// seekImpl is always called under mutex (from seekAndRead).
-    /// The caller must ensure the buffer exists before calling this method.
-    void seekImpl(off_t offset, int whence) const
-    {
-        if (whence == SEEK_SET)
-            buffer->seek(file_offset + offset, SEEK_SET);
-        else if (whence == SEEK_END)
-            buffer->seek(file_offset + file_size + offset, SEEK_SET);
-        else
-            buffer->seek(offset, whence);
-    }
-
     /// Lazily (re-)create the read buffer if it was released.
     /// Always acquires mutex internally for thread safety.
     void checkOrCreateReadBuffer() const
@@ -129,11 +115,10 @@ private:
     String file_path;
     DataPartStoragePtr storage;
 
-    /// Offset and size of the SST region within the underlying file.
-    /// In owned mode (standalone SST file), both are 0.
+    /// Offset of the SST region within the underlying file.
+    /// In owned mode (standalone SST file), this is 0.
     /// In non-owning mode (SST embedded in a column file), file_offset locates the SST region.
     uint64_t file_offset = 0;
-    uint64_t file_size = 0;
 
     mutable std::mutex mutex;
     mutable std::atomic<bool> supports_read_at{false};
@@ -155,7 +140,7 @@ public:
         char * scratch,
         rocksdb::IODebugContext *) override
     {
-        auto bytes_read = read_buffer->seekAndRead(position, SEEK_SET, scratch, n);
+        auto bytes_read = read_buffer->seekAndRead(position, scratch, n);
         position += bytes_read;
         *result = rocksdb::Slice(scratch, bytes_read);
         return rocksdb::IOStatus::OK();
@@ -485,7 +470,7 @@ private:
         else
         {
             /// Non-owning mode: wrap the externally managed SeekableReadBuffer.
-            read_buffer_wrapper = std::make_shared<ReadBufferWrapper>(external_buffer, file_offset, file_size);
+            read_buffer_wrapper = std::make_shared<ReadBufferWrapper>(external_buffer, file_offset);
         }
         {
             std::scoped_lock lock(read_buffers_manage_mutex);
