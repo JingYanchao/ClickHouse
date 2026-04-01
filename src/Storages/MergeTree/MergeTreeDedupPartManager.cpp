@@ -347,12 +347,12 @@ MergeTreeDedupPartManager::MergeTreeDedupPartManager(const MergeTreeData & stora
 {
 }
 
-MergeTreeDedupPartManager::DedupSSTContext MergeTreeDedupPartManager::prepareSSTReadersForDedup(
+MergeTreeDedupPartManager::DedupPartWithSSTReaders MergeTreeDedupPartManager::prepareSSTReadersForDedup(
     const DataPartPtr & input_part,
     const StorageMetadataPtr & metadata_snapshot,
     MergeTreeData::DataPartsVector & visible_parts)
 {
-    DedupSSTContext ctx;
+    DedupPartWithSSTReaders ctx;
 
     if (input_part->rows_count == 0)
         return ctx;

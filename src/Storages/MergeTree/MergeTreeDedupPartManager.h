@@ -78,14 +78,14 @@ explicit MergeTreeDedupPartManager(const MergeTreeData & storage_);
 
     /// SST context for dedup: holds the input part and pre-opened
     /// SSTFileReaders for visible parts.
-    struct DedupSSTContext
+    struct DedupPartWithSSTReaders
     {
         PartWithSSTReader input;
         std::vector<PartWithSSTReader> visible_parts;
     };
 
 private:
-    DedupSSTContext prepareSSTReadersForDedup(
+    DedupPartWithSSTReaders prepareSSTReadersForDedup(
         const DataPartPtr & input_part,
         const StorageMetadataPtr & metadata_snapshot,
         MergeTreeData::DataPartsVector & visible_parts);
