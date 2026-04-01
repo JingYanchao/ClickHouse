@@ -6,13 +6,14 @@
 #include <unordered_map>
 #include <vector>
 
-#include <roaring/roaring.hh>
-
 #include <base/types.h>
 #include <Common/Logger.h>
 #include <Common/Stopwatch.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/SSTFileUtil.h>
+#include <rocksdb/comparator.h>
+#include <rocksdb/iterator.h>
+#include <queue>
 
 namespace DB
 {
@@ -23,8 +24,11 @@ using DataPartPtr = std::shared_ptr<const IMergeTreeDataPart>;
 using DataPartsVector = std::vector<DataPartPtr>;
 using StorageMetadataPtr = std::shared_ptr<const StorageInMemoryMetadata>;
 
+struct ProjectionIndexBitmap;
+using ProjectionIndexBitmapPtr = std::shared_ptr<ProjectionIndexBitmap>;
+
 /// Maps part pointer -> delete bitmap (rows to be marked as deleted).
-using PartDeleteBitmapType = std::unordered_map<const IMergeTreeDataPart *, roaring::Roaring>;
+using PartDeleteBitmapType = std::unordered_map<const IMergeTreeDataPart *, ProjectionIndexBitmapPtr>;
 
 
 struct UniqueProcessLock
@@ -62,8 +66,8 @@ explicit MergeTreeDedupPartManager(const MergeTreeData & storage_);
     void commitDeleteMarkBuffers(const DataPartsLock & lock);
 
     /// Build delete marks for all active parts on startup.
-    /// For each partition, parts are sorted from oldest to newest; each part is deduped
-    /// against all older parts using prepareSSTReadersForDedup + dedupKeysThroughNewCommitParts.
+    /// For each partition, parts are sorted from oldest to newest and deduped
+    /// using a multi-way merge of their SST iterators.
     void buildAllDeleteMarksOnStartup();
 
     UniqueProcessLock lockUniqueProcess() { return UniqueProcessLock(unique_process_mutex); }
@@ -84,7 +88,59 @@ explicit MergeTreeDedupPartManager(const MergeTreeData & storage_);
         std::vector<PartWithSSTReader> visible_parts;
     };
 
+    /// Lightweight multi-way merge iterator over rocksdb SST iterators.
+    /// Produces keys in sorted order; when keys are equal, the iterator
+    /// with the smaller index (older part) comes first.
+    /// Used by `buildAllDeleteMarksForPartition` for startup dedup.
+    class SSTMergingIterator
+    {
+    public:
+        SSTMergingIterator(
+            std::vector<std::unique_ptr<rocksdb::Iterator>> iters,
+            std::vector<SSTFileReaderPtr> readers);
+
+        bool valid() const { return !min_heap.empty(); }
+        void seekToFirst();
+        void next();
+
+        rocksdb::Slice key() const { return iters[min_heap.top()]->key(); }
+        rocksdb::Slice value() const { return iters[min_heap.top()]->value(); }
+        size_t currentIndex() const { return min_heap.top(); }
+
+    private:
+        struct Comparator
+        {
+            const std::vector<std::unique_ptr<rocksdb::Iterator>> * iters_ptr;
+            const rocksdb::Comparator * cmp;
+
+            explicit Comparator(const std::vector<std::unique_ptr<rocksdb::Iterator>> * p)
+                : iters_ptr(p), cmp(rocksdb::BytewiseComparator()) {}
+
+            bool operator()(size_t lhs, size_t rhs) const
+            {
+                int res = cmp->Compare((*iters_ptr)[lhs]->key(), (*iters_ptr)[rhs]->key());
+                if (res > 0) return true;
+                if (res < 0) return false;
+                /// Equal keys: smaller index (older part) should come first (top of min-heap).
+                return lhs > rhs;
+            }
+        };
+
+        using MinHeap = std::priority_queue<size_t, std::vector<size_t>, Comparator>;
+        std::vector<std::unique_ptr<rocksdb::Iterator>> iters;
+        /// Hold SSTFileReaderPtr to keep underlying memory alive.
+        std::vector<SSTFileReaderPtr> readers;
+        MinHeap min_heap;
+    };
+
 private:
+    /// Open SST readers for a list of parts, skipping parts without SST.
+    /// Returns pairs of (part, reader) for parts that have valid SST readers.
+    /// Shared by prepareSSTReadersForDedup and buildAllDeleteMarksForPartition.
+    std::vector<PartWithSSTReader> openSSTReadersForParts(
+        const DataPartsVector & parts,
+        const StorageMetadataPtr & metadata_snapshot);
+
     DedupPartWithSSTReaders prepareSSTReadersForDedup(
         const DataPartPtr & input_part,
         const StorageMetadataPtr & metadata_snapshot,
@@ -102,6 +158,14 @@ private:
     ProjectionIndexBitmapPtr buildIntraPartDeleteMark(
         const DataPartPtr & input_part,
         const SSTFileReader & input_sst);
+
+    /// Build delete marks for all parts in a single partition using a
+    /// multi-way merge of their SST iterators. This is O(N·log(N)·K)
+    /// where N = number of parts and K = total keys, compared to the
+    /// previous O(N²·K) approach.
+    void buildAllDeleteMarksForPartition(
+        const DataPartsVector & partition_parts,
+        const StorageMetadataPtr & metadata_snapshot);
 
     const MergeTreeData & storage;
     std::mutex unique_process_mutex;
