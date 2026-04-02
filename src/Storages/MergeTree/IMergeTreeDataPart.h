@@ -601,6 +601,11 @@ public:
     /// True if here is lightweight deleted mask file in part.
     bool hasLightweightDelete() const;
 
+    /// Ensures the delete mark bitmap is initialized for this part.
+    /// Throws LOGICAL_ERROR for Compact parts (not supported).
+    /// Returns a reference to the bitmap for direct modification.
+    ProjectionIndexBitmapPtr & checkOrCreateDeleteMark() const;
+
     /// Returns the delete mark bitmap for this part (may be nullptr if not set).
     ProjectionIndexBitmapPtr getDeleteMarkBitmap() const;
 

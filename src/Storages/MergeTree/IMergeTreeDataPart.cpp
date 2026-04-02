@@ -2071,6 +2071,17 @@ bool IMergeTreeDataPart::hasLightweightDelete() const
     return columns.contains(RowExistsColumn::name) || storage.supportsUpsert();
 }
 
+ProjectionIndexBitmapPtr & IMergeTreeDataPart::checkOrCreateDeleteMark() const
+{
+    if (part_type == MergeTreeDataPartType::Compact)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't create delete mark for compact part {}", name);
+
+    if (!delete_mark_bitmap)
+        delete_mark_bitmap = ProjectionIndexBitmap::create(rows_count);
+    
+    return delete_mark_bitmap;
+}
+
 ProjectionIndexBitmapPtr IMergeTreeDataPart::getDeleteMarkBitmap() const
 {
     return delete_mark_bitmap;

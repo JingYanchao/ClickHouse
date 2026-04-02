@@ -150,6 +150,14 @@ ProjectionIndexBitmap::~ProjectionIndexBitmap()
     }
 }
 
+ProjectionIndexBitmapPtr ProjectionIndexBitmap::create(size_t size)
+{
+    if (size <= std::numeric_limits<UInt32>::max())
+        return create32();
+    else
+        return create64();
+}
+
 ProjectionIndexBitmapPtr ProjectionIndexBitmap::create32()
 {
     return std::make_shared<ProjectionIndexBitmap>(BitmapType::Bitmap32);

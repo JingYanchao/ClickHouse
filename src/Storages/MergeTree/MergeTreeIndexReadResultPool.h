@@ -83,6 +83,7 @@ struct ProjectionIndexBitmap
     ProjectionIndexBitmap(const ProjectionIndexBitmap &) = delete;
     ProjectionIndexBitmap & operator=(const ProjectionIndexBitmap &) = delete;
 
+    static ProjectionIndexBitmapPtr create(size_t size);
     static ProjectionIndexBitmapPtr create32();
     static ProjectionIndexBitmapPtr create64();
 

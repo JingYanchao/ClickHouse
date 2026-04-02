@@ -27,9 +27,7 @@ using StorageMetadataPtr = std::shared_ptr<const StorageInMemoryMetadata>;
 struct ProjectionIndexBitmap;
 using ProjectionIndexBitmapPtr = std::shared_ptr<ProjectionIndexBitmap>;
 
-/// Maps part pointer -> delete bitmap (rows to be marked as deleted).
-using PartDeleteBitmapType = std::unordered_map<const IMergeTreeDataPart *, ProjectionIndexBitmapPtr>;
-
+using PartDeleteBitmapMap = std::unordered_map<const IMergeTreeDataPart *, ProjectionIndexBitmapPtr>;
 
 struct UniqueProcessLock
 {
@@ -169,7 +167,7 @@ private:
 
     const MergeTreeData & storage;
     std::mutex unique_process_mutex;
-    PartDeleteBitmapType delta_deleted_rows_map; /// protected by unique_process_mutex
+    PartDeleteBitmapMap delta_deleted_rows_map; /// protected by unique_process_mutex
     LoggerPtr log;
 };
 using MergeTreeDedupPartManagerPtr = std::shared_ptr<MergeTreeDedupPartManager>;

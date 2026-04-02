@@ -39,22 +39,10 @@ static constexpr size_t DEDUP_MAX_PARALLEL = 16;
 /// Minimum number of keys to trigger parallel dedup; below this threshold, single-threaded path is used.
 static constexpr size_t MIN_KEYS_FOR_PARALLEL = 16 * 16 * 2;
 
-/// Per-thread delta bitmap: records rows to be deleted for each affected part.
-using DeltaBitmaps = PartDeleteBitmapType;
-
 /// Maximum number of keys to batch in a single MultiGet call.
 static constexpr size_t MULTI_GET_BATCH_SIZE = 16;
 
 using PartWithSSTReader = MergeTreeDedupPartManager::PartWithSSTReader;
-
-/// Get or create a 32-bit ProjectionIndexBitmap in the delta map for the given part.
-static ProjectionIndexBitmapPtr & getOrCreateDelta(PartDeleteBitmapType & delta, const IMergeTreeDataPart * part)
-{
-    auto & ptr = delta[part];
-    if (!ptr)
-        ptr = ProjectionIndexBitmap::create32();
-    return ptr;
-}
 
 /// Retrieve the effective version for a part/entry pair.
 /// When row-level versioning is available (16-byte SST values), use the per-row
@@ -66,6 +54,14 @@ static UInt64 getEffectiveVersion(
 {
     return has_row_version ? entry.version : static_cast<UInt64>(part->info.max_block);
 }
+
+inline void addToBitmap(ProjectionIndexBitmapPtr & bitmap, UInt64 value, size_t part_rows)
+{
+    if (!bitmap)
+        bitmap = ProjectionIndexBitmap::create(part_rows);
+    bitmap->add(value);
+}
+
 
 /// Detect whether the SST uses row-level versioning (16-byte values) or
 /// part-level versioning (8-byte values). Returns true for row-level.
@@ -79,7 +75,7 @@ static void deduplicateKeyByBucket(
     const std::vector<PartWithSSTReader> & visible_parts,
     const std::string & start_key,
     size_t num_keys,
-    DeltaBitmaps & delta_bitmaps,
+    PartDeleteBitmapMap & delta_bitmaps,
     size_t shard_id)
 {
     /// Cached entry from the input SST iterator, used for batching.
@@ -212,12 +208,12 @@ static void deduplicateKeyByBucket(
                 if (input_wins)
                 {
                     /// Input part wins — mark the visible part's row as deleted.
-                    getOrCreateDelta(delta_bitmaps, current_part.get())->add(static_cast<UInt32>(current_entry.part_offset));
+                    addToBitmap(delta_bitmaps[current_part.get()], current_entry.part_offset, current_part->rows_count);
                 }
                 else
                 {
                     /// Visible part wins — mark the input part's row as deleted.
-                    getOrCreateDelta(delta_bitmaps, input.part.get())->add(static_cast<UInt32>(input_entry.part_offset));
+                    addToBitmap(delta_bitmaps[input.part.get()], input_entry.part_offset, input.part->rows_count);
                 }
 
                 /// Only one visible part can own a given unique key.
@@ -234,20 +230,22 @@ static void deduplicateKeyByBucket(
 
 /// Deduplicate keys from the input part against visible parts using parallel threads.
 /// Splits the input SST key space into shards, processes each in a separate thread,
-/// then merges per-shard delta bitmaps into cross_part_delete_marks.
-static void dedupKeysThroughNewCommitParts(
+/// then merges per-shard delta bitmaps into a result map.
+/// Returns a map from part pointer to the computed delete mark bitmap.
+static PartDeleteBitmapMap dedupKeysThroughNewCommitParts(
     const PartWithSSTReader & input,
-    const std::vector<PartWithSSTReader> & visible_parts,
-    PartDeleteBitmapType & cross_part_delete_marks)
+    const std::vector<PartWithSSTReader> & visible_parts)
 {
+    PartDeleteBitmapMap result;
+
     if (visible_parts.empty())
-        return;
+        return result;
 
     /// Get total key count from SST properties — O(1), no scanning needed.
     auto props = input.reader->getProperties();
     const size_t total_keys = props ? props->num_entries : 0;
     if (total_keys == 0)
-        return;
+        return result;
 
     /// For small key sets, fall back to single-threaded path to avoid thread overhead.
     const size_t num_threads = (total_keys < MIN_KEYS_FOR_PARALLEL) ? 1 : std::min(DEDUP_MAX_PARALLEL, total_keys);
@@ -272,10 +270,10 @@ static void dedupKeysThroughNewCommitParts(
 
     const size_t actual_shards = boundary_keys.size();
     if (actual_shards == 0)
-        return;
+        return result;
 
     /// Allocate per-shard delta bitmaps.
-    std::vector<DeltaBitmaps> delta_bitmaps(actual_shards);
+    std::vector<PartDeleteBitmapMap> delta_bitmaps(actual_shards);
     Stopwatch parallel_process_watch;
     {
         /// Unified parallel path: even for a single shard the thread pool
@@ -312,16 +310,21 @@ static void dedupKeysThroughNewCommitParts(
     ProfileEvents::increment(ProfileEvents::UniqueKeyDedupParallelProcessMicroseconds, parallel_process_watch.elapsedMicroseconds());
 
     /// Merge all per-shard delta bitmaps into the final output.
-    for (auto & shard_delta : delta_bitmaps)
+    /// Iterate by part: for each part, create a new bitmap by merging all shard deltas.
+    for (const auto & visible : visible_parts)
     {
-        for (auto & [part_ptr, bitmap] : shard_delta)
+        const auto * part_ptr = visible.part.get();
+        auto bitmap = ProjectionIndexBitmap::create(visible.part->rows_count);
+
+        for (const auto & shard_delta : delta_bitmaps)
         {
-            if (bitmap && !bitmap->empty())
-            {
-                auto & target = getOrCreateDelta(cross_part_delete_marks, part_ptr);
-                target->unionWith(*bitmap);
-            }
+            auto it = shard_delta.find(part_ptr);
+            if (it != shard_delta.end() && it->second && !it->second->empty())
+                bitmap->unionWith(*it->second);
         }
+
+        if (!bitmap->empty())
+            result.emplace(part_ptr, std::move(bitmap));
     }
 
     /// Release ReadBuffer memory (~1MB per file) now that cross-part dedup is done.
@@ -332,6 +335,8 @@ static void dedupKeysThroughNewCommitParts(
         if (visible.reader)
             visible.reader->releaseBufferMemory();
     }
+
+    return result;
 }
 
 /// Merge cross-part delete marks into each affected part's persistent delete mark bitmap.
@@ -339,7 +344,7 @@ static void dedupKeysThroughNewCommitParts(
 /// under readLockParts) are serialized by the parts lock, so there is no data race.
 /// We still use COW (Copy-On-Write) — always creating a new bitmap object — so that
 /// snapshot readers holding a shared_ptr to the old bitmap are not affected by later updates.
-static void applyCrossPartDeleteMarks(const PartDeleteBitmapType & cross_part_marks_map)
+static void applyCrossPartDeleteMarks(const PartDeleteBitmapMap & cross_part_marks_map)
 {
     for (const auto & [part_ptr, cross_part_marks] : cross_part_marks_map)
     {
@@ -347,10 +352,7 @@ static void applyCrossPartDeleteMarks(const PartDeleteBitmapType & cross_part_ma
             continue;
 
         /// COW: create a fresh bitmap, copy existing marks if any, then add new ones.
-        auto new_marks = (part_ptr->rows_count <= std::numeric_limits<UInt32>::max())
-            ? ProjectionIndexBitmap::create32()
-            : ProjectionIndexBitmap::create64();
-
+        auto new_marks = ProjectionIndexBitmap::create(part_ptr->rows_count);
         auto existing_marks = part_ptr->getDeleteMarkBitmap();
         if (existing_marks)
             new_marks->unionWith(*existing_marks);
@@ -406,7 +408,6 @@ MergeTreeDedupPartManager::DedupPartWithSSTReaders MergeTreeDedupPartManager::pr
 
     /// Build visible part SST readers from cache.
     ctx.visible_parts = openSSTReadersForParts(visible_parts, metadata_snapshot);
-
     return ctx;
 }
 
@@ -432,7 +433,7 @@ ProjectionIndexBitmapPtr MergeTreeDedupPartManager::buildIntraPartDeleteMark(
             if (iter->value().size() >= 8)
             {
                 auto entry = decodeUniqueValueEntry(iter->value().data(), iter->value().size());
-                input_part_delete_mark->add(static_cast<UInt32>(entry.part_offset));
+                input_part_delete_mark->add(entry.part_offset);
             }
         }
     }
@@ -542,17 +543,16 @@ void MergeTreeDedupPartManager::dedupPart(const DataPartPtr & new_part, MergeTre
     /// and all per-shard multiGet work entirely.
     if (!sst_ctx.visible_parts.empty())
     {
-        PartDeleteBitmapType cross_part_delta;
-        dedupKeysThroughNewCommitParts(
-            sst_ctx.input, sst_ctx.visible_parts,
-            cross_part_delta);
-
-        for (auto & [part_ptr, delete_marks] : cross_part_delta)
+        auto cross_part_marks = dedupKeysThroughNewCommitParts(sst_ctx.input, sst_ctx.visible_parts);
+        /// Merge cross-part marks into delta_deleted_rows_map.
+        for (auto & [part_ptr, bitmap] : cross_part_marks)
         {
-            if (delete_marks && !delete_marks->empty())
+            if (bitmap && !bitmap->empty())
             {
-                auto & target = getOrCreateDelta(delta_deleted_rows_map, part_ptr);
-                target->unionWith(*delete_marks);
+                auto & target = delta_deleted_rows_map[part_ptr];
+                if (!target)
+                    target = ProjectionIndexBitmap::create(part_ptr->rows_count);
+                target->unionWith(*bitmap);
             }
         }
     }
@@ -563,7 +563,10 @@ void MergeTreeDedupPartManager::dedupPart(const DataPartPtr & new_part, MergeTre
     {
         LOG_DEBUG(log, "dedupPart: part '{}' has {} intra-part duplicate rows",
             new_part->name, input_part_delete_mark->cardinality());
-        getOrCreateDelta(delta_deleted_rows_map, new_part.get())->unionWith(*input_part_delete_mark);
+        auto & intra_target = delta_deleted_rows_map[new_part.get()];
+        if (!intra_target)
+            intra_target = ProjectionIndexBitmap::create(new_part->rows_count);
+        intra_target->unionWith(*input_part_delete_mark);
     }
 
     LOG_DEBUG(log, "dedupPart: part '{}', op={}, visible_parts={}, elapsed={}us",
@@ -648,9 +651,6 @@ void MergeTreeDedupPartManager::buildAllDeleteMarksForPartition(
     SSTMergingIterator merge_iter(std::move(sst_iters), std::move(sst_readers));
     merge_iter.seekToFirst();
 
-    /// Unified delete marks for both intra-part and cross-part dedup.
-    PartDeleteBitmapType all_delta;
-
     bool has_row_version = false;
     bool version_detected = false;
 
@@ -669,9 +669,6 @@ void MergeTreeDedupPartManager::buildAllDeleteMarksForPartition(
     for (; merge_iter.valid(); merge_iter.next())
     {
         auto val = merge_iter.value();
-        if (val.size() < 8)
-            continue;
-
         if (!version_detected)
         {
             has_row_version = detectRowVersioning(val.size());
@@ -698,15 +695,15 @@ void MergeTreeDedupPartManager::buildAllDeleteMarksForPartition(
                     && parts[idx]->info.max_block >= parts[last_max_entry_info.part_index]->info.max_block))
             {
                 /// Current entry has higher version — mark the previous max as deleted.
-                getOrCreateDelta(all_delta, parts[last_max_entry_info.part_index].get())
-                    ->add(static_cast<UInt32>(last_max_entry_info.entry.part_offset));
+                parts[last_max_entry_info.part_index]->checkOrCreateDeleteMark()
+                    ->add(last_max_entry_info.entry.part_offset);
                 last_max_entry_info = {idx, entry, current_version};
             }
             else
             {
                 /// Current entry loses — mark it as deleted.
-                getOrCreateDelta(all_delta, parts[idx].get())
-                    ->add(static_cast<UInt32>(entry.part_offset));
+                parts[idx]->checkOrCreateDeleteMark()
+                    ->add(entry.part_offset);
             }
         }
     }
@@ -718,12 +715,9 @@ void MergeTreeDedupPartManager::buildAllDeleteMarksForPartition(
         {
             LOG_DEBUG(log, "buildAllDeleteMarksForPartition: part '{}' has {} intra-part duplicate rows",
                 part->name, intra_mark->cardinality());
-            getOrCreateDelta(all_delta, part.get())->unionWith(*intra_mark);
+            part->checkOrCreateDeleteMark()->unionWith(*intra_mark);
         }
     }
-
-    /// Apply all delete marks at once.
-    applyCrossPartDeleteMarks(all_delta);
 
     /// Release ReadBuffer memory for all SST readers in this partition.
     for (const auto & [part, reader] : part_readers)
@@ -760,17 +754,6 @@ void MergeTreeDedupPartManager::buildAllDeleteMarksOnStartup()
     size_t total_parts_deduped = 0;
     for (auto & [partition_id, partition_parts] : parts_by_partition)
     {
-        /// Sort by max_block ascending so that older parts come first.
-        /// The merging iterator uses index order to break ties on equal keys:
-        /// smaller index (older part) comes first, matching the dedup semantics
-        /// where newer parts win.
-        std::ranges::sort(
-            partition_parts,
-            [](const DataPartPtr & a, const DataPartPtr & b)
-            {
-                return a->info.max_block < b->info.max_block;
-            });
-
         buildAllDeleteMarksForPartition(partition_parts, metadata_snapshot);
         total_parts_deduped += partition_parts.size();
 
