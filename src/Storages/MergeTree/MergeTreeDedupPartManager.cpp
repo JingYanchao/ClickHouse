@@ -1,5 +1,4 @@
 #include <Storages/MergeTree/MergeTreeDedupPartManager.h>
-
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreeIndexReadResultPool.h>
@@ -62,8 +61,6 @@ inline void addToBitmap(ProjectionIndexBitmapPtr & bitmap, UInt64 value, size_t 
         bitmap = ProjectionIndexBitmap::create(part_rows);
     bitmap->add(value);
 }
-
-
 
 static void deduplicateKeyByBucket(
     const PartWithSSTReader & input,
@@ -400,41 +397,6 @@ MergeTreeDedupPartManager::DedupPartWithSSTReaders MergeTreeDedupPartManager::pr
     return ctx;
 }
 
-ProjectionIndexBitmapPtr MergeTreeDedupPartManager::buildIntraPartDeleteMark(
-    const DataPartPtr & input_part,
-    const SSTFileReader & input_sst)
-{
-    auto props = input_sst.getProperties();
-    size_t sst_entry_count = props ? props->num_entries : 0;
-
-    /// All rows have distinct keys — no intra-part duplicates.
-    if (sst_entry_count >= input_part->rows_count)
-        return nullptr;
-
-    /// Collect all surviving offsets (one per unique key) from the SST.
-    auto input_part_delete_mark = ProjectionIndexBitmap::create32();
-    {
-        rocksdb::ReadOptions opts;
-        opts.fill_cache = false;
-        auto iter = input_sst.newIterator(opts);
-        for (iter->SeekToFirst(); iter->Valid(); iter->Next())
-        {
-            if (iter->value().size() >= 8)
-            {
-                auto entry = decodeUniqueValueEntry(iter->value().data(), iter->value().size());
-                input_part_delete_mark->add(entry.part_offset);
-            }
-        }
-    }
-
-    /// Flip [0, rows_count): survivors become 0, losers become 1.
-    input_part_delete_mark->flipRange(0, input_part->rows_count);
-
-    if (input_part_delete_mark->empty())
-        return nullptr;
-
-    return input_part_delete_mark;
-}
 
 void MergeTreeDedupPartManager::optimizeVisiblePartsForMerge(
     const DataPartPtr & new_part,
@@ -468,8 +430,8 @@ void MergeTreeDedupPartManager::optimizeVisiblePartsForMerge(
             && part->info.max_block <= new_part->info.max_block)
         {
             size_t deleted = 0;
-            if (auto bm = part->getDeleteMarkBitmap())
-                deleted = bm->cardinality();
+            if (auto delete_mark = part->getDeleteMarkBitmap())
+                deleted = delete_mark->cardinality();
             covered_effective_rows += (part->rows_count - deleted);
             return true;
         }
@@ -521,42 +483,17 @@ void MergeTreeDedupPartManager::dedupPart(const DataPartPtr & new_part, MergeTre
     if (op == MergeTreeData::CommitOperation::Merge)
         optimizeVisiblePartsForMerge(new_part, all_visible_parts);
 
-    /// Open the input part's SST reader (from cache). Required for both
-    /// cross-part and intra-part dedup.
+    /// No visible parts to compare against — nothing to dedup.
+    if (all_visible_parts.empty())
+        return;
+
+    /// Open the input part's SST reader (from cache) for cross-part dedup.
     auto sst_ctx = prepareSSTReadersForDedup(new_part, metadata_snapshot, all_visible_parts);
     if (!sst_ctx.input.reader)
         return;
 
-    /// Cross-part dedup: only needed when there are visible parts to compare against.
-    /// When visible_parts is empty, skip boundary key scanning, shard partitioning,
-    /// and all per-shard multiGet work entirely.
-    if (!sst_ctx.visible_parts.empty())
-    {
-        auto cross_part_marks = dedupKeysThroughNewCommitParts(sst_ctx.input, sst_ctx.visible_parts);
-        /// Merge cross-part marks into delta_deleted_rows_map.
-        for (auto & [part_ptr, bitmap] : cross_part_marks)
-        {
-            if (bitmap && !bitmap->empty())
-            {
-                auto & target = delta_deleted_rows_map[part_ptr];
-                if (!target)
-                    target = ProjectionIndexBitmap::create(part_ptr->rows_count);
-                target->unionWith(*bitmap);
-            }
-        }
-    }
-
-    /// Intra-part dedup: detect rows that lost to other rows with the same
-    /// unique key during SST construction (last-write-wins).
-    if (auto input_part_delete_mark = buildIntraPartDeleteMark(new_part, *sst_ctx.input.reader))
-    {
-        LOG_DEBUG(log, "dedupPart: part '{}' has {} intra-part duplicate rows",
-            new_part->name, input_part_delete_mark->cardinality());
-        auto & intra_target = delta_deleted_rows_map[new_part.get()];
-        if (!intra_target)
-            intra_target = ProjectionIndexBitmap::create(new_part->rows_count);
-        intra_target->unionWith(*input_part_delete_mark);
-    }
+    /// Cross-part dedup against visible parts.
+    delta_deleted_rows_map = dedupKeysThroughNewCommitParts(sst_ctx.input, sst_ctx.visible_parts);
 
     LOG_DEBUG(log, "dedupPart: part '{}', op={}, visible_parts={}, elapsed={}us",
         new_part->name, static_cast<int>(op), all_visible_parts.size(), dedup_watch.elapsedMicroseconds());
@@ -603,16 +540,15 @@ void MergeTreeDedupPartManager::SSTMergingIterator::next()
 
 /// ---- buildAllDeleteMarksForPartition ----
 ///
-/// Two-step dedup for a single partition:
+/// Cross-part dedup for a single partition via multi-way merge: walks all
+/// SST iterators in key order. When the same key appears in multiple parts,
+/// the entry with the highest version wins (ties broken by newer part).
+/// Losers are marked as deleted immediately during the walk.
 ///
-/// 1. Cross-part dedup via multi-way merge: walks all SST iterators in key
-///    order. When the same key appears in multiple parts, the entry with the
-///    highest version wins (ties broken by newer part). Losers are marked as
-///    deleted immediately during the walk.
-///
-/// 2. Intra-part dedup: reuses buildIntraPartDeleteMark for each part to
-///    find rows that lost during SST construction (last-write-wins). These
-///    rows' offsets do NOT appear in the SST and are discovered via flip.
+/// Intra-part dedup is unnecessary because:
+/// - INSERT path already deduplicates the block via `deduplicateBlockByUniqueKey`.
+/// - Merge path filters out delete-marked rows via `_row_exists` column,
+///   so merged parts never contain duplicate keys.
 
 void MergeTreeDedupPartManager::buildAllDeleteMarksForPartition(
     const DataPartsVector & partition_parts,
@@ -685,17 +621,6 @@ void MergeTreeDedupPartManager::buildAllDeleteMarksForPartition(
                 parts[idx]->checkOrCreateDeleteMark()
                     ->add(entry.part_offset);
             }
-        }
-    }
-
-    /// Step 3: Intra-part dedup — reuse buildIntraPartDeleteMark for each part.
-    for (const auto & [part, reader] : part_readers)
-    {
-        if (auto intra_mark = buildIntraPartDeleteMark(part, *reader))
-        {
-            LOG_DEBUG(log, "buildAllDeleteMarksForPartition: part '{}' has {} intra-part duplicate rows",
-                part->name, intra_mark->cardinality());
-            part->checkOrCreateDeleteMark()->unionWith(*intra_mark);
         }
     }
 

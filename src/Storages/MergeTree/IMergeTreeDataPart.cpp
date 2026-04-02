@@ -2073,9 +2073,6 @@ bool IMergeTreeDataPart::hasLightweightDelete() const
 
 ProjectionIndexBitmapPtr & IMergeTreeDataPart::checkOrCreateDeleteMark() const
 {
-    if (part_type == MergeTreeDataPartType::Compact)
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't create delete mark for compact part {}", name);
-
     if (!delete_mark_bitmap)
         delete_mark_bitmap = ProjectionIndexBitmap::create(rows_count);
 

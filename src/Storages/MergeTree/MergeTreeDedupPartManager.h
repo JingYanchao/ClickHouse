@@ -150,13 +150,6 @@ private:
         const DataPartPtr & new_part,
         MergeTreeData::DataPartsVector & visible_parts);
 
-    /// Build intra-part delete mark bitmap by scanning the input SST.
-    /// Rows not present in the SST are duplicates that lost during SST
-    /// construction (last-write-wins). Returns nullptr if no duplicates.
-    ProjectionIndexBitmapPtr buildIntraPartDeleteMark(
-        const DataPartPtr & input_part,
-        const SSTFileReader & input_sst);
-
     /// Build delete marks for all parts in a single partition using a
     /// multi-way merge of their SST iterators. This is O(N·log(N)·K)
     /// where N = number of parts and K = total keys, compared to the
