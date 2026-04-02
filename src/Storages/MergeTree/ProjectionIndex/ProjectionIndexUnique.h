@@ -112,6 +112,7 @@ public:
     UInt64 getMaxRows() const override { return std::numeric_limits<UInt32>::max(); }
 
     const String & getVersionColumnName() const { return version_column_name; }
+    const Names & getUniqueKeyColumns() const { return unique_key_columns; }
 
 private:
     Names unique_key_columns;

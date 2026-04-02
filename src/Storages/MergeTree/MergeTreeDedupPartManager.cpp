@@ -48,11 +48,12 @@ using PartWithSSTReader = MergeTreeDedupPartManager::PartWithSSTReader;
 /// When row-level versioning is available (16-byte SST values), use the per-row
 /// version stored in the entry; otherwise fall back to part-level max_block.
 static UInt64 getEffectiveVersion(
-    bool has_row_version,
     const DataPartPtr & part,
-    const UniqueValueEntryFull & entry)
+    const UniqueValueEntryFull & entry,
+    size_t value_size)
 {
-    return has_row_version ? entry.version : static_cast<UInt64>(part->info.max_block);
+    /// 16-byte values carry per-row version; 8-byte values use part-level max_block.
+    return (value_size == 16) ? entry.version : static_cast<UInt64>(part->info.max_block);
 }
 
 inline void addToBitmap(ProjectionIndexBitmapPtr & bitmap, UInt64 value, size_t part_rows)
@@ -63,12 +64,6 @@ inline void addToBitmap(ProjectionIndexBitmapPtr & bitmap, UInt64 value, size_t 
 }
 
 
-/// Detect whether the SST uses row-level versioning (16-byte values) or
-/// part-level versioning (8-byte values). Returns true for row-level.
-static bool detectRowVersioning(size_t value_size)
-{
-    return value_size == 16;
-}
 
 static void deduplicateKeyByBucket(
     const PartWithSSTReader & input,
@@ -95,11 +90,6 @@ static void deduplicateKeyByBucket(
     auto input_iter = input.reader->newIterator(opts);
     input_iter->Seek(rocksdb::Slice(start_key));
 
-    /// Detect once whether the SST uses row-level versioning (16-byte values)
-    /// or part-level versioning (8-byte values), via `detectRowVersioning`.
-    bool has_row_version = false;
-    bool version_detected = false;
-
     /// Reusable batch buffer to avoid repeated allocations.
     std::vector<InputKeyEntry> batch;
     batch.reserve(MULTI_GET_BATCH_SIZE);
@@ -125,12 +115,6 @@ static void deduplicateKeyByBucket(
 
             const auto & value_slice = input_iter->value();
             auto input_entry = decodeUniqueValueEntry(value_slice.data(), value_slice.size());
-
-            if (!version_detected)
-            {
-                has_row_version = detectRowVersioning(value_slice.size());
-                version_detected = true;
-            }
 
             batch.push_back({input_iter->key().ToString(), input_entry});
         }
@@ -192,8 +176,8 @@ static void deduplicateKeyByBucket(
                 size_t batch_idx = candidate_batch_indices[c];
                 const auto & input_entry = batch[batch_idx].entry;
 
-                auto input_version = getEffectiveVersion(has_row_version, input.part, input_entry);
-                auto visible_version = getEffectiveVersion(has_row_version, current_part, current_entry);
+                auto input_version = getEffectiveVersion(input.part, input_entry, current_value.size());
+                auto visible_version = getEffectiveVersion(current_part, current_entry, current_value.size());
 
                 /// Determine the winner: higher version wins.
                 /// When versions are equal, use `max_block` as tiebreaker —
@@ -311,29 +295,34 @@ static PartDeleteBitmapMap dedupKeysThroughNewCommitParts(
 
     /// Merge all per-shard delta bitmaps into the final output.
     /// Iterate by part: for each part, create a new bitmap by merging all shard deltas.
-    for (const auto & visible : visible_parts)
+    /// Include the input part as well — it may have rows marked as deleted
+    /// when a visible part wins the version comparison.
+    auto mergeDeltaBitmaps = [&](const IMergeTreeDataPart * part_ptr, size_t rows_count)
     {
-        const auto * part_ptr = visible.part.get();
-        auto bitmap = ProjectionIndexBitmap::create(visible.part->rows_count);
-
+        auto bitmap = ProjectionIndexBitmap::create(rows_count);
         for (const auto & shard_delta : delta_bitmaps)
         {
             auto it = shard_delta.find(part_ptr);
             if (it != shard_delta.end() && it->second && !it->second->empty())
                 bitmap->unionWith(*it->second);
         }
-
         if (!bitmap->empty())
             result.emplace(part_ptr, std::move(bitmap));
-    }
+    };
+
+    for (const auto & [part, reader] : visible_parts)
+        mergeDeltaBitmaps(part.get(), part->rows_count);
+
+    /// Input part can also have rows deleted when visible parts win.
+    mergeDeltaBitmaps(input.part.get(), input.part->rows_count);
 
     /// Release ReadBuffer memory (~1MB per file) now that cross-part dedup is done.
     /// Bloom filter and index blocks remain pinned in the cached SSTFileReader.
     input.reader->releaseBufferMemory();
-    for (const auto & visible : visible_parts)
+    for (const auto & [part, reader] : visible_parts)
     {
-        if (visible.reader)
-            visible.reader->releaseBufferMemory();
+        if (reader)
+            reader->releaseBufferMemory();
     }
 
     return result;
@@ -651,9 +640,6 @@ void MergeTreeDedupPartManager::buildAllDeleteMarksForPartition(
     SSTMergingIterator merge_iter(std::move(sst_iters), std::move(sst_readers));
     merge_iter.seekToFirst();
 
-    bool has_row_version = false;
-    bool version_detected = false;
-
     /// Tracks the entry with the highest version for the current key group.
     struct IteratorEntryInfo
     {
@@ -669,18 +655,12 @@ void MergeTreeDedupPartManager::buildAllDeleteMarksForPartition(
     for (; merge_iter.valid(); merge_iter.next())
     {
         auto val = merge_iter.value();
-        if (!version_detected)
-        {
-            has_row_version = detectRowVersioning(val.size());
-            version_detected = true;
-        }
-
         auto entry = decodeUniqueValueEntry(val.data(), val.size());
         size_t idx = merge_iter.currentIndex();
 
         /// Cross-part dedup: compare entries sharing the same key.
         auto current_key = merge_iter.key();
-        UInt64 current_version = getEffectiveVersion(has_row_version, parts[idx], entry);
+        UInt64 current_version = getEffectiveVersion(parts[idx], entry, val.size());
 
         if (last_key != current_key.ToString())
         {

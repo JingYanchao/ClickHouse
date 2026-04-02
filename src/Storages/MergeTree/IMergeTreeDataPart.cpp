@@ -2078,7 +2078,7 @@ ProjectionIndexBitmapPtr & IMergeTreeDataPart::checkOrCreateDeleteMark() const
 
     if (!delete_mark_bitmap)
         delete_mark_bitmap = ProjectionIndexBitmap::create(rows_count);
-    
+
     return delete_mark_bitmap;
 }
 

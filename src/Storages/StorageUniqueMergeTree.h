@@ -36,6 +36,8 @@ public:
 
     bool supportsUpsert() const override { return true; }
 
+    String getUniqueProjectionName() const override { return unique_projection_name; }
+
     bool supportsTrivialCountOptimization(const StorageSnapshotPtr &, ContextPtr) const override { return false; }
 
     /// Override startup to rebuild delete marks BEFORE background tasks start.

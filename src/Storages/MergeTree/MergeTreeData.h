@@ -1427,6 +1427,10 @@ public:
     /// Returns the number of parts for which index was unloaded.
     size_t unloadPrimaryKeysAndClearCachesOfOutdatedParts();
 
+    /// Return the name of the unique projection used for upsert dedup.
+    /// Non-empty only for UniqueMergeTree.
+    virtual String getUniqueProjectionName() const { return {}; }
+
 protected:
     friend class IMergeTreeDataPart;
     friend class MergeTreeDataMergerMutator;
