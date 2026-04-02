@@ -182,14 +182,16 @@ private:
         const DataPartsVector & partition_parts,
         const StorageMetadataPtr & metadata_snapshot);
 
-    /// Try to dedup a merge/mutation result part by scanning only source parts
-    /// that have delete marks. For each such source part, iterates its SST to
-    /// find keys whose rows were deleted by concurrent INSERT dedup, then uses
-    /// batch multiGet on the merged part's SST to locate and mark the
-    /// corresponding rows as deleted.
+    /// Propagate delete marks from source parts into the merged part.
+    /// Uses a multi-way merge iterator over all source parts' SSTs to walk
+    /// keys in sorted order. For each key group (same key across parts),
+    /// only propagates the deletion when ALL entries are deleted — meaning
+    /// a concurrent INSERT deleted the key from every source part that had it.
+    /// If any entry is alive, the merged part inherited the key from that
+    /// source part, so no propagation is needed.
     ///
-    /// Complexity: O(Σ N_source_with_deletes + D × log(N_merged))
-    ///   where D = total deleted keys (typically D << N_merged).
+    /// Complexity: O(Σ N_source + D × log(N_merged))
+    ///   where D = keys deleted by concurrent INSERTs (typically D << N_merged).
     void tryDedupDeletedKeysFromSourceParts(
         const DataPartPtr & new_part,
         const DataPartsVector & source_parts,
