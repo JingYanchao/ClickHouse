@@ -6,8 +6,6 @@
 #include <unordered_map>
 #include <vector>
 
-#include <base/types.h>
-#include <Common/Logger.h>
 #include <Common/Stopwatch.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/SSTFileUtil.h>
@@ -76,7 +74,22 @@ explicit MergeTreeDedupPartManager(const MergeTreeData & storage_);
     {
         DataPartPtr part;
         SSTFileReaderPtr reader;
+
+        /// Release the underlying ReadBuffer memory (~1MB per file) while
+        /// keeping Bloom filter and index blocks pinned in the cached reader.
+        void releaseBufferMemory() const
+        {
+            if (reader)
+                reader->releaseBufferMemory();
+        }
     };
+
+    /// Release ReadBuffer memory for a batch of PartWithSSTReader entries.
+    static void releaseAllBufferMemory(const std::vector<PartWithSSTReader> & readers)
+    {
+        for (const auto & r : readers)
+            r.releaseBufferMemory();
+    }
 
     /// SST context for dedup: holds the input part and pre-opened
     /// SSTFileReaders for visible parts.
@@ -135,7 +148,7 @@ private:
     /// Open SST readers for a list of parts, skipping parts without SST.
     /// Returns pairs of (part, reader) for parts that have valid SST readers.
     /// Shared by prepareSSTReadersForDedup and buildAllDeleteMarksForPartition.
-    std::vector<PartWithSSTReader> openSSTReadersForParts(
+    static std::vector<PartWithSSTReader> openSSTReadersForParts(
         const DataPartsVector & parts,
         const StorageMetadataPtr & metadata_snapshot);
 
@@ -144,10 +157,21 @@ private:
         const StorageMetadataPtr & metadata_snapshot,
         MergeTreeData::DataPartsVector & visible_parts);
 
-    /// Optimize visible parts list for merge-produced parts by filtering out
-    /// parts that cannot conflict with the merge result.
-    void optimizeVisiblePartsForMerge(
+    /// Dedup path for INSERT-produced parts: cross-part dedup against all
+    /// active visible parts using parallel SST key comparison.
+    void dedupForInsert(
         const DataPartPtr & new_part,
+        const StorageMetadataPtr & metadata_snapshot,
+        MergeTreeData::DataPartsVector & visible_parts);
+
+    /// Dedup path for MERGE/MUTATION-produced parts: filter out source parts
+    /// (covered by the merged part's block range), then propagate any delete
+    /// marks from source parts into the merged part via deleted-keys optimization.
+    /// No cross-part dedup is needed because merge only combines existing data
+    /// without introducing new unique keys.
+    void dedupForMerge(
+        const DataPartPtr & new_part,
+        const StorageMetadataPtr & metadata_snapshot,
         MergeTreeData::DataPartsVector & visible_parts);
 
     /// Build delete marks for all parts in a single partition using a
@@ -156,6 +180,19 @@ private:
     /// previous O(N²·K) approach.
     void buildAllDeleteMarksForPartition(
         const DataPartsVector & partition_parts,
+        const StorageMetadataPtr & metadata_snapshot);
+
+    /// Try to dedup a merge/mutation result part by scanning only source parts
+    /// that have delete marks. For each such source part, iterates its SST to
+    /// find keys whose rows were deleted by concurrent INSERT dedup, then uses
+    /// batch multiGet on the merged part's SST to locate and mark the
+    /// corresponding rows as deleted.
+    ///
+    /// Complexity: O(Σ N_source_with_deletes + D × log(N_merged))
+    ///   where D = total deleted keys (typically D << N_merged).
+    void tryDedupDeletedKeysFromSourceParts(
+        const DataPartPtr & new_part,
+        const DataPartsVector & source_parts,
         const StorageMetadataPtr & metadata_snapshot);
 
     const MergeTreeData & storage;

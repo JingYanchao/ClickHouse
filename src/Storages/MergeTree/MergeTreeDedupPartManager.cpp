@@ -315,12 +315,8 @@ static PartDeleteBitmapMap dedupKeysThroughNewCommitParts(
 
     /// Release ReadBuffer memory (~1MB per file) now that cross-part dedup is done.
     /// Bloom filter and index blocks remain pinned in the cached SSTFileReader.
-    input.reader->releaseBufferMemory();
-    for (const auto & [part, reader] : visible_parts)
-    {
-        if (reader)
-            reader->releaseBufferMemory();
-    }
+    input.releaseBufferMemory();
+    MergeTreeDedupPartManager::releaseAllBufferMemory(visible_parts);
 
     return result;
 }
@@ -398,61 +394,194 @@ MergeTreeDedupPartManager::DedupPartWithSSTReaders MergeTreeDedupPartManager::pr
 }
 
 
-void MergeTreeDedupPartManager::optimizeVisiblePartsForMerge(
+void MergeTreeDedupPartManager::dedupForInsert(
     const DataPartPtr & new_part,
+    const StorageMetadataPtr & metadata_snapshot,
     MergeTreeData::DataPartsVector & visible_parts)
 {
-    /// Always remove parts that are covered by the merged part (i.e. the
-    /// merge's source parts).  At the time `dedupPart` runs, source parts
-    /// are still Active, but they will become Outdated once the merge
-    /// transaction commits.  If we let them participate in cross-part
-    /// dedup, the merged part and a source part can share the same
-    /// `max_block` (the merged part inherits the largest source
-    /// `max_block`), causing the version-comparison tie-breaker to
-    /// potentially let the source part win and mark the merged part's row
-    /// as deleted.  After commit the source part becomes Outdated, so the
-    /// row is lost from all Active parts — leading to fewer rows than
-    /// expected.
+    /// Open the input part's SST reader (from cache) for cross-part dedup.
+    auto sst_ctx = prepareSSTReadersForDedup(new_part, metadata_snapshot, visible_parts);
+    if (!sst_ctx.input.reader)
+        return;
+
+    /// Cross-part dedup against all visible parts.
+    delta_deleted_rows_map = dedupKeysThroughNewCommitParts(sst_ctx.input, sst_ctx.visible_parts);
+}
+
+void MergeTreeDedupPartManager::dedupForMerge(
+    const DataPartPtr & new_part,
+    const StorageMetadataPtr & metadata_snapshot,
+    MergeTreeData::DataPartsVector & visible_parts)
+{
+    /// Collect source parts: those covered by the merged part's block range.
+    /// These are the merge's input parts that will become Outdated after commit.
     ///
-    /// Also filter out parts whose max_block < new_part's min_block:
-    /// these older parts were already deduped against the merge's source
-    /// parts during prior commits and cannot conflict.
-    ///
-    /// While filtering, accumulate the effective rows (rows - delete marks)
-    /// of covered source parts. If the sum equals new_part's rows, the
-    /// merge did not introduce any new key conflicts against the remaining
-    /// visible parts, so we can skip cross-part dedup entirely.
-    size_t covered_effective_rows = 0;
-    std::erase_if(visible_parts, [&](const auto & part)
+    /// Merge/mutation only combines existing data — it does not introduce new
+    /// unique keys. The only dedup work needed is propagating delete marks:
+    /// if a concurrent INSERT marked a row as deleted in a source part, the
+    /// corresponding row in the merged part must also be marked.
+    DataPartsVector source_parts;
+    size_t source_effective_rows = 0;
+    for (const auto & part : visible_parts)
     {
-        /// Covered by the merged part (source parts).
         if (part->info.min_block >= new_part->info.min_block
             && part->info.max_block <= new_part->info.max_block)
         {
+            source_parts.push_back(part);
             size_t deleted = 0;
             if (auto delete_mark = part->getDeleteMarkBitmap())
                 deleted = delete_mark->cardinality();
-            covered_effective_rows += (part->rows_count - deleted);
-            return true;
+            source_effective_rows += (part->rows_count - deleted);
+        }
+    }
+
+    /// If the merged part's row count matches the sum of source parts'
+    /// effective rows (rows - delete marks), no concurrent INSERT has
+    /// deleted any key in the source parts — nothing to propagate.
+    if (source_effective_rows == new_part->rows_count)
+    {
+        LOG_TRACE(log, "dedupForMerge: part '{}' rows ({}) match source effective rows, skip",
+            new_part->name, new_part->rows_count);
+        return;
+    }
+
+    if (!source_parts.empty())
+        tryDedupDeletedKeysFromSourceParts(new_part, source_parts, metadata_snapshot);
+}
+
+void MergeTreeDedupPartManager::tryDedupDeletedKeysFromSourceParts(
+    const DataPartPtr & new_part,
+    const DataPartsVector & source_parts,
+    const StorageMetadataPtr & metadata_snapshot)
+{
+    Stopwatch watch;
+    auto source_part_readers = openSSTReadersForParts(source_parts, metadata_snapshot);
+
+    /// Only keep source parts that actually have delete marks — skip the rest entirely.
+    /// This is the key optimization: instead of iterating ALL source parts' SSTs,
+    /// we only iterate the ones where concurrent INSERT dedup actually deleted rows.
+    std::vector<PartWithSSTReader> parts_with_deletes;
+    std::vector<ProjectionIndexBitmapPtr> delete_bitmaps;
+
+    for (auto & [part, reader] : source_part_readers)
+    {
+        auto delete_mark = part->getDeleteMarkBitmap();
+        if (delete_mark && !delete_mark->empty())
+        {
+            parts_with_deletes.push_back({part, reader});
+            delete_bitmaps.push_back(std::move(delete_mark));
+        }
+    }
+
+    if (parts_with_deletes.empty())
+    {
+        LOG_DEBUG(
+            log,
+            "tryDedupDeletedKeysFromSourceParts: part '{}', no source parts have delete marks, skip, elapsed={}us",
+            new_part->name,
+            watch.elapsedMicroseconds());
+        releaseAllBufferMemory(source_part_readers);
+        return;
+    }
+
+    /// Step 2: Open SST reader for the merged new part (used for multiGet lookups).
+    auto merged_sst_reader = new_part->getOrOpenSSTReader(metadata_snapshot);
+
+    /// Step 3: For each source part with delete marks, iterate its SST to find
+    /// deleted keys, then batch-lookup those keys in the merged part via multiGet.
+    ///
+    /// Complexity: O(Σ N_source_with_deletes + D × log(N_merged))
+    ///   where D = total deleted keys (typically D << N_merged).
+    /// This avoids the O(N_merged) full scan of the merged part's SST.
+    size_t total_marked = 0;
+    size_t total_source_keys_scanned = 0;
+    auto merged_delete_bitmap = ProjectionIndexBitmap::create(new_part->rows_count);
+
+    rocksdb::ReadOptions opts;
+    opts.fill_cache = false;
+
+    for (size_t part_idx = 0; part_idx < parts_with_deletes.size(); ++part_idx)
+    {
+        const auto & [src_part, src_reader] = parts_with_deletes[part_idx];
+        const auto & delete_bitmap = delete_bitmaps[part_idx];
+
+        auto src_iter = src_reader->newIterator(opts);
+
+        /// Collect deleted keys in batches, then multiGet against merged part.
+        std::vector<std::string> deleted_key_batch;
+        deleted_key_batch.reserve(MULTI_GET_BATCH_SIZE);
+
+        auto lookupAndMarkDeletedKeys = [&]()
+        {
+            if (deleted_key_batch.empty())
+                return;
+
+            std::vector<rocksdb::Slice> key_slices;
+            key_slices.reserve(deleted_key_batch.size());
+            for (const auto & k : deleted_key_batch)
+                key_slices.emplace_back(k);
+
+            std::vector<std::string> values;
+            auto statuses = merged_sst_reader->multiGet(key_slices, &values);
+
+            for (size_t i = 0; i < statuses.size(); ++i)
+            {
+                if (!statuses[i].ok())
+                    continue;
+
+                const auto & val = values[i];
+                if (unlikely(val.empty()))
+                    continue;
+
+                auto merged_entry = decodeUniqueValueEntry(val.data(), val.size());
+                merged_delete_bitmap->add(merged_entry.part_offset);
+                ++total_marked;
+            }
+
+            deleted_key_batch.clear();
+        };
+
+        for (src_iter->SeekToFirst(); src_iter->Valid(); src_iter->Next())
+        {
+            ++total_source_keys_scanned;
+
+            if (unlikely(!src_iter->status().ok()))
+                throw Exception(ErrorCodes::INCORRECT_DATA,
+                    "Source SST iterator error: {}", src_iter->status().ToString());
+
+            auto val = src_iter->value();
+            if (unlikely(val.empty()))
+                continue;
+
+            auto entry = decodeUniqueValueEntry(val.data(), val.size());
+
+            /// Only collect keys whose rows are marked as deleted.
+            if (!delete_bitmap->contains(entry.part_offset))
+                continue;
+
+            deleted_key_batch.push_back(src_iter->key().ToString());
+
+            if (deleted_key_batch.size() >= MULTI_GET_BATCH_SIZE)
+                lookupAndMarkDeletedKeys();
         }
 
-        /// Older parts that cannot conflict.
-        if (part->info.max_block < new_part->info.min_block)
-            return true;
-
-        return false;
-    });
-
-    /// If the covered source parts' effective rows match the merged part's
-    /// row count, the merge preserved all unique keys without introducing
-    /// new conflicts — skip cross-part dedup against remaining visible parts.
-    if (covered_effective_rows == new_part->rows_count)
-    {
-        LOG_TRACE(log, "optimizeVisiblePartsForMerge: merge part '{}' effective rows match "
-            "covered parts ({} rows), clearing visible parts to skip cross-part dedup",
-            new_part->name, new_part->rows_count);
-        visible_parts.clear();
+        /// Lookup remaining keys in the last partial batch.
+        lookupAndMarkDeletedKeys();
     }
+
+    /// Step 4: Store the result in delta_deleted_rows_map.
+    if (!merged_delete_bitmap->empty())
+        delta_deleted_rows_map[new_part.get()] = std::move(merged_delete_bitmap);
+
+    merged_sst_reader->releaseBufferMemory();
+    releaseAllBufferMemory(source_part_readers);
+
+    LOG_DEBUG(
+        log,
+        "tryDedupDeletedKeysFromSourceParts: part '{}', source_parts_with_deletes={}, "
+        "source_keys_scanned={}, marked_keys={}, elapsed={}us",
+        new_part->name, parts_with_deletes.size(),
+        total_source_keys_scanned, total_marked, watch.elapsedMicroseconds());
 }
 
 void MergeTreeDedupPartManager::dedupPart(const DataPartPtr & new_part, MergeTreeData::CommitOperation op)
@@ -479,21 +608,10 @@ void MergeTreeDedupPartManager::dedupPart(const DataPartPtr & new_part, MergeTre
         return part->rows_count == 0 || part->name == new_part->name;
     });
 
-    /// Apply per-operation optimizations that may reduce or clear visible_parts.
-    if (op == MergeTreeData::CommitOperation::Merge)
-        optimizeVisiblePartsForMerge(new_part, all_visible_parts);
-
-    /// No visible parts to compare against — nothing to dedup.
-    if (all_visible_parts.empty())
-        return;
-
-    /// Open the input part's SST reader (from cache) for cross-part dedup.
-    auto sst_ctx = prepareSSTReadersForDedup(new_part, metadata_snapshot, all_visible_parts);
-    if (!sst_ctx.input.reader)
-        return;
-
-    /// Cross-part dedup against visible parts.
-    delta_deleted_rows_map = dedupKeysThroughNewCommitParts(sst_ctx.input, sst_ctx.visible_parts);
+    if (op == MergeTreeData::CommitOperation::Merge || op == MergeTreeData::CommitOperation::Mutation)
+        dedupForMerge(new_part, metadata_snapshot, all_visible_parts);
+    else
+        dedupForInsert(new_part, metadata_snapshot, all_visible_parts);
 
     LOG_DEBUG(log, "dedupPart: part '{}', op={}, visible_parts={}, elapsed={}us",
         new_part->name, static_cast<int>(op), all_visible_parts.size(), dedup_watch.elapsedMicroseconds());
@@ -506,7 +624,6 @@ void MergeTreeDedupPartManager::commitDeleteMarkBuffers(const DataPartsLock & /*
 }
 
 /// ---- SSTMergingIterator implementation ----
-
 MergeTreeDedupPartManager::SSTMergingIterator::SSTMergingIterator(
     std::vector<std::unique_ptr<rocksdb::Iterator>> iters_,
     std::vector<SSTFileReaderPtr> readers_)
@@ -624,12 +741,7 @@ void MergeTreeDedupPartManager::buildAllDeleteMarksForPartition(
         }
     }
 
-    /// Release ReadBuffer memory for all SST readers in this partition.
-    for (const auto & [part, reader] : part_readers)
-    {
-        if (reader)
-            reader->releaseBufferMemory();
-    }
+    releaseAllBufferMemory(part_readers);
 }
 
 void MergeTreeDedupPartManager::buildAllDeleteMarksOnStartup()
@@ -657,13 +769,31 @@ void MergeTreeDedupPartManager::buildAllDeleteMarksOnStartup()
     }
 
     size_t total_parts_deduped = 0;
-    for (auto & [partition_id, partition_parts] : parts_by_partition)
     {
-        buildAllDeleteMarksForPartition(partition_parts, metadata_snapshot);
-        total_parts_deduped += partition_parts.size();
+        const size_t num_partitions = parts_by_partition.size();
+        const size_t pool_size = std::min(num_partitions, DEDUP_MAX_PARALLEL);
 
-        LOG_DEBUG(log, "buildAllDeleteMarksOnStartup: partition '{}', parts={}",
-                  partition_id, partition_parts.size());
+        ThreadPool partition_pool(
+            CurrentMetrics::UniqueKeyDedupThreads,
+            CurrentMetrics::UniqueKeyDedupThreadsActive,
+            CurrentMetrics::UniqueKeyDedupThreadsScheduled,
+            pool_size);
+
+        ThreadPoolCallbackRunnerLocal<void> runner(partition_pool, ThreadName::UNIQUE_KEY_DEDUP);
+
+        for (auto & [partition_id, partition_parts] : parts_by_partition)
+        {
+            total_parts_deduped += partition_parts.size();
+            runner.enqueueAndKeepTrack(
+                [this, &partition_parts, &metadata_snapshot, partition_id]
+                {
+                    buildAllDeleteMarksForPartition(partition_parts, metadata_snapshot);
+                    LOG_DEBUG(log, "buildAllDeleteMarksOnStartup: partition '{}', parts={}",
+                              partition_id, partition_parts.size());
+                });
+        }
+
+        runner.waitForAllToFinishAndRethrowFirstError();
     }
 
     LOG_INFO(log, "buildAllDeleteMarksOnStartup: complete, deduped {} parts across {} partitions, total elapsed={}ms",
