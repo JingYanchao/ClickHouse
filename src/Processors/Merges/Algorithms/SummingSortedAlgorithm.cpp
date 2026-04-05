@@ -123,6 +123,31 @@ static bool isInNames(const std::string & column_name, const Names & names)
     return is_in_partition_key != names.end();
 }
 
+/// When allow_tuple_element_aggregation is enabled, Tuple columns are flattened
+/// into leaf columns with dot-separated names (e.g. "value.a", "value.b").
+/// If the user specified the original Tuple column name (e.g. "value") in
+/// column_names_to_sum, we need to match the flattened leaf names against
+/// their parent Tuple names.
+static bool isInNamesOrAncestorInNames(const std::string & column_name, const Names & names)
+{
+    if (isInNames(column_name, names))
+        return true;
+
+    /// Walk up the dot-separated hierarchy.
+    /// For "a.b.c" we check "a.b" first, then "a".
+    std::string_view remaining(column_name);
+    while (true)
+    {
+        auto pos = remaining.rfind('.');
+        if (pos == std::string_view::npos || pos == 0)
+            break;
+        remaining = remaining.substr(0, pos);
+        if (isInNames(std::string(remaining), names))
+            return true;
+    }
+    return false;
+}
+
 
 using Row = std::vector<Field>;
 
@@ -360,7 +385,11 @@ static SummingSortedAlgorithm::ColumnsDefinition defineColumns(
                 continue;
             }
 
-            if (column_names_to_sum.empty() || isInNames(column.name, column_names_to_sum))
+            bool column_should_be_summed = column_names_to_sum.empty()
+                || (allow_tuple_element_aggregation
+                    ? isInNamesOrAncestorInNames(column.name, column_names_to_sum)
+                    : isInNames(column.name, column_names_to_sum));
+            if (column_should_be_summed)
             {
                 // Create aggregator to sum this column
                 SummingSortedAlgorithm::AggregateDescription desc;

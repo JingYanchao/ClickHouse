@@ -1,0 +1,15 @@
+=== Test 1: Explicit column_names_to_sum with Tuple ===
+Before OPTIMIZE - with FINAL:
+1	(40,60)
+After OPTIMIZE:
+1	(40,60)
+=== Test 2: Explicit column_names_to_sum with nested Tuple ===
+Before OPTIMIZE - with FINAL:
+1	(50,(70,90))	200
+After OPTIMIZE:
+1	(50,(70,90))	200
+=== Test 3: Explicit column_names_to_sum - only specified Tuple is summed ===
+Before OPTIMIZE - with FINAL:
+1	(40,60)	(300,400)
+After OPTIMIZE (not_summed should keep last value):
+1	(40,60)	(300,400)
