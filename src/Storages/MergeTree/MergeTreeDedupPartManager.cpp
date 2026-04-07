@@ -526,19 +526,24 @@ void MergeTreeDedupPartManager::dedupForMutation(
         new_part->name, source_part->name, source_part->rows_count, new_part->rows_count);
 }
 
-/// Propagate deleted keys from source parts to the merged part using a multi-way
-/// merge iterator over all source parts' SSTs.
+/// Propagate deleted keys from source parts to the merged part.
 ///
-/// The merging iterator produces keys in sorted order; when the same key appears
-/// in multiple source parts, entries are grouped together. For each key group we
-/// check whether ALL source-part entries that contain this key have been newly
-/// deleted (present in the diff bitmap). Only when every entry is deleted do we
-/// propagate the deletion to the merged part — because if any source-part entry
-/// is alive, the merge inherited the key from that entry.
+/// For each source part, scan its SST and collect keys whose `part_offset` is
+/// in the diff bitmap (i.e. newly deleted by a concurrent INSERT). Then batch-
+/// lookup those keys in the merged part's SST to find the new offsets and mark
+/// them as deleted.
 ///
-/// Propagated keys are batched (MULTI_GET_BATCH_SIZE) for efficient multiGet
-/// against the merged part's SST.
-static void propagateDeletedKeysByMergingIterator(
+/// Why we don't need a multi-way merge iterator with "ALL entries deleted" logic:
+/// Version transitivity guarantees correctness. If key K exists in source parts
+/// A (version=5) and B (version=3), merge picks A as the winner. A concurrent
+/// INSERT that deletes A's entry must have a higher version (>5), which also
+/// beats B (>5 > 3), so B's entry is also deleted. Therefore, if the winner is
+/// deleted, all losers are necessarily deleted too — checking any single source
+/// part that has the key deleted is sufficient.
+///
+/// Duplicate keys collected from multiple source parts are harmless: the merged
+/// part's SST contains each key exactly once, so multiGet deduplicates naturally.
+static void propagateDeletedKeysPerSourcePart(
     std::vector<PartWithSSTReader> & source_part_readers,
     const std::vector<ProjectionIndexBitmapPtr> & diff_bitmaps,
     const SSTFileReaderPtr & merged_sst_reader,
@@ -547,24 +552,6 @@ static void propagateDeletedKeysByMergingIterator(
     LoggerPtr log)
 {
     Stopwatch watch;
-
-    /// Build the merging iterator over all source parts' SSTs.
-    std::vector<std::unique_ptr<rocksdb::Iterator>> sst_iters;
-    std::vector<SSTFileReaderPtr> sst_readers;
-    sst_iters.reserve(source_part_readers.size());
-    sst_readers.reserve(source_part_readers.size());
-
-    rocksdb::ReadOptions opts;
-    opts.fill_cache = false;
-    for (auto & [part, reader] : source_part_readers)
-    {
-        sst_iters.push_back(reader->newIterator(opts));
-        sst_readers.push_back(reader);
-    }
-
-    MergeTreeDedupPartManager::SSTMergingIterator merge_iter(
-        std::move(sst_iters), std::move(sst_readers));
-    merge_iter.seekToFirst();
 
     auto bitmap = ProjectionIndexBitmap::create(merged_part_rows);
     size_t marked = 0;
@@ -605,65 +592,39 @@ static void propagateDeletedKeysByMergingIterator(
         key_batch.clear();
     };
 
-    /// Walk the merged stream, grouping entries by key.
-    /// For each key group, track whether ALL entries are in the diff bitmap.
-    std::string current_key;
-    bool all_deleted_in_group = true;
-    bool has_group = false;
+    /// Iterate each source part independently: scan its SST and collect keys
+    /// whose part_offset is in the diff bitmap.
+    rocksdb::ReadOptions opts;
+    opts.fill_cache = false;
 
-    auto finalizeGroup = [&]()
+    for (size_t idx = 0; idx < source_part_readers.size(); ++idx)
     {
-        if (!has_group)
-            return;
+        const auto & diff = diff_bitmaps[idx];
+        if (!diff || diff->empty())
+            continue;
 
-        if (all_deleted_in_group)
+        auto iter = source_part_readers[idx].reader->newIterator(opts);
+        for (iter->SeekToFirst(); iter->Valid(); iter->Next())
         {
-            key_batch.push_back(current_key);
+            if (unlikely(!iter->status().ok()))
+                throw Exception(ErrorCodes::INCORRECT_DATA,
+                    "SST iterator error during delete mark propagation: {}", iter->status().ToString());
+
+            auto val = iter->value();
+            if (unlikely(val.empty()))
+                continue;
+
+            auto entry = decodeUniqueValueEntry(val.data(), val.size());
+            if (!diff->contains(entry.part_offset))
+                continue;
+
+            key_batch.push_back(iter->key().ToString());
             ++keys_collected;
 
             if (key_batch.size() >= MULTI_GET_BATCH_SIZE)
                 flushBatch();
         }
-    };
-
-    for (; merge_iter.valid(); merge_iter.next())
-    {
-        auto key = merge_iter.key();
-        auto val = merge_iter.value();
-
-        if (unlikely(val.empty()))
-            continue;
-
-        size_t idx = merge_iter.currentIndex();
-        auto entry = decodeUniqueValueEntry(val.data(), val.size());
-
-        if (!has_group || current_key != key.ToString())
-        {
-            /// Finalize the previous key group.
-            finalizeGroup();
-
-            /// Start a new key group.
-            current_key = key.ToString();
-            has_group = true;
-
-            /// Check if this entry is in the diff bitmap for its source part.
-            all_deleted_in_group = diff_bitmaps[idx]
-                && diff_bitmaps[idx]->contains(entry.part_offset);
-        }
-        else
-        {
-            /// Same key, another source part — AND the deletion status.
-            if (all_deleted_in_group)
-            {
-                bool this_deleted = diff_bitmaps[idx]
-                    && diff_bitmaps[idx]->contains(entry.part_offset);
-                all_deleted_in_group = this_deleted;
-            }
-        }
     }
-
-    /// Finalize the last key group.
-    finalizeGroup();
 
     /// Flush remaining keys.
     flushBatch();
@@ -672,7 +633,7 @@ static void propagateDeletedKeysByMergingIterator(
         result_bitmap = std::move(bitmap);
 
     LOG_TEST(log,
-        "propagateDeletedKeysByMergingIterator: keys_collected={}, marked={}, elapsed={}us",
+        "propagateDeletedKeysPerSourcePart: keys_collected={}, marked={}, elapsed={}us",
         keys_collected, marked, watch.elapsedMicroseconds());
 }
 
@@ -744,15 +705,14 @@ void MergeTreeDedupPartManager::tryDedupDeletedKeysFromSourceParts(
         return;
     }
 
-    /// Use a multi-way merge iterator over all source parts' SSTs to walk keys
-    /// in sorted order. For each key group (same key across parts), only propagate
-    /// the deletion when ALL entries are deleted — meaning a concurrent INSERT
-    /// deleted the key from every source part that had it.
+    /// For each source part, scan its SST for keys whose offsets are in the diff
+    /// bitmap (newly deleted by concurrent INSERTs), then look them up in the
+    /// merged part's SST to propagate the deletion.
     auto merged_sst_reader = new_part->getOrOpenSSTReader(metadata_snapshot);
 
     ProjectionIndexBitmapPtr result_bitmap;
 
-    propagateDeletedKeysByMergingIterator(
+    propagateDeletedKeysPerSourcePart(
         source_part_readers, diff_bitmaps,
         merged_sst_reader, new_part->rows_count,
         result_bitmap, log);
