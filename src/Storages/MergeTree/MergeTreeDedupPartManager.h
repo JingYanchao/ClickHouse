@@ -27,6 +27,8 @@ using ProjectionIndexBitmapPtr = std::shared_ptr<ProjectionIndexBitmap>;
 
 using PartDeleteBitmapMap = std::unordered_map<const IMergeTreeDataPart *, ProjectionIndexBitmapPtr>;
 
+
+
 struct UniqueProcessLock
 {
     explicit UniqueProcessLock(std::mutex & unique_process_lock_);
@@ -55,7 +57,13 @@ explicit MergeTreeDedupPartManager(const MergeTreeData & storage_);
     /// Populates delta_deleted_rows_map with rows to be deleted.
     /// The op parameter indicates how this part was produced (insert, merge, etc.),
     /// enabling optimization strategies (e.g. skipping older parts for merge).
-    void dedupPart(const DataPartPtr & new_part, MergeTreeData::CommitOperation op = MergeTreeData::CommitOperation::Insert);
+    /// The optional delete_mark_snapshots carries a snapshot of source parts'
+    /// delete marks taken at merge/mutation start, enabling diff-based dedup
+    /// that only processes newly deleted keys instead of scanning all keys.
+    void dedupPart(
+        const DataPartPtr & new_part,
+        MergeTreeData::CommitOperation op = MergeTreeData::CommitOperation::Insert,
+        const MergeTreeData::DeleteMarkSnapshotMap & source_part_delete_mark_snapshots = {});
 
     /// Apply accumulated delta delete bitmaps to each part's delete_mark_bitmap.
     /// Should be called under DataPartsLock to ensure atomicity with part state transitions.
@@ -112,6 +120,9 @@ explicit MergeTreeDedupPartManager(const MergeTreeData & storage_);
 
         bool valid() const { return !min_heap.empty(); }
         void seekToFirst();
+        /// Seek all underlying iterators to `target` and rebuild the heap.
+        /// Each SST iterator uses O(log N) binary search on index/data blocks.
+        void seek(const rocksdb::Slice & target);
         void next();
 
         rocksdb::Slice key() const { return iters[min_heap.top()]->key(); }
@@ -164,7 +175,7 @@ private:
         const StorageMetadataPtr & metadata_snapshot,
         MergeTreeData::DataPartsVector & visible_parts);
 
-    /// Dedup path for MERGE/MUTATION-produced parts: filter out source parts
+    /// Dedup path for MERGE-produced parts: filter out source parts
     /// (covered by the merged part's block range), then propagate any delete
     /// marks from source parts into the merged part via deleted-keys optimization.
     /// No cross-part dedup is needed because merge only combines existing data
@@ -172,7 +183,21 @@ private:
     void dedupForMerge(
         const DataPartPtr & new_part,
         const StorageMetadataPtr & metadata_snapshot,
-        MergeTreeData::DataPartsVector & visible_parts);
+        MergeTreeData::DataPartsVector & visible_parts,
+        const MergeTreeData::DeleteMarkSnapshotMap & delete_mark_snapshots);
+
+    /// Dedup path for MUTATION-produced parts: a mutation transforms exactly
+    /// one source part into one new part.
+    /// - If row counts match (e.g. ALTER UPDATE), clone the source part's
+    ///   delete mark bitmap directly — row offsets are preserved.
+    /// - If the new part has fewer rows (e.g. ALTER DELETE removed rows),
+    ///   propagate deleted keys from the source part via SST lookup, reusing
+    ///   the same algorithm as `tryDedupDeletedKeysFromSourceParts`.
+    void dedupForMutation(
+        const DataPartPtr & new_part,
+        const StorageMetadataPtr & metadata_snapshot,
+        MergeTreeData::DataPartsVector & visible_parts,
+        const MergeTreeData::DeleteMarkSnapshotMap & delete_mark_snapshots);
 
     /// Build delete marks for all parts in a single partition using a
     /// multi-way merge of their SST iterators. This is O(N·log(N)·K)
@@ -195,7 +220,8 @@ private:
     void tryDedupDeletedKeysFromSourceParts(
         const DataPartPtr & new_part,
         const DataPartsVector & source_parts,
-        const StorageMetadataPtr & metadata_snapshot);
+        const StorageMetadataPtr & metadata_snapshot,
+        const MergeTreeData::DeleteMarkSnapshotMap & source_delete_mark_snapshots = {});
 
     const MergeTreeData & storage;
     std::mutex unique_process_mutex;

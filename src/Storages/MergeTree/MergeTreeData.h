@@ -365,6 +365,15 @@ public:
         Fetch,     /// Replicated fetch from another replica (future use)
     };
 
+    /// Context passed to the before-commit hook.
+    /// Bundles the operation type and any extra data (e.g. delete mark snapshots)
+    /// so that Transaction only needs a single field for the hook.
+    struct BeforeCommitHookContext
+    {
+        CommitOperation operation = CommitOperation::Insert;
+        std::any data;  /// Arbitrary payload, e.g. DeleteMarkSnapshotMap
+    };
+
     class Transaction : private boost::noncopyable
     {
     public:
@@ -373,8 +382,10 @@ public:
         DataPartsVector commit();
         DataPartsVector commit(DataPartsLock & lock);
 
-        void setCommitOperation(CommitOperation op) { commit_operation = op; }
-        CommitOperation getCommitOperation() const { return commit_operation; }
+        /// Set/get the context passed to the before-commit hook.
+        /// Bundles operation type + arbitrary payload (e.g. delete mark snapshots).
+        void setBeforeCommitHookContext(BeforeCommitHookContext ctx) { before_commit_hook_context = std::move(ctx); }
+        const BeforeCommitHookContext & getBeforeCommitHookContext() const { return before_commit_hook_context; }
 
         /// Rename should be done explicitly, before calling commit(), to
         /// guarantee that no lock held during rename (since rename is IO
@@ -405,7 +416,7 @@ public:
 
         MutableDataParts precommitted_parts;
         MutableDataParts precommitted_parts_need_rename;
-        CommitOperation commit_operation = CommitOperation::Insert;
+        BeforeCommitHookContext before_commit_hook_context;
     };
 
     using TransactionUniquePtr = std::unique_ptr<Transaction>;
@@ -566,7 +577,7 @@ public:
     /// Hook called by Transaction::commit BEFORE lockParts.
     /// Used by UniqueMergeTree for dedup; returns an RAII guard
     /// (e.g. UniqueProcessLock) that must stay alive until commit finishes.
-    using BeforeTransactionCommitHook = std::function<std::any(const MutableDataParts & parts, CommitOperation op)>;
+    using BeforeTransactionCommitHook = std::function<std::any(const MutableDataParts & parts, const BeforeCommitHookContext & context)>;
 
     void setBeforeTransactionCommitHook(BeforeTransactionCommitHook hook) { before_transaction_commit_hook = std::move(hook); }
 
@@ -640,6 +651,10 @@ public:
 
     using MutationsSnapshotPtr = std::shared_ptr<const IMutationsSnapshot>;
 
+    /// Snapshot of source parts' delete mark bitmaps, keyed by part name.
+    /// Used to compute the diff between merge-start and commit-time delete marks.
+    using DeleteMarkSnapshotMap = std::unordered_map<String, ProjectionIndexBitmapPtr>;
+
     /// Snapshot for MergeTree contains the current set of data parts
     /// and mutations required to be applied at the moment of the start of query.
     struct SnapshotData : public StorageSnapshot::Data
@@ -654,18 +669,19 @@ public:
 
         MutationsSnapshotPtr mutations_snapshot;
 
-        std::unordered_map<String, ProjectionIndexBitmapPtr> delete_mark_buffer_map;
+        DeleteMarkSnapshotMap delete_mark_buffer_map;
     };
 
-    StorageSnapshot::DataPtr getStorageSnapshotDataAttachPartsOnMerge(DataPartsVector & parts) const;
+    /// Snapshot the current delete mark bitmaps for the given parts.
+    /// Should be called at merge/mutation start (before the merge executes)
+    /// so that at commit time we can compute the diff and only process
+    /// newly deleted keys. Thread-safe: reads COW bitmap pointers.
+    DeleteMarkSnapshotMap getDeleteMarksSnapshot(const DataPartsVector & parts) const;
 
     StorageSnapshotPtr getStorageSnapshot(const StorageMetadataPtr & metadata_snapshot, ContextPtr query_context) const override;
 
     /// The same as above but does not hold vector of data parts.
     StorageSnapshotPtr getStorageSnapshotWithoutData(const StorageMetadataPtr & metadata_snapshot, ContextPtr query_context) const override;
-
-    /// Build snapshot data for merge, filtering out empty/fully-deleted parts and collecting delete mark bitmaps.
-    StorageSnapshot::DataPtr getStorageSnapshotDataAttachPartsOnMerge(DataPartsVector & parts);
 
     /// Load the set of data parts from disk. Call once - immediately after the object is created.
     void loadDataParts(bool skip_sanity_checks, std::optional<std::unordered_set<std::string>> expected_parts);

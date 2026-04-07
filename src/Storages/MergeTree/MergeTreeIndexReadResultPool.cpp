@@ -186,6 +186,15 @@ void ProjectionIndexBitmap::unionWith(const ProjectionIndexBitmap & other) // NO
         roaring64_bitmap_or_inplace(data.bitmap64, other.data.bitmap64);
 }
 
+void ProjectionIndexBitmap::andNotWith(const ProjectionIndexBitmap & other) // NOLINT
+{
+    chassert(type == other.type);
+    if (type == BitmapType::Bitmap32)
+        roaring_bitmap_andnot_inplace(data.bitmap32, other.data.bitmap32);
+    else
+        roaring64_bitmap_andnot_inplace(data.bitmap64, other.data.bitmap64);
+}
+
 size_t ProjectionIndexBitmap::cardinality() const
 {
     if (type == BitmapType::Bitmap32)

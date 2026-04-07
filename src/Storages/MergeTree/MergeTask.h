@@ -176,6 +176,13 @@ public:
         return std::move(global_ctx->projections_merge_time);
     }
 
+    /// Pass pre-computed delete mark snapshots so that the merge reader
+    /// and the commit-time dedup use the same snapshot.
+    void setDeleteMarkSnapshots(MergeTreeData::DeleteMarkSnapshotMap snapshots)
+    {
+        global_ctx->delete_mark_snapshots = std::move(snapshots);
+    }
+
     bool execute();
 
     void cancel() noexcept;
@@ -214,6 +221,12 @@ private:
         ActionBlocker * ttl_merges_blocker{nullptr};
         StorageSnapshotPtr storage_snapshot{nullptr};
         StorageMetadataPtr metadata_snapshot{nullptr};
+
+        /// Pre-computed delete mark snapshots passed from the outer task.
+        /// When set, the merge prepare stage uses these directly instead of
+        /// re-snapshotting, so that the merge reader and the commit-time dedup
+        /// see exactly the same snapshot.
+        MergeTreeData::DeleteMarkSnapshotMap delete_mark_snapshots;
         FutureMergedMutatedPartPtr future_part{nullptr};
         std::vector<AlterConversionsPtr> alter_conversions;
         ProjectionDescriptionRawPtr projection{nullptr};

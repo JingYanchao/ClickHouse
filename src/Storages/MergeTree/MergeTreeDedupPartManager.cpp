@@ -9,6 +9,7 @@
 #include <Common/logger_useful.h>
 #include <Common/setThreadName.h>
 #include <Common/threadPoolCallbackRunner.h>
+#include <base/scope_guard.h>
 
 namespace CurrentMetrics
 {
@@ -209,6 +210,35 @@ static void deduplicateKeyByBucket(
         shard_id, num_keys, processed, shard_watch.elapsedMicroseconds());
 }
 
+/// Sample boundary keys from a single SST reader by scanning every `stride`-th key.
+/// Returns up to `max_shards` boundary keys that partition the key space into roughly
+/// equal-sized shards. Shared by INSERT and Merge/Mutation parallel dedup paths.
+static std::vector<std::string> sampleBoundaryKeysFromSST(
+    const SSTFileReaderPtr & reader,
+    size_t total_keys,
+    size_t max_shards)
+{
+    const size_t num_shards = (total_keys < MIN_KEYS_FOR_PARALLEL) ? 1 : std::min(max_shards, total_keys);
+    const size_t stride = total_keys / num_shards;
+
+    std::vector<std::string> boundary_keys;
+    boundary_keys.reserve(num_shards);
+
+    Stopwatch boundary_scan_watch;
+    rocksdb::ReadOptions opts;
+    opts.fill_cache = false;
+    auto scan_iter = reader->newIterator(opts);
+    size_t idx = 0;
+    for (scan_iter->SeekToFirst(); scan_iter->Valid(); scan_iter->Next(), ++idx)
+    {
+        if (idx % stride == 0 && boundary_keys.size() < num_shards)
+            boundary_keys.push_back(scan_iter->key().ToString());
+    }
+    ProfileEvents::increment(ProfileEvents::UniqueKeyDedupBoundaryKeyScanMicroseconds, boundary_scan_watch.elapsedMicroseconds());
+
+    return boundary_keys;
+}
+
 /// Deduplicate keys from the input part against visible parts using parallel threads.
 /// Splits the input SST key space into shards, processes each in a separate thread,
 /// then merges per-shard delta bitmaps into a result map.
@@ -222,6 +252,13 @@ static PartDeleteBitmapMap dedupKeysThroughNewCommitParts(
     if (visible_parts.empty())
         return result;
 
+    /// Release ReadBuffer memory (~1MB per file) when cross-part dedup is done.
+    /// Bloom filter and index blocks remain pinned in the cached SSTFileReader.
+    SCOPE_EXIT({
+        input.releaseBufferMemory();
+        MergeTreeDedupPartManager::releaseAllBufferMemory(visible_parts);
+    });
+
     /// Get total key count from SST properties — O(1), no scanning needed.
     auto props = input.reader->getProperties();
     const size_t total_keys = props ? props->num_entries : 0;
@@ -232,22 +269,7 @@ static PartDeleteBitmapMap dedupKeysThroughNewCommitParts(
     const size_t num_threads = (total_keys < MIN_KEYS_FOR_PARALLEL) ? 1 : std::min(DEDUP_MAX_PARALLEL, total_keys);
     const size_t stride = total_keys / num_threads;
 
-    /// One sequential scan to sample boundary keys for each shard.
-    std::vector<std::string> boundary_keys;
-    boundary_keys.reserve(num_threads);
-    {
-        Stopwatch boundary_scan_watch;
-        rocksdb::ReadOptions opts;
-        opts.fill_cache = false;
-        auto scan_iter = input.reader->newIterator(opts);
-        size_t idx = 0;
-        for (scan_iter->SeekToFirst(); scan_iter->Valid(); scan_iter->Next(), ++idx)
-        {
-            if (idx % stride == 0 && boundary_keys.size() < num_threads)
-                boundary_keys.push_back(scan_iter->key().ToString());
-        }
-        ProfileEvents::increment(ProfileEvents::UniqueKeyDedupBoundaryKeyScanMicroseconds, boundary_scan_watch.elapsedMicroseconds());
-    }
+    auto boundary_keys = sampleBoundaryKeysFromSST(input.reader, total_keys, DEDUP_MAX_PARALLEL);
 
     const size_t actual_shards = boundary_keys.size();
     if (actual_shards == 0)
@@ -312,11 +334,6 @@ static PartDeleteBitmapMap dedupKeysThroughNewCommitParts(
 
     /// Input part can also have rows deleted when visible parts win.
     mergeDeltaBitmaps(input.part.get(), input.part->rows_count);
-
-    /// Release ReadBuffer memory (~1MB per file) now that cross-part dedup is done.
-    /// Bloom filter and index blocks remain pinned in the cached SSTFileReader.
-    input.releaseBufferMemory();
-    MergeTreeDedupPartManager::releaseAllBufferMemory(visible_parts);
 
     return result;
 }
@@ -411,12 +428,13 @@ void MergeTreeDedupPartManager::dedupForInsert(
 void MergeTreeDedupPartManager::dedupForMerge(
     const DataPartPtr & new_part,
     const StorageMetadataPtr & metadata_snapshot,
-    MergeTreeData::DataPartsVector & visible_parts)
+    MergeTreeData::DataPartsVector & visible_parts,
+    const MergeTreeData::DeleteMarkSnapshotMap & source_delete_mark_snapshots)
 {
     /// Collect source parts: those covered by the merged part's block range.
     /// These are the merge's input parts that will become Outdated after commit.
     ///
-    /// Merge/mutation only combines existing data — it does not introduce new
+    /// Merge only combines existing data — it does not introduce new
     /// unique keys. The only dedup work needed is propagating delete marks:
     /// if a concurrent INSERT marked a row as deleted in a source part, the
     /// corresponding row in the merged part must also be marked.
@@ -446,13 +464,223 @@ void MergeTreeDedupPartManager::dedupForMerge(
     }
 
     if (new_part->rows_count)
-        tryDedupDeletedKeysFromSourceParts(new_part, source_parts, metadata_snapshot);
+        tryDedupDeletedKeysFromSourceParts(new_part, source_parts, metadata_snapshot, source_delete_mark_snapshots);
+}
+
+void MergeTreeDedupPartManager::dedupForMutation(
+    const DataPartPtr & new_part,
+    const StorageMetadataPtr & metadata_snapshot,
+    MergeTreeData::DataPartsVector & visible_parts,
+    const MergeTreeData::DeleteMarkSnapshotMap & source_delete_mark_snapshots)
+{
+    /// Mutation transforms exactly one source part into one new part.
+    /// The source part has the same block range but a lower mutation version.
+    DataPartPtr source_part;
+    for (const auto & part : visible_parts)
+    {
+        if (part->info.min_block == new_part->info.min_block
+            && part->info.max_block == new_part->info.max_block)
+        {
+            source_part = part;
+            break;
+        }
+    }
+
+    if (!source_part)
+    {
+        LOG_DEBUG(log, "dedupForMutation: part '{}', no matching source part found, skip", new_part->name);
+        return;
+    }
+
+    auto source_delete_mark = source_part->getDeleteMarkBitmap();
+    if (!source_delete_mark || source_delete_mark->empty())
+    {
+        LOG_TRACE(log, "dedupForMutation: part '{}', source part '{}' has no delete marks, skip",
+            new_part->name, source_part->name);
+        return;
+    }
+
+    /// Fast path: if row counts match (e.g. ALTER UPDATE that does not remove rows),
+    /// row offsets are preserved — clone the delete mark bitmap directly.
+    if (new_part->rows_count == source_part->rows_count)
+    {
+        auto cloned_bitmap = ProjectionIndexBitmap::create(new_part->rows_count);
+        cloned_bitmap->unionWith(*source_delete_mark);
+        delta_deleted_rows_map[new_part.get()] = std::move(cloned_bitmap);
+
+        LOG_DEBUG(log, "dedupForMutation: part '{}', cloned {} delete marks from source part '{}' (rows match)",
+            new_part->name, source_delete_mark->cardinality(), source_part->name);
+        return;
+    }
+
+    /// Slow path: mutation removed some rows (e.g. ALTER DELETE), so row offsets
+    /// changed. We need to look up deleted keys from the source part in the new
+    /// part's SST to find their new offsets. Reuse the same algorithm as merge.
+    if (new_part->rows_count)
+    {
+        DataPartsVector source_parts = {source_part};
+        tryDedupDeletedKeysFromSourceParts(new_part, source_parts, metadata_snapshot, source_delete_mark_snapshots);
+    }
+
+    LOG_DEBUG(log, "dedupForMutation: part '{}', source part '{}', source_rows={}, new_rows={}",
+        new_part->name, source_part->name, source_part->rows_count, new_part->rows_count);
+}
+
+/// Propagate deleted keys from source parts to the merged part using a multi-way
+/// merge iterator over all source parts' SSTs.
+///
+/// The merging iterator produces keys in sorted order; when the same key appears
+/// in multiple source parts, entries are grouped together. For each key group we
+/// check whether ALL source-part entries that contain this key have been newly
+/// deleted (present in the diff bitmap). Only when every entry is deleted do we
+/// propagate the deletion to the merged part — because if any source-part entry
+/// is alive, the merge inherited the key from that entry.
+///
+/// Propagated keys are batched (MULTI_GET_BATCH_SIZE) for efficient multiGet
+/// against the merged part's SST.
+static void propagateDeletedKeysByMergingIterator(
+    std::vector<PartWithSSTReader> & source_part_readers,
+    const std::vector<ProjectionIndexBitmapPtr> & diff_bitmaps,
+    const SSTFileReaderPtr & merged_sst_reader,
+    size_t merged_part_rows,
+    ProjectionIndexBitmapPtr & result_bitmap,
+    LoggerPtr log)
+{
+    Stopwatch watch;
+
+    /// Build the merging iterator over all source parts' SSTs.
+    std::vector<std::unique_ptr<rocksdb::Iterator>> sst_iters;
+    std::vector<SSTFileReaderPtr> sst_readers;
+    sst_iters.reserve(source_part_readers.size());
+    sst_readers.reserve(source_part_readers.size());
+
+    rocksdb::ReadOptions opts;
+    opts.fill_cache = false;
+    for (auto & [part, reader] : source_part_readers)
+    {
+        sst_iters.push_back(reader->newIterator(opts));
+        sst_readers.push_back(reader);
+    }
+
+    MergeTreeDedupPartManager::SSTMergingIterator merge_iter(
+        std::move(sst_iters), std::move(sst_readers));
+    merge_iter.seekToFirst();
+
+    auto bitmap = ProjectionIndexBitmap::create(merged_part_rows);
+    size_t marked = 0;
+    size_t keys_collected = 0;
+
+    /// Reusable batch buffer for streaming multiGet against the merged part.
+    std::vector<std::string> key_batch;
+    key_batch.reserve(MULTI_GET_BATCH_SIZE);
+
+    /// Flush the current batch: look up keys in the merged part and mark deletions.
+    auto flushBatch = [&]()
+    {
+        if (key_batch.empty())
+            return;
+
+        std::vector<rocksdb::Slice> key_slices;
+        key_slices.reserve(key_batch.size());
+        for (const auto & k : key_batch)
+            key_slices.emplace_back(k);
+
+        std::vector<std::string> values;
+        auto statuses = merged_sst_reader->multiGet(key_slices, &values);
+
+        for (size_t j = 0; j < statuses.size(); ++j)
+        {
+            if (!statuses[j].ok())
+                continue;
+
+            const auto & val = values[j];
+            if (unlikely(val.empty()))
+                continue;
+
+            auto merged_entry = decodeUniqueValueEntry(val.data(), val.size());
+            bitmap->add(merged_entry.part_offset);
+            ++marked;
+        }
+
+        key_batch.clear();
+    };
+
+    /// Walk the merged stream, grouping entries by key.
+    /// For each key group, track whether ALL entries are in the diff bitmap.
+    std::string current_key;
+    bool all_deleted_in_group = true;
+    bool has_group = false;
+
+    auto finalizeGroup = [&]()
+    {
+        if (!has_group)
+            return;
+
+        if (all_deleted_in_group)
+        {
+            key_batch.push_back(current_key);
+            ++keys_collected;
+
+            if (key_batch.size() >= MULTI_GET_BATCH_SIZE)
+                flushBatch();
+        }
+    };
+
+    for (; merge_iter.valid(); merge_iter.next())
+    {
+        auto key = merge_iter.key();
+        auto val = merge_iter.value();
+
+        if (unlikely(val.empty()))
+            continue;
+
+        size_t idx = merge_iter.currentIndex();
+        auto entry = decodeUniqueValueEntry(val.data(), val.size());
+
+        if (!has_group || current_key != key.ToString())
+        {
+            /// Finalize the previous key group.
+            finalizeGroup();
+
+            /// Start a new key group.
+            current_key = key.ToString();
+            has_group = true;
+
+            /// Check if this entry is in the diff bitmap for its source part.
+            all_deleted_in_group = diff_bitmaps[idx]
+                && diff_bitmaps[idx]->contains(entry.part_offset);
+        }
+        else
+        {
+            /// Same key, another source part — AND the deletion status.
+            if (all_deleted_in_group)
+            {
+                bool this_deleted = diff_bitmaps[idx]
+                    && diff_bitmaps[idx]->contains(entry.part_offset);
+                all_deleted_in_group = this_deleted;
+            }
+        }
+    }
+
+    /// Finalize the last key group.
+    finalizeGroup();
+
+    /// Flush remaining keys.
+    flushBatch();
+
+    if (!bitmap->empty())
+        result_bitmap = std::move(bitmap);
+
+    LOG_TEST(log,
+        "propagateDeletedKeysByMergingIterator: keys_collected={}, marked={}, elapsed={}us",
+        keys_collected, marked, watch.elapsedMicroseconds());
 }
 
 void MergeTreeDedupPartManager::tryDedupDeletedKeysFromSourceParts(
     const DataPartPtr & new_part,
     const DataPartsVector & source_parts,
-    const StorageMetadataPtr & metadata_snapshot)
+    const StorageMetadataPtr & metadata_snapshot,
+    const MergeTreeData::DeleteMarkSnapshotMap & delete_mark_snapshots)
 {
     Stopwatch watch;
     auto source_part_readers = openSSTReadersForParts(source_parts, metadata_snapshot);
@@ -465,165 +693,84 @@ void MergeTreeDedupPartManager::tryDedupDeletedKeysFromSourceParts(
         return;
     }
 
-    /// Snapshot each source part's delete bitmap (COW pointer, cheap copy).
+    /// Ensure SST buffer memory is released on all exit paths.
+    SCOPE_EXIT({ releaseAllBufferMemory(source_part_readers); });
+
+    /// Compute diff bitmaps: diff = current_delete_marks AND NOT snapshot_delete_marks.
+    /// Only entries in the diff were newly deleted by concurrent INSERTs during merge/mutation.
+    /// When snapshots are not available (e.g. startup rebuild), all current delete marks
+    /// are treated as "new" (diff = full delete marks).
     /// Index matches source_part_readers.
-    std::vector<ProjectionIndexBitmapPtr> delete_bitmaps;
-    delete_bitmaps.reserve(source_part_readers.size());
-    bool any_deletes = false;
+    std::vector<ProjectionIndexBitmapPtr> diff_bitmaps;
+    diff_bitmaps.reserve(source_part_readers.size());
+    size_t total_diff_count = 0;
+
     for (const auto & [part, reader] : source_part_readers)
     {
         auto delete_mark = part->getDeleteMarkBitmap();
-        if (delete_mark && !delete_mark->empty())
-            any_deletes = true;
-        delete_bitmaps.push_back(std::move(delete_mark));
-    }
-
-    if (!any_deletes)
-    {
-        LOG_DEBUG(log,
-            "tryDedupDeletedKeysFromSourceParts: part '{}', no source parts have delete marks, skip, elapsed={}us",
-            new_part->name, watch.elapsedMicroseconds());
-        releaseAllBufferMemory(source_part_readers);
-        return;
-    }
-
-    /// Step 1: Build a merging iterator over all source parts' SSTs.
-    /// Walk in key order; for each key group, determine whether ALL entries
-    /// are deleted. Only keys where every source entry is deleted need to be
-    /// propagated to the merged part — those are the keys deleted by a
-    /// concurrent INSERT (not by pre-snapshot cross-part dedup between
-    /// source parts, where one entry would still be alive).
-    rocksdb::ReadOptions opts;
-    opts.fill_cache = false;
-
-    std::vector<std::unique_ptr<rocksdb::Iterator>> sst_iters;
-    std::vector<SSTFileReaderPtr> sst_readers;
-    sst_iters.reserve(source_part_readers.size());
-    sst_readers.reserve(source_part_readers.size());
-
-    for (const auto & [part, reader] : source_part_readers)
-    {
-        sst_iters.push_back(reader->newIterator(opts));
-        sst_readers.push_back(reader);
-    }
-
-    SSTMergingIterator merge_iter(std::move(sst_iters), std::move(sst_readers));
-    merge_iter.seekToFirst();
-
-    /// Step 2: Open SST reader for the merged new part (used for multiGet lookups).
-    auto merged_sst_reader = new_part->getOrOpenSSTReader(metadata_snapshot);
-
-    /// Step 3: Walk the merged stream, grouping entries by key.
-    /// For each key group, if any entry is NOT deleted, the key survives in
-    /// at least one source part — the merged part inherited it from that
-    /// source, so no propagation is needed.
-    /// Only when ALL entries are deleted do we collect the key for multiGet.
-    size_t total_marked = 0;
-    size_t total_source_keys_scanned = 0;
-    auto merged_delete_bitmap = ProjectionIndexBitmap::create(new_part->rows_count);
-
-    std::vector<std::string> deleted_key_batch;
-    deleted_key_batch.reserve(MULTI_GET_BATCH_SIZE);
-
-    auto lookupAndMarkDeletedKeys = [&]()
-    {
-        if (deleted_key_batch.empty())
-            return;
-
-        std::vector<rocksdb::Slice> key_slices;
-        key_slices.reserve(deleted_key_batch.size());
-        for (const auto & k : deleted_key_batch)
-            key_slices.emplace_back(k);
-
-        std::vector<std::string> values;
-        auto statuses = merged_sst_reader->multiGet(key_slices, &values);
-
-        for (size_t i = 0; i < statuses.size(); ++i)
+        if (!delete_mark || delete_mark->empty())
         {
-            if (!statuses[i].ok())
-                continue;
-
-            const auto & val = values[i];
-            if (unlikely(val.empty()))
-                continue;
-
-            auto merged_entry = decodeUniqueValueEntry(val.data(), val.size());
-            merged_delete_bitmap->add(merged_entry.part_offset);
-            ++total_marked;
-        }
-
-        deleted_key_batch.clear();
-    };
-
-    std::string current_group_key;
-    bool current_group_all_deleted = true;
-
-    auto flushKeyGroup = [&]()
-    {
-        if (current_group_key.empty())
-            return;
-
-        if (current_group_all_deleted)
-        {
-            deleted_key_batch.push_back(current_group_key);
-            if (deleted_key_batch.size() >= MULTI_GET_BATCH_SIZE)
-                lookupAndMarkDeletedKeys();
-        }
-    };
-
-    for (; merge_iter.valid(); merge_iter.next())
-    {
-        ++total_source_keys_scanned;
-
-        auto key = merge_iter.key();
-        auto val = merge_iter.value();
-        if (unlikely(val.empty()))
+            diff_bitmaps.push_back(nullptr);
             continue;
+        }
 
-        auto entry = decodeUniqueValueEntry(val.data(), val.size());
-        size_t idx = merge_iter.currentIndex();
-
-        /// Check whether this entry is deleted in its source part.
-        bool is_deleted = delete_bitmaps[idx] && delete_bitmaps[idx]->contains(entry.part_offset);
-
-        if (current_group_key != key.ToString())
+        auto it = delete_mark_snapshots.find(part->name);
+        if (it == delete_mark_snapshots.end() || !it->second)
         {
-            /// Flush the previous key group.
-            flushKeyGroup();
-
-            /// Start a new key group.
-            current_group_key = key.ToString();
-            current_group_all_deleted = is_deleted;
+            /// No snapshot for this part — all current delete marks are "new".
+            total_diff_count += delete_mark->cardinality();
+            diff_bitmaps.push_back(std::move(delete_mark));
         }
         else
         {
-            /// Same key group — if any entry is alive, the group is not all-deleted.
-            if (!is_deleted)
-                current_group_all_deleted = false;
+            /// Compute diff = current AND NOT snapshot.
+            auto diff = ProjectionIndexBitmap::create(part->rows_count);
+            diff->unionWith(*delete_mark);
+            diff->andNotWith(*it->second);
+
+            if (!diff->empty())
+                total_diff_count += diff->cardinality();
+
+            diff_bitmaps.push_back(std::move(diff));
         }
     }
 
-    /// Flush the last key group.
-    flushKeyGroup();
+    /// If no diffs at all, no concurrent INSERT deleted any key — skip entirely.
+    if (total_diff_count == 0)
+    {
+        LOG_DEBUG(log,
+            "tryDedupDeletedKeysFromSourceParts: part '{}', no diff delete marks, skip, elapsed={}us",
+            new_part->name, watch.elapsedMicroseconds());
+        return;
+    }
 
-    /// Flush remaining batch.
-    lookupAndMarkDeletedKeys();
+    /// Use a multi-way merge iterator over all source parts' SSTs to walk keys
+    /// in sorted order. For each key group (same key across parts), only propagate
+    /// the deletion when ALL entries are deleted — meaning a concurrent INSERT
+    /// deleted the key from every source part that had it.
+    auto merged_sst_reader = new_part->getOrOpenSSTReader(metadata_snapshot);
 
-    /// Step 4: Store the result in delta_deleted_rows_map.
-    if (!merged_delete_bitmap->empty())
-        delta_deleted_rows_map[new_part.get()] = std::move(merged_delete_bitmap);
+    ProjectionIndexBitmapPtr result_bitmap;
+
+    propagateDeletedKeysByMergingIterator(
+        source_part_readers, diff_bitmaps,
+        merged_sst_reader, new_part->rows_count,
+        result_bitmap, log);
+
+    if (result_bitmap && !result_bitmap->empty())
+        delta_deleted_rows_map[new_part.get()] = std::move(result_bitmap);
 
     merged_sst_reader->releaseBufferMemory();
-    releaseAllBufferMemory(source_part_readers);
 
     LOG_DEBUG(log,
-        "tryDedupDeletedKeysFromSourceParts: part '{}', source_parts={}, "
-        "source_keys_scanned={}, marked_keys={}, elapsed={}us",
-        new_part->name, source_part_readers.size(),
-        total_source_keys_scanned, total_marked, watch.elapsedMicroseconds());
+        "tryDedupDeletedKeysFromSourceParts: part '{}', source_parts={}, diff_count={}, elapsed={}us",
+        new_part->name, source_part_readers.size(), total_diff_count, watch.elapsedMicroseconds());
 }
 
-void MergeTreeDedupPartManager::dedupPart(const DataPartPtr & new_part, MergeTreeData::CommitOperation op)
+void MergeTreeDedupPartManager::dedupPart(
+    const DataPartPtr & new_part,
+    MergeTreeData::CommitOperation op,
+    const MergeTreeData::DeleteMarkSnapshotMap & source_delete_mark_snapshots)
 {
     if (!new_part)
         return;
@@ -647,8 +794,10 @@ void MergeTreeDedupPartManager::dedupPart(const DataPartPtr & new_part, MergeTre
         return part->rows_count == 0 || part->name == new_part->name;
     });
 
-    if (op == MergeTreeData::CommitOperation::Merge || op == MergeTreeData::CommitOperation::Mutation)
-        dedupForMerge(new_part, metadata_snapshot, all_visible_parts);
+    if (op == MergeTreeData::CommitOperation::Merge)
+        dedupForMerge(new_part, metadata_snapshot, all_visible_parts, source_delete_mark_snapshots);
+    else if (op == MergeTreeData::CommitOperation::Mutation)
+        dedupForMutation(new_part, metadata_snapshot, all_visible_parts, source_delete_mark_snapshots);
     else
         dedupForInsert(new_part, metadata_snapshot, all_visible_parts);
 
@@ -684,6 +833,20 @@ void MergeTreeDedupPartManager::SSTMergingIterator::seekToFirst()
     }
 }
 
+void MergeTreeDedupPartManager::SSTMergingIterator::seek(const rocksdb::Slice & target)
+{
+    /// Rebuild the heap: each SST iterator uses O(log N) binary search
+    /// on index/data blocks, so total cost is O(K * log N_max + K * log K)
+    /// where K = number of iterators.
+    min_heap = MinHeap(Comparator(&iters));
+    for (size_t i = 0; i < iters.size(); ++i)
+    {
+        iters[i]->Seek(target);
+        if (iters[i]->Valid() && !iters[i]->key().empty())
+            min_heap.push(i);
+    }
+}
+
 void MergeTreeDedupPartManager::SSTMergingIterator::next()
 {
     chassert(valid());
@@ -713,6 +876,9 @@ void MergeTreeDedupPartManager::buildAllDeleteMarksForPartition(
     auto part_readers = openSSTReadersForParts(partition_parts, metadata_snapshot);
     if (part_readers.empty())
         return;
+
+    /// Ensure SST buffer memory is released when done.
+    SCOPE_EXIT({ releaseAllBufferMemory(part_readers); });
 
     /// Step 1: Build the merging iterator over all parts' SST files.
     std::vector<std::unique_ptr<rocksdb::Iterator>> sst_iters;
@@ -779,8 +945,6 @@ void MergeTreeDedupPartManager::buildAllDeleteMarksForPartition(
             }
         }
     }
-
-    releaseAllBufferMemory(part_readers);
 }
 
 void MergeTreeDedupPartManager::buildAllDeleteMarksOnStartup()

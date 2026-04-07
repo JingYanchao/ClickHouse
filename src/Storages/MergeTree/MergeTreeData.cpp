@@ -8505,7 +8505,7 @@ MergeTreeData::DataPartsVector MergeTreeData::Transaction::commit()
     /// The returned guard must stay alive until commit finishes.
     std::any before_commit_guard;
     if (data.before_transaction_commit_hook && !isEmpty())
-        before_commit_guard = data.before_transaction_commit_hook(precommitted_parts, commit_operation);
+        before_commit_guard = data.before_transaction_commit_hook(precommitted_parts, before_commit_hook_context);
 
     auto lock = data.lockParts();
     return commit(lock);
@@ -10566,17 +10566,17 @@ StorageMetadataPtr MergeTreeData::getInMemoryMetadataPtr(bool bypass_metadata_ca
 }
 
 
-StorageSnapshot::DataPtr MergeTreeData::getStorageSnapshotDataAttachPartsOnMerge(DataPartsVector & parts)
+MergeTreeData::DeleteMarkSnapshotMap MergeTreeData::getDeleteMarksSnapshot(const DataPartsVector & parts) const
 {
-    assert(supportsUpsert());
-    auto snapshot_data = std::make_unique<SnapshotData>();
+    DeleteMarkSnapshotMap snapshots;
     auto lock = readLockParts();
     for (const auto & part : parts)
     {
-        if (part->delete_mark_bitmap)
-            snapshot_data->delete_mark_buffer_map[part->name] = part->delete_mark_bitmap;
+        const auto delete_mark = part->getDeleteMarkBitmap();
+        if (delete_mark)
+            snapshots.emplace(part->name, delete_mark);
     }
-    return snapshot_data;
+    return snapshots;
 }
 
 StorageSnapshotPtr

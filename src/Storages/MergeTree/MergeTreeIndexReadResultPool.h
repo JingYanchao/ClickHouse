@@ -89,6 +89,9 @@ struct ProjectionIndexBitmap
 
     void intersectWith(const ProjectionIndexBitmap & other);
     void unionWith(const ProjectionIndexBitmap & other);
+    /// Compute difference: removes from this bitmap all values present in other.
+    /// Result is this AND NOT other.
+    void andNotWith(const ProjectionIndexBitmap & other);
     size_t cardinality() const;
     bool empty() const;
 

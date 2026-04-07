@@ -567,9 +567,12 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare() const
     global_ctx->storage_columns = global_ctx->metadata_snapshot->getColumns().getAllPhysical();
     if (global_ctx->data->supportsUpsert())
     {
-        // Create storage snapshot data under `lockParts.
-        auto storage_snapshot_data = global_ctx->data->getStorageSnapshotDataAttachPartsOnMerge(global_ctx->future_part->parts);
-        global_ctx->storage_snapshot = std::make_shared<StorageSnapshot>(*global_ctx->data, global_ctx->metadata_snapshot, std::move(storage_snapshot_data));
+        /// Directly copy the pre-computed snapshots into SnapshotData.
+        /// Both maps have the same type (unordered_map<String, ProjectionIndexBitmapPtr>)
+        /// and snapshotSourceDeleteMarks already excludes nullptr entries.
+        auto snapshot_data = std::make_unique<MergeTreeData::SnapshotData>();
+        snapshot_data->delete_mark_buffer_map = global_ctx->delete_mark_snapshots;
+        global_ctx->storage_snapshot = std::make_shared<StorageSnapshot>(*global_ctx->data, global_ctx->metadata_snapshot, std::move(snapshot_data));
     }
     else
         global_ctx->storage_snapshot = std::make_shared<StorageSnapshot>(*global_ctx->data, global_ctx->metadata_snapshot);

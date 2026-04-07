@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Storages/StorageMergeTree.h>
+#include <Storages/MergeTree/MergeTreeDedupPartManager.h>
 #include <memory>
 
 namespace DB
@@ -49,7 +50,7 @@ private:
     String unique_projection_name;
 
     /// BeforeTransactionCommitHook implementation.
-    std::any onBeforeTransactionCommit(const MutableDataParts & parts, CommitOperation op);
+    std::any onBeforeTransactionCommit(const MutableDataParts & parts, const BeforeCommitHookContext & context);
 };
 
 }

@@ -77,21 +77,25 @@ StorageUniqueMergeTree::StorageUniqueMergeTree(
     dedup_manager = std::make_shared<MergeTreeDedupPartManager>(*this);
 
     setBeforeTransactionCommitHook(
-        [this](const MutableDataParts & parts, CommitOperation op) -> std::any
+        [this](const MutableDataParts & parts, const BeforeCommitHookContext & context) -> std::any
         {
-            return onBeforeTransactionCommit(parts, op);
+            return onBeforeTransactionCommit(parts, context);
         });
 }
 
 std::any StorageUniqueMergeTree::onBeforeTransactionCommit(
-    const MutableDataParts & parts, CommitOperation op)
+    const MutableDataParts & parts, const BeforeCommitHookContext & before_commit_context)
 {
     /// Serialize concurrent commits: only one thread computes delete bitmaps at a time.
     auto unique_lock = dedup_manager->lockUniqueProcess();
 
+    DeleteMarkSnapshotMap delete_mark_snapshots;
+    if (before_commit_context.data.has_value())
+        delete_mark_snapshots = std::any_cast<DeleteMarkSnapshotMap>(before_commit_context.data);
+
     for (const auto & part : parts)
     {
-        dedup_manager->dedupPart(part, op);
+        dedup_manager->dedupPart(part, before_commit_context.operation, delete_mark_snapshots);
     }
 
     /// Wrap in shared_ptr because std::any requires CopyConstructible,
