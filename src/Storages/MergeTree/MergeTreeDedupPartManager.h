@@ -190,9 +190,8 @@ private:
     /// one source part into one new part.
     /// - If row counts match (e.g. ALTER UPDATE), clone the source part's
     ///   delete mark bitmap directly — row offsets are preserved.
-    /// - If the new part has fewer rows (e.g. ALTER DELETE removed rows),
-    ///   propagate deleted keys from the source part via SST lookup, reusing
-    ///   the same algorithm as `tryDedupDeletedKeysFromSourceParts`.
+    /// Mutation preserves row count, so row offsets are unchanged.
+    /// Simply clone the source part's delete mark bitmap to the new part.
     void dedupForMutation(
         const DataPartPtr & new_part,
         const StorageMetadataPtr & metadata_snapshot,

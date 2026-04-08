@@ -1,6 +1,7 @@
 #include <cstddef>
 #include <Storages/MergeTree/MutatePlainMergeTreeTask.h>
 
+#include <Storages/MergeTree/MergeTreeDedupPartManager.h>
 #include <Storages/StorageMergeTree.h>
 #include <Interpreters/TransactionLog.h>
 #include <Interpreters/Context.h>
@@ -79,15 +80,6 @@ void MutatePlainMergeTreeTask::prepare()
     mutate_task = storage.merger_mutator.mutatePartToTemporaryPart(
             future_part, metadata_snapshot, merge_mutate_entry->commands, merge_list_entry.get(),
             time(nullptr), task_context, merge_mutate_entry->txn, merge_mutate_entry->tagger->reserved_space, table_lock_holder);
-
-    /*/// Snapshot source parts' delete marks before the mutation starts.
-    if (storage.supportsUpsert())
-    {
-        DataPartsVector source_parts;
-        for (const auto & p : future_part->parts)
-            source_parts.push_back(p);
-        source_delete_mark_snapshots = storage.snapshotSourceDeleteMarks(source_parts);
-    }*/
 }
 
 void MutatePlainMergeTreeTask::finish()
@@ -135,24 +127,18 @@ bool MutatePlainMergeTreeTask::executeStep()
                 /// mutation result. After REPLACE releases the lock, the mutation's commit promotes
                 /// the PreActive part to Active, "resurrecting" old data.
                 ///
-                /// For UniqueMergeTree, we must use the no-arg commit() path so that the
-                /// before_transaction_commit_hook (dedup) is invoked. The hook internally
-                /// acquires a shared read lock on parts, which would deadlock if we already
-                /// held the exclusive DataPartsLock. The unique_process_mutex in the dedup
-                /// manager serializes dedup + commit, providing equivalent safety.
+                /// For UniqueMergeTree, use an explicit lock → rename → dedup → lockParts → commit
+                /// sequence (same pattern as INSERT in MergeTreeSink) instead of the hook-based
+                /// approach. This ensures the dedup manager sees the renamed part in the correct
+                /// state and the unique_process_mutex serializes the whole operation.
                 if (storage.supportsUpsert())
                 {
+                    auto dedup_mgr = storage.getDedupManager();
+                    auto dedup_lock = dedup_mgr->lockUniqueProcess();
                     storage.renameTempPartAndReplace(new_part, transaction, /*rename_in_transaction=*/ false);
-                    /// Pass operation type and delete mark snapshots to the before-commit hook.
-                    {
-                        MergeTreeData::BeforeCommitHookContext hook_ctx;
-                        hook_ctx.operation = MergeTreeData::CommitOperation::Mutation;
-                        if (!source_delete_mark_snapshots.empty())
-                            hook_ctx.data = std::move(source_delete_mark_snapshots);
-                        transaction.setBeforeCommitHookContext(std::move(hook_ctx));
-                    }
-
-                    transaction.commit();
+                    dedup_mgr->dedupPart(new_part, MergeTreeData::CommitOperation::Mutation);
+                    auto lock = storage.lockParts();
+                    transaction.commit(lock);
                 }
                 else
                 {

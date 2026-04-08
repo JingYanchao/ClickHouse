@@ -5,7 +5,6 @@
 #include <Core/Names.h>
 
 #include <Storages/MergeTree/IExecutableTask.h>
-#include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MutateTask.h>
 #include <Storages/MutationCommands.h>
 #include <Storages/MergeTree/MergeMutateSelectedEntry.h>
@@ -83,10 +82,6 @@ private:
     ProfileEvents::Counters profile_counters;
 
     ContextMutablePtr task_context;
-
-    /// Snapshot of source parts' delete mark bitmaps taken at mutation start.
-    /// Used for diff-based dedup optimization at commit time.
-    MergeTreeData::DeleteMarkSnapshotMap source_delete_mark_snapshots;
 
     ContextMutablePtr createTaskContext() const;
 };

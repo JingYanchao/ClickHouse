@@ -32,6 +32,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int INCORRECT_DATA;
+    extern const int LOGICAL_ERROR;
 }
 
 /// Default number of parallel dedup threads.
@@ -469,9 +470,9 @@ void MergeTreeDedupPartManager::dedupForMerge(
 
 void MergeTreeDedupPartManager::dedupForMutation(
     const DataPartPtr & new_part,
-    const StorageMetadataPtr & metadata_snapshot,
+    const StorageMetadataPtr & /*metadata_snapshot*/,
     MergeTreeData::DataPartsVector & visible_parts,
-    const MergeTreeData::DeleteMarkSnapshotMap & source_delete_mark_snapshots)
+    const MergeTreeData::DeleteMarkSnapshotMap & /*source_delete_mark_snapshots*/)
 {
     /// Mutation transforms exactly one source part into one new part.
     /// The source part has the same block range but a lower mutation version.
@@ -487,10 +488,15 @@ void MergeTreeDedupPartManager::dedupForMutation(
     }
 
     if (!source_part)
-    {
-        LOG_DEBUG(log, "dedupForMutation: part '{}', no matching source part found, skip", new_part->name);
-        return;
-    }
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "dedupForMutation: part '{}', no matching source part found in visible_parts", new_part->name);
+
+    /// Mutation preserves row count, so row offsets are unchanged.
+    /// Clone the delete mark bitmap directly from the source part.
+    if (new_part->rows_count != source_part->rows_count)
+        throw Exception(ErrorCodes::INCORRECT_DATA,
+            "dedupForMutation: part '{}' has {} rows, but source part '{}' has {} rows",
+            new_part->name, new_part->rows_count, source_part->name, source_part->rows_count);
 
     auto source_delete_mark = source_part->getDeleteMarkBitmap();
     if (!source_delete_mark || source_delete_mark->empty())
@@ -500,30 +506,10 @@ void MergeTreeDedupPartManager::dedupForMutation(
         return;
     }
 
-    /// Fast path: if row counts match (e.g. ALTER UPDATE that does not remove rows),
-    /// row offsets are preserved — clone the delete mark bitmap directly.
-    if (new_part->rows_count == source_part->rows_count)
-    {
-        auto cloned_bitmap = ProjectionIndexBitmap::create(new_part->rows_count);
-        cloned_bitmap->unionWith(*source_delete_mark);
-        delta_deleted_rows_map[new_part.get()] = std::move(cloned_bitmap);
+    delta_deleted_rows_map[new_part.get()] = source_delete_mark;
 
-        LOG_DEBUG(log, "dedupForMutation: part '{}', cloned {} delete marks from source part '{}' (rows match)",
-            new_part->name, source_delete_mark->cardinality(), source_part->name);
-        return;
-    }
-
-    /// Slow path: mutation removed some rows (e.g. ALTER DELETE), so row offsets
-    /// changed. We need to look up deleted keys from the source part in the new
-    /// part's SST to find their new offsets. Reuse the same algorithm as merge.
-    if (new_part->rows_count)
-    {
-        DataPartsVector source_parts = {source_part};
-        tryDedupDeletedKeysFromSourceParts(new_part, source_parts, metadata_snapshot, source_delete_mark_snapshots);
-    }
-
-    LOG_DEBUG(log, "dedupForMutation: part '{}', source part '{}', source_rows={}, new_rows={}",
-        new_part->name, source_part->name, source_part->rows_count, new_part->rows_count);
+    LOG_DEBUG(log, "dedupForMutation: part '{}', cloned {} delete marks from source part '{}'",
+        new_part->name, source_delete_mark->cardinality(), source_part->name);
 }
 
 /// Propagate deleted keys from source parts to the merged part.
