@@ -58,10 +58,11 @@ explicit MergeTreeDedupPartManager(const MergeTreeData & storage_);
     /// Populates delta_deleted_rows_map with rows to be deleted.
     ///
     /// The operation type is inferred from part metadata:
-    ///   - level == 0                                → Insert  (full cross-part dedup)
-    ///   - level > 0 + has snapshots + single block  → Mutation (clone source delete marks)
-    ///   - level > 0 + has snapshots + multi block   → Merge   (propagate source delete marks)
-    ///   - level > 0 + no snapshots                  → Fetch   (full cross-part dedup)
+    ///   - level == 0 + mutation == 0                  → Insert  (full cross-part dedup)
+    ///   - level == 0 + mutation > 0                   → Mutation of level-0 part (clone delete marks)
+    ///   - level > 0 + mutation source found           → Mutation (clone source delete marks)
+    ///   - level > 0 + has snapshots + no mut. source  → Merge   (propagate source delete marks)
+    ///   - level > 0 + no snapshots + no mut. source   → Fetch   (dual-iterator or full dedup)
     ///
     /// The optional delete_mark_snapshots carries a snapshot of source parts'
     /// delete marks taken at merge/mutation start, enabling diff-based dedup
@@ -223,12 +224,15 @@ private:
         const StorageMetadataPtr & metadata_snapshot);
 
     /// Propagate delete marks from source parts into the merged part.
-    /// Uses a multi-way merge iterator over all source parts' SSTs to walk
-    /// keys in sorted order. For each key group (same key across parts),
-    /// only propagates the deletion when ALL entries are deleted — meaning
-    /// a concurrent INSERT deleted the key from every source part that had it.
-    /// If any entry is alive, the merged part inherited the key from that
-    /// source part, so no propagation is needed.
+    /// For each source part, scans its SST for keys whose offsets are in the
+    /// diff bitmap (newly deleted by concurrent INSERTs), then looks them up
+    /// in the merged part's SST to propagate the deletion.
+    ///
+    /// Version transitivity guarantees correctness: if the merge winner is
+    /// deleted by a concurrent INSERT (which must have a higher version),
+    /// all losers are necessarily deleted too. Therefore, checking any single
+    /// source part that has the key deleted is sufficient — no need to verify
+    /// that ALL source entries are deleted.
     ///
     /// Complexity: O(Σ N_source + D × log(N_merged))
     ///   where D = keys deleted by concurrent INSERTs (typically D << N_merged).

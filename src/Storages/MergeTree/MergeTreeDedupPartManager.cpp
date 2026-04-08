@@ -266,15 +266,15 @@ static PartDeleteBitmapMap dedupKeysThroughNewCommitParts(
     if (total_keys == 0)
         return result;
 
-    /// For small key sets, fall back to single-threaded path to avoid thread overhead.
-    const size_t num_threads = (total_keys < MIN_KEYS_FOR_PARALLEL) ? 1 : std::min(DEDUP_MAX_PARALLEL, total_keys);
-    const size_t stride = total_keys / num_threads;
-
     auto boundary_keys = sampleBoundaryKeysFromSST(input.reader, total_keys, DEDUP_MAX_PARALLEL);
 
     const size_t actual_shards = boundary_keys.size();
     if (actual_shards == 0)
         return result;
+
+    /// Recompute stride from actual_shards (which may differ from the
+    /// requested max_shards when the SST has fewer keys than expected).
+    const size_t stride = total_keys / actual_shards;
 
     /// Allocate per-shard delta bitmaps.
     std::vector<PartDeleteBitmapMap> delta_bitmaps(actual_shards);
@@ -293,8 +293,10 @@ static PartDeleteBitmapMap dedupKeysThroughNewCommitParts(
 
         for (size_t shard = 0; shard < actual_shards; ++shard)
         {
-            /// Last shard gets the remainder.
-            size_t shard_keys = (shard == actual_shards - 1) ? (total_keys - stride * shard) : stride;
+            /// Last shard processes all remaining keys until the end of the SST.
+            /// Using SIZE_MAX lets the iterator naturally exhaust, which is safe
+            /// because `deduplicateKeyByBucket` stops when the iterator is invalid.
+            size_t shard_keys = (shard == actual_shards - 1) ? SIZE_MAX : stride;
 
             runner.enqueueAndKeepTrack(
                 [&input,
