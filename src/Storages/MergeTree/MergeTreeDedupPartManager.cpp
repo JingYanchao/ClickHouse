@@ -428,11 +428,12 @@ void MergeTreeDedupPartManager::dedupForInsert(
 }
 
 /// Propagate delete marks from source parts to the fetched part using a
-/// dual-iterator (two-pointer) approach.
+/// parallel dual-iterator (two-pointer) approach.
 ///
-/// Builds a SSTMergingIterator over all source parts' SSTs and a plain
-/// iterator over the fetched part's SST. Both streams are sorted by key,
-/// so we walk them in lockstep:
+/// The fetched part's SST key space is split into shards via boundary key
+/// sampling. Each shard independently builds a SSTMergingIterator over all
+/// source parts' SSTs and a plain iterator over the fetched part's SST,
+/// then walks them in lockstep:
 ///
 ///   - Keys matching in both streams: check if the source entry is
 ///     delete-marked. If so, mark the corresponding row in the fetched part.
@@ -441,26 +442,33 @@ void MergeTreeDedupPartManager::dedupForInsert(
 ///   - Keys in source parts but not in the fetched part: these are losers
 ///     eliminated during merge — skip them.
 ///
-/// Complexity: O(N_source * log(K) + N_fetched) with pure sequential IO,
+/// Complexity: O((N_source * log(K) + N_fetched) / P) with P = parallelism,
 /// where K = number of source parts.
-static void propagateDeleteMarksByDualIterator(
-    std::vector<PartWithSSTReader> & source_part_readers,
+/// Run the dual-iterator logic for a single shard of the key space.
+/// `start_key` is the first key in this shard; `end_key` is the first key
+/// of the *next* shard (empty means "until the end of the SST").
+/// Produces a per-shard bitmap of fetched-part rows to mark as deleted.
+static void propagateDeleteMarksByShard(
+    const std::vector<PartWithSSTReader> & source_part_readers,
     const SSTFileReaderPtr & fetched_sst_reader,
     size_t fetched_part_rows,
-    ProjectionIndexBitmapPtr & result_bitmap,
+    const std::string & start_key,
+    const std::string & end_key,
+    ProjectionIndexBitmapPtr & shard_bitmap,
+    size_t shard_id,
     LoggerPtr log)
 {
-    Stopwatch watch;
-
-    /// Step 1: Build the merging iterator over all source parts' SSTs.
-    std::vector<std::unique_ptr<rocksdb::Iterator>> sst_iters;
-    std::vector<SSTFileReaderPtr> sst_readers;
-    std::vector<DataPartPtr> parts;
+    Stopwatch shard_watch;
 
     rocksdb::ReadOptions opts;
     opts.fill_cache = false;
 
-    for (auto & [part, reader] : source_part_readers)
+    /// Build a merging iterator over all source parts' SSTs for this shard.
+    std::vector<std::unique_ptr<rocksdb::Iterator>> sst_iters;
+    std::vector<SSTFileReaderPtr> sst_readers;
+    std::vector<DataPartPtr> parts;
+
+    for (const auto & [part, reader] : source_part_readers)
     {
         sst_iters.push_back(reader->newIterator(opts));
         sst_readers.push_back(reader);
@@ -468,35 +476,32 @@ static void propagateDeleteMarksByDualIterator(
     }
 
     MergeTreeDedupPartManager::SSTMergingIterator merge_iter(std::move(sst_iters), std::move(sst_readers));
-    merge_iter.seekToFirst();
+    merge_iter.seek(rocksdb::Slice(start_key));
 
-    /// Step 2: Build a plain iterator over the fetched part's SST.
+    /// Build a plain iterator over the fetched part's SST for this shard.
     auto fetched_iter = fetched_sst_reader->newIterator(opts);
-    fetched_iter->SeekToFirst();
+    fetched_iter->Seek(rocksdb::Slice(start_key));
 
     auto bitmap = ProjectionIndexBitmap::create(fetched_part_rows);
     size_t marked = 0;
     size_t source_keys_scanned = 0;
     size_t fetched_keys_scanned = 0;
 
-    /// Step 3: Walk both iterators in lockstep.
-    ///
-    /// Key insight: skip delete-marked source entries upfront. After skipping,
-    /// the merging iterator always points to a "live" (non-deleted) source key.
-    ///
-    /// Three cases:
-    ///   source_key < fetched_key → source-only key (merge loser), skip.
-    ///   source_key == fetched_key → key exists live in source, no action needed.
-    ///   source_key > fetched_key → fetched key has no live source entry,
-    ///       meaning all source entries for this key were delete-marked.
-    ///       Mark the fetched row as deleted.
-    ///
-    /// When the merging iterator is exhausted but fetched keys remain, those
-    /// remaining fetched keys also have no live source entry → mark them deleted.
+    /// Helper: check if a key has crossed the shard boundary.
+    auto beyondShardEnd = [&](const rocksdb::Slice & key) -> bool
+    {
+        return !end_key.empty() && key.compare(rocksdb::Slice(end_key)) >= 0;
+    };
+
+    /// Skip delete-marked source entries so merge_iter always points to
+    /// a live (non-deleted) key when valid.
     auto skipDeletedSourceEntries = [&]()
     {
         while (merge_iter.valid())
         {
+            if (beyondShardEnd(merge_iter.key()))
+                break;
+
             size_t idx = merge_iter.currentIndex();
             auto val = merge_iter.value();
             auto entry = decodeUniqueValueEntry(val.data(), val.size());
@@ -510,21 +515,27 @@ static void propagateDeleteMarksByDualIterator(
         }
     };
 
-    while (fetched_iter->Valid())
+    /// Walk both iterators in lockstep within this shard's key range.
+    ///
+    /// Three cases:
+    ///   source_key < fetched_key → source-only key (merge loser), skip.
+    ///   source_key == fetched_key → key exists live in source, no action.
+    ///   source_key > fetched_key → fetched key has no live source entry,
+    ///       mark the fetched row as deleted.
+    while (fetched_iter->Valid() && !beyondShardEnd(fetched_iter->key()))
     {
-        /// Skip all delete-marked source entries first, so merge_iter
-        /// always points to a live (non-deleted) key when valid.
         skipDeletedSourceEntries();
 
         auto fetched_key = fetched_iter->key();
-        if (merge_iter.valid())
+        bool merge_iter_in_range = merge_iter.valid() && !beyondShardEnd(merge_iter.key());
+
+        if (merge_iter_in_range)
         {
             auto source_key = merge_iter.key();
             int cmp_result = source_key.compare(fetched_key);
 
             if (cmp_result < 0)
             {
-                /// Source key < fetched key: merge loser or irrelevant key, skip.
                 merge_iter.next();
                 ++source_keys_scanned;
                 continue;
@@ -532,18 +543,15 @@ static void propagateDeleteMarksByDualIterator(
 
             if (cmp_result == 0)
             {
-                /// Keys match and source entry is live → no deletion needed.
-                /// Advance both iterators past this key.
                 merge_iter.next();
                 ++source_keys_scanned;
-
                 fetched_iter->Next();
                 ++fetched_keys_scanned;
                 continue;
             }
         }
 
-        /// source_key > fetched_key, or merging iterator exhausted:
+        /// source_key > fetched_key, or merging iterator exhausted/out-of-range:
         /// this fetched key has no live source entry → mark as deleted.
         auto fetched_val = fetched_iter->value();
         if (!fetched_val.empty())
@@ -558,12 +566,100 @@ static void propagateDeleteMarksByDualIterator(
     }
 
     if (!bitmap->empty())
-        result_bitmap = std::move(bitmap);
+        shard_bitmap = std::move(bitmap);
+
+    LOG_TEST(log,
+        "propagateDeleteMarksByShard: shard={}, source_keys_scanned={}, fetched_keys_scanned={}, "
+        "marked={}, elapsed={}us",
+        shard_id, source_keys_scanned, fetched_keys_scanned, marked, shard_watch.elapsedMicroseconds());
+}
+
+/// Parallel version of delete mark propagation from source parts to the
+/// fetched part using dual-iterator (merging iterator vs fetched iterator).
+///
+/// Splits the fetched part's SST key space into shards using boundary key
+/// sampling, then runs the dual-iterator logic per shard in parallel threads.
+/// Each shard produces a local bitmap; results are merged at the end.
+///
+/// Complexity: O((N_source * log(K) + N_fetched) / P) with P = parallelism,
+/// where K = number of source parts.
+static void propagateDeleteMarksByDualIterator(
+    std::vector<PartWithSSTReader> & source_part_readers,
+    const SSTFileReaderPtr & fetched_sst_reader,
+    size_t fetched_part_rows,
+    ProjectionIndexBitmapPtr & result_bitmap,
+    LoggerPtr log)
+{
+    Stopwatch watch;
+
+    /// Get total key count from SST properties — O(1), no scanning needed.
+    auto props = fetched_sst_reader->getProperties();
+    const size_t total_keys = props ? props->num_entries : 0;
+    if (total_keys == 0)
+        return;
+
+    auto boundary_keys = sampleBoundaryKeysFromSST(fetched_sst_reader, total_keys, DEDUP_MAX_PARALLEL);
+    const size_t actual_shards = boundary_keys.size();
+    if (actual_shards == 0)
+        return;
+
+    /// Per-shard bitmaps.
+    std::vector<ProjectionIndexBitmapPtr> shard_bitmaps(actual_shards);
+
+    Stopwatch parallel_watch;
+    {
+        ThreadPool dedup_pool(
+            CurrentMetrics::UniqueKeyDedupThreads,
+            CurrentMetrics::UniqueKeyDedupThreadsActive,
+            CurrentMetrics::UniqueKeyDedupThreadsScheduled,
+            actual_shards);
+
+        ThreadPoolCallbackRunnerLocal<void> runner(dedup_pool, ThreadName::UNIQUE_KEY_DEDUP);
+
+        for (size_t shard = 0; shard < actual_shards; ++shard)
+        {
+            /// shard_end_key is the start of the next shard; empty for the last shard
+            /// (meaning "until the end of the SST").
+            std::string shard_end_key = (shard + 1 < actual_shards) ? boundary_keys[shard + 1] : std::string{};
+
+            runner.enqueueAndKeepTrack(
+                [&source_part_readers,
+                 &fetched_sst_reader,
+                 fetched_part_rows,
+                 start_key = boundary_keys[shard],
+                 end_key = std::move(shard_end_key),
+                 &shard_bitmap = shard_bitmaps[shard],
+                 shard,
+                 log]
+                {
+                    propagateDeleteMarksByShard(
+                        source_part_readers, fetched_sst_reader, fetched_part_rows,
+                        start_key, end_key, shard_bitmap, shard, log);
+                });
+        }
+
+        runner.waitForAllToFinishAndRethrowFirstError();
+    }
+    ProfileEvents::increment(ProfileEvents::UniqueKeyDedupParallelProcessMicroseconds, parallel_watch.elapsedMicroseconds());
+
+    /// Merge all per-shard bitmaps into the final result.
+    auto merged = ProjectionIndexBitmap::create(fetched_part_rows);
+    size_t total_marked = 0;
+    for (auto & shard_bitmap : shard_bitmaps)
+    {
+        if (shard_bitmap && !shard_bitmap->empty())
+        {
+            total_marked += shard_bitmap->cardinality();
+            merged->unionWith(*shard_bitmap);
+        }
+    }
+
+    if (!merged->empty())
+        result_bitmap = std::move(merged);
 
     LOG_DEBUG(log,
-        "propagateDeleteMarksByDualIterator: source_keys_scanned={}, fetched_keys_scanned={}, "
-        "marked={}, elapsed={}us",
-        source_keys_scanned, fetched_keys_scanned, marked, watch.elapsedMicroseconds());
+        "propagateDeleteMarksByDualIterator: shards={}, total_marked={}, elapsed={}us",
+        actual_shards, total_marked, watch.elapsedMicroseconds());
 }
 
 void MergeTreeDedupPartManager::dedupForFetch(
@@ -584,11 +680,24 @@ void MergeTreeDedupPartManager::dedupForFetch(
 
     if (has_gaps)
     {
+        /// Filter out source parts that are covered by the fetched part's
+        /// block range — they overlap with the fetched part's data and
+        /// should not participate in cross-part dedup.
+        DataPartsVector filtered_visible_parts;
+        filtered_visible_parts.reserve(all_visible_parts.size());
+        for (const auto & part : all_visible_parts)
+        {
+            if (part->info.min_block >= new_part->info.min_block
+                && part->info.max_block <= new_part->info.max_block)
+                continue; /// Covered by the fetched part, skip.
+            filtered_visible_parts.push_back(part);
+        }
+
         LOG_DEBUG(log,
             "dedupForFetch: part '{}', source parts have block gaps, "
-            "falling back to full cross-part dedup",
-            new_part->name);
-        dedupForInsert(new_part, metadata_snapshot, all_visible_parts);
+            "falling back to full cross-part dedup (visible_parts: {} -> {})",
+            new_part->name, all_visible_parts.size(), filtered_visible_parts.size());
+        dedupForInsert(new_part, metadata_snapshot, filtered_visible_parts);
         return;
     }
 
