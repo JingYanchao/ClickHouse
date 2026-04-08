@@ -96,7 +96,7 @@ namespace DB
 class ZooKeeperWithFaultInjection;
 using ZooKeeperWithFaultInjectionPtr = std::shared_ptr<ZooKeeperWithFaultInjection>;
 
-class StorageReplicatedMergeTree final : public MergeTreeData
+class StorageReplicatedMergeTree : public MergeTreeData
 {
 public:
     /** For the system table replicas. */

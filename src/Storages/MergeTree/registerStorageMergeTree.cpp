@@ -8,6 +8,7 @@
 #include <Storages/StorageUniqueMergeTree.h>
 #include <Storages/MergeTree/ProjectionIndex/ProjectionIndexUnique.h>
 #include <Storages/StorageReplicatedMergeTree.h>
+#include <Storages/StorageReplicatedUniqueMergeTree.h>
 #include <Storages/TableZnodeInfo.h>
 
 #include <Core/ServerSettings.h>
@@ -987,6 +988,26 @@ static StoragePtr create(const StorageFactory::Arguments & args)
             local_settings[Setting::keeper_retry_max_backoff_ms],
             args.getLocalContext()->getProcessListElementSafe()};
 
+        /// ReplicatedUniqueMergeTree engine — uses StorageReplicatedUniqueMergeTree
+        /// which inherits StorageReplicatedMergeTree and injects dedup logic via
+        /// BeforeTransactionCommitHook.
+        if (name_part == "Unique")
+        {
+            return std::make_shared<StorageReplicatedUniqueMergeTree>(
+                zookeeper_info,
+                args.mode,
+                args.table_id,
+                args.relative_data_path,
+                metadata,
+                context,
+                date_column_name,
+                merging_params,
+                std::move(storage_settings),
+                need_check_table_structure,
+                create_query_zk_retries_info,
+                unique_projection_name);
+        }
+
         return std::make_shared<StorageReplicatedMergeTree>(
             zookeeper_info,
             args.mode,
@@ -1063,6 +1084,7 @@ void registerStorageMergeTree(StorageFactory & factory)
     factory.registerStorage("ReplicatedCoalescingMergeTree", create, features);
     factory.registerStorage("ReplicatedGraphiteMergeTree", create, features);
     factory.registerStorage("ReplicatedVersionedCollapsingMergeTree", create, features);
+    factory.registerStorage("ReplicatedUniqueMergeTree", create, features);
 }
 
 }

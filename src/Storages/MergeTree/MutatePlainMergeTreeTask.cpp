@@ -136,7 +136,7 @@ bool MutatePlainMergeTreeTask::executeStep()
                     auto dedup_mgr = storage.getDedupManager();
                     auto dedup_lock = dedup_mgr->lockUniqueProcess();
                     storage.renameTempPartAndReplace(new_part, transaction, /*rename_in_transaction=*/ false);
-                    dedup_mgr->dedupPart(new_part, MergeTreeData::CommitOperation::Mutation);
+                    dedup_mgr->dedupPart(new_part);
                     auto lock = storage.lockParts();
                     transaction.commit(lock);
                 }

@@ -5522,6 +5522,11 @@ bool StorageReplicatedMergeTree::fetchPart(
             renameTempPartAndReplace(part, transaction, /*rename_in_transaction=*/ true);
             transaction.renameParts();
 
+            /// For ReplicatedUniqueMergeTree: the before-commit hook runs
+            /// cross-part dedup. The dedup layer infers the operation type
+            /// from part metadata (level, snapshots), so no explicit enum needed.
+            /// Fetched parts carry a complete SST, so cross-part dedup is always correct.
+
             chassert(!part_to_clone || !is_zero_copy_part(part));
             replaced_parts = checkPartChecksumsAndCommit(transaction, part, /*hardlinked_files*/ {}, /*replace_zero_copy_lock*/ true);
 

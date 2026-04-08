@@ -8,6 +8,7 @@
 
 #include <Common/Stopwatch.h>
 #include <Storages/MergeTree/MergeTreeData.h>
+#include <Storages/MergeTree/MergeTreePartInfo.h>
 #include <Storages/MergeTree/SSTFileUtil.h>
 #include <rocksdb/comparator.h>
 #include <rocksdb/iterator.h>
@@ -55,14 +56,18 @@ explicit MergeTreeDedupPartManager(const MergeTreeData & storage_);
 
     /// Deduplicate new_part against all active parts in the same partition.
     /// Populates delta_deleted_rows_map with rows to be deleted.
-    /// The op parameter indicates how this part was produced (insert, merge, etc.),
-    /// enabling optimization strategies (e.g. skipping older parts for merge).
+    ///
+    /// The operation type is inferred from part metadata:
+    ///   - level == 0                                → Insert  (full cross-part dedup)
+    ///   - level > 0 + has snapshots + single block  → Mutation (clone source delete marks)
+    ///   - level > 0 + has snapshots + multi block   → Merge   (propagate source delete marks)
+    ///   - level > 0 + no snapshots                  → Fetch   (full cross-part dedup)
+    ///
     /// The optional delete_mark_snapshots carries a snapshot of source parts'
     /// delete marks taken at merge/mutation start, enabling diff-based dedup
     /// that only processes newly deleted keys instead of scanning all keys.
     void dedupPart(
         const DataPartPtr & new_part,
-        MergeTreeData::CommitOperation op = MergeTreeData::CommitOperation::Insert,
         const MergeTreeData::DeleteMarkSnapshotMap & source_part_delete_mark_snapshots = {});
 
     /// Apply accumulated delta delete bitmaps to each part's delete_mark_bitmap.
@@ -175,28 +180,39 @@ private:
         const StorageMetadataPtr & metadata_snapshot,
         MergeTreeData::DataPartsVector & visible_parts);
 
-    /// Dedup path for MERGE-produced parts: filter out source parts
-    /// (covered by the merged part's block range), then propagate any delete
-    /// marks from source parts into the merged part via deleted-keys optimization.
+    /// Dedup path for FETCH-produced parts: optimized path that avoids full
+    /// cross-part dedup when source parts fully cover the fetched part's block
+    /// range (no gaps). Uses a dual-iterator approach: builds a merging iterator
+    /// over source parts' SSTs and a plain iterator over the fetched part's SST,
+    /// then walks both in key order to propagate delete marks from source parts.
+    /// Falls back to `dedupForInsert` when source parts have block gaps.
+    void dedupForFetch(
+        const DataPartPtr & new_part,
+        const StorageMetadataPtr & metadata_snapshot,
+        const DataPartsVector & source_parts,
+        MergeTreeData::DataPartsVector & all_visible_parts);
+
+    /// Dedup path for MERGE-produced parts: propagate delete marks from
+    /// source parts into the merged part via deleted-keys optimization.
+    /// Source parts (covered by the merged part's block range) are pre-computed
+    /// by `dedupPart` and passed in directly.
     /// No cross-part dedup is needed because merge only combines existing data
     /// without introducing new unique keys.
     void dedupForMerge(
         const DataPartPtr & new_part,
         const StorageMetadataPtr & metadata_snapshot,
-        MergeTreeData::DataPartsVector & visible_parts,
+        const DataPartsVector & source_parts,
         const MergeTreeData::DeleteMarkSnapshotMap & delete_mark_snapshots);
 
     /// Dedup path for MUTATION-produced parts: a mutation transforms exactly
     /// one source part into one new part.
-    /// - If row counts match (e.g. ALTER UPDATE), clone the source part's
-    ///   delete mark bitmap directly — row offsets are preserved.
+    /// The source part is pre-identified by `dedupPart` (same block range,
+    /// lower mutation version) and passed in directly.
     /// Mutation preserves row count, so row offsets are unchanged.
     /// Simply clone the source part's delete mark bitmap to the new part.
     void dedupForMutation(
         const DataPartPtr & new_part,
-        const StorageMetadataPtr & metadata_snapshot,
-        MergeTreeData::DataPartsVector & visible_parts,
-        const MergeTreeData::DeleteMarkSnapshotMap & delete_mark_snapshots);
+        const DataPartPtr & source_part);
 
     /// Build delete marks for all parts in a single partition using a
     /// multi-way merge of their SST iterators. This is O(N·log(N)·K)

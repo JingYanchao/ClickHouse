@@ -355,22 +355,13 @@ public:
     /// * Next, if commit() is called, the parts are added to the active set and the parts that are
     ///   covered by them are marked Outdated.
     /// If neither commit() nor rollback() was called, the destructor rollbacks the operation.
-    /// What kind of operation produced the part being committed.
-    /// Used by dedup to choose optimization strategy.
-    enum class CommitOperation : uint8_t
-    {
-        Insert,    /// Normal INSERT
-        Merge,     /// Background merge
-        Mutation,  /// Background mutation
-        Fetch,     /// Replicated fetch from another replica (future use)
-    };
-
     /// Context passed to the before-commit hook.
-    /// Bundles the operation type and any extra data (e.g. delete mark snapshots)
-    /// so that Transaction only needs a single field for the hook.
+    /// Carries optional payload (e.g. delete mark snapshots for merge/mutation).
+    /// The dedup layer infers the operation type from part metadata
+    /// (level, mutation version, snapshot presence) instead of requiring
+    /// callers to pass an explicit enum.
     struct BeforeCommitHookContext
     {
-        CommitOperation operation = CommitOperation::Insert;
         std::any data;  /// Arbitrary payload, e.g. DeleteMarkSnapshotMap
     };
 
@@ -383,7 +374,7 @@ public:
         DataPartsVector commit(DataPartsLock & lock);
 
         /// Set/get the context passed to the before-commit hook.
-        /// Bundles operation type + arbitrary payload (e.g. delete mark snapshots).
+        /// Carries optional payload (e.g. delete mark snapshots).
         void setBeforeCommitHookContext(BeforeCommitHookContext ctx) { before_commit_hook_context = std::move(ctx); }
         const BeforeCommitHookContext & getBeforeCommitHookContext() const { return before_commit_hook_context; }
 

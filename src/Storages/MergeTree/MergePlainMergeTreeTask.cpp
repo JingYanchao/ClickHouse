@@ -173,10 +173,9 @@ void MergePlainMergeTreeTask::finish()
 
     MergeTreeData::Transaction transaction(storage, txn.get());
     storage.merger_mutator.renameMergedTemporaryPart(new_part, future_part->parts, txn, transaction);
-    /// Pass operation type and delete mark snapshots to the before-commit hook.
+    /// Pass delete mark snapshots to the before-commit hook for diff-based dedup.
     {
         MergeTreeData::BeforeCommitHookContext hook_ctx;
-        hook_ctx.operation = MergeTreeData::CommitOperation::Merge;
         if (!source_delete_mark_snapshots.empty())
             hook_ctx.data = std::move(source_delete_mark_snapshots);
         transaction.setBeforeCommitHookContext(std::move(hook_ctx));

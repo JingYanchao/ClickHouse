@@ -353,8 +353,7 @@ static void applyCrossPartDeleteMarks(const PartDeleteBitmapMap & cross_part_mar
 
         /// COW: create a fresh bitmap, copy existing marks if any, then add new ones.
         auto new_marks = ProjectionIndexBitmap::create(part_ptr->rows_count);
-        auto existing_marks = part_ptr->getDeleteMarkBitmap();
-        if (existing_marks)
+        if (auto existing_marks = part_ptr->getDeleteMarkBitmap())
             new_marks->unionWith(*existing_marks);
 
         new_marks->unionWith(*cross_part_marks);
@@ -426,32 +425,271 @@ void MergeTreeDedupPartManager::dedupForInsert(
     delta_deleted_rows_map = dedupKeysThroughNewCommitParts(sst_ctx.input, sst_ctx.visible_parts);
 }
 
+/// Propagate delete marks from source parts to the fetched part using a
+/// dual-iterator (two-pointer) approach.
+///
+/// Builds a SSTMergingIterator over all source parts' SSTs and a plain
+/// iterator over the fetched part's SST. Both streams are sorted by key,
+/// so we walk them in lockstep:
+///
+///   - Keys matching in both streams: check if the source entry is
+///     delete-marked. If so, mark the corresponding row in the fetched part.
+///   - Keys in the fetched part but not in source parts: impossible when
+///     source parts fully cover the fetched part's block range (no gaps).
+///   - Keys in source parts but not in the fetched part: these are losers
+///     eliminated during merge — skip them.
+///
+/// Complexity: O(N_source * log(K) + N_fetched) with pure sequential IO,
+/// where K = number of source parts.
+static void propagateDeleteMarksByDualIterator(
+    std::vector<PartWithSSTReader> & source_part_readers,
+    const SSTFileReaderPtr & fetched_sst_reader,
+    size_t fetched_part_rows,
+    ProjectionIndexBitmapPtr & result_bitmap,
+    LoggerPtr log)
+{
+    Stopwatch watch;
+
+    /// Step 1: Build the merging iterator over all source parts' SSTs.
+    std::vector<std::unique_ptr<rocksdb::Iterator>> sst_iters;
+    std::vector<SSTFileReaderPtr> sst_readers;
+    std::vector<DataPartPtr> parts;
+
+    rocksdb::ReadOptions opts;
+    opts.fill_cache = false;
+
+    for (auto & [part, reader] : source_part_readers)
+    {
+        sst_iters.push_back(reader->newIterator(opts));
+        sst_readers.push_back(reader);
+        parts.push_back(part);
+    }
+
+    MergeTreeDedupPartManager::SSTMergingIterator merge_iter(std::move(sst_iters), std::move(sst_readers));
+    merge_iter.seekToFirst();
+
+    /// Step 2: Build a plain iterator over the fetched part's SST.
+    auto fetched_iter = fetched_sst_reader->newIterator(opts);
+    fetched_iter->SeekToFirst();
+
+    auto bitmap = ProjectionIndexBitmap::create(fetched_part_rows);
+    size_t marked = 0;
+    size_t source_keys_scanned = 0;
+    size_t fetched_keys_scanned = 0;
+
+    /// Step 3: Walk both iterators in lockstep.
+    ///
+    /// Key insight: skip delete-marked source entries upfront. After skipping,
+    /// the merging iterator always points to a "live" (non-deleted) source key.
+    ///
+    /// Three cases:
+    ///   source_key < fetched_key → source-only key (merge loser), skip.
+    ///   source_key == fetched_key → key exists live in source, no action needed.
+    ///   source_key > fetched_key → fetched key has no live source entry,
+    ///       meaning all source entries for this key were delete-marked.
+    ///       Mark the fetched row as deleted.
+    ///
+    /// When the merging iterator is exhausted but fetched keys remain, those
+    /// remaining fetched keys also have no live source entry → mark them deleted.
+    auto skipDeletedSourceEntries = [&]()
+    {
+        while (merge_iter.valid())
+        {
+            size_t idx = merge_iter.currentIndex();
+            auto val = merge_iter.value();
+            auto entry = decodeUniqueValueEntry(val.data(), val.size());
+
+            auto source_delete_mark = parts[idx]->getDeleteMarkBitmap();
+            if (!source_delete_mark || !source_delete_mark->contains(entry.part_offset))
+                break; /// Found a live entry, stop skipping.
+
+            merge_iter.next();
+            ++source_keys_scanned;
+        }
+    };
+
+    while (fetched_iter->Valid())
+    {
+        /// Skip all delete-marked source entries first, so merge_iter
+        /// always points to a live (non-deleted) key when valid.
+        skipDeletedSourceEntries();
+
+        auto fetched_key = fetched_iter->key();
+        if (merge_iter.valid())
+        {
+            auto source_key = merge_iter.key();
+            int cmp_result = source_key.compare(fetched_key);
+
+            if (cmp_result < 0)
+            {
+                /// Source key < fetched key: merge loser or irrelevant key, skip.
+                merge_iter.next();
+                ++source_keys_scanned;
+                continue;
+            }
+
+            if (cmp_result == 0)
+            {
+                /// Keys match and source entry is live → no deletion needed.
+                /// Advance both iterators past this key.
+                merge_iter.next();
+                ++source_keys_scanned;
+
+                fetched_iter->Next();
+                ++fetched_keys_scanned;
+                continue;
+            }
+        }
+
+        /// source_key > fetched_key, or merging iterator exhausted:
+        /// this fetched key has no live source entry → mark as deleted.
+        auto fetched_val = fetched_iter->value();
+        if (!fetched_val.empty())
+        {
+            auto fetched_entry = decodeUniqueValueEntry(fetched_val.data(), fetched_val.size());
+            bitmap->add(fetched_entry.part_offset);
+            ++marked;
+        }
+
+        fetched_iter->Next();
+        ++fetched_keys_scanned;
+    }
+
+    if (!bitmap->empty())
+        result_bitmap = std::move(bitmap);
+
+    LOG_DEBUG(log,
+        "propagateDeleteMarksByDualIterator: source_keys_scanned={}, fetched_keys_scanned={}, "
+        "marked={}, elapsed={}us",
+        source_keys_scanned, fetched_keys_scanned, marked, watch.elapsedMicroseconds());
+}
+
+void MergeTreeDedupPartManager::dedupForFetch(
+    const DataPartPtr & new_part,
+    const StorageMetadataPtr & metadata_snapshot,
+    const DataPartsVector & source_parts,
+    MergeTreeData::DataPartsVector & all_visible_parts)
+{
+    /// Check if source parts fully cover the fetched part's block range.
+    /// If there are gaps (some source parts are missing on this replica),
+    /// fall back to full cross-part dedup.
+    std::vector<MergeTreePartInfo> source_infos;
+    source_infos.reserve(source_parts.size());
+    for (const auto & part : source_parts)
+        source_infos.push_back(part->info);
+
+    bool has_gaps = !MergeTreePartInfo::areAllBlockNumbersCovered(new_part->info, std::move(source_infos));
+
+    if (has_gaps)
+    {
+        LOG_DEBUG(log,
+            "dedupForFetch: part '{}', source parts have block gaps, "
+            "falling back to full cross-part dedup",
+            new_part->name);
+        dedupForInsert(new_part, metadata_snapshot, all_visible_parts);
+        return;
+    }
+
+    /// No gaps — source parts fully cover the fetched part's block range.
+    /// Use the optimized dual-iterator approach: only propagate delete marks
+    /// from source parts, no need for full cross-part dedup.
+
+    /// Quick row-count check (analogous to dedupForMerge):
+    /// If the fetched part's row count matches the sum of source parts'
+    /// effective rows (rows - delete marks), no concurrent INSERT has
+    /// deleted any key in the source parts — nothing to propagate.
+    size_t source_effective_rows = 0;
+    for (const auto & part : source_parts)
+    {
+        size_t deleted = 0;
+        if (auto delete_mark = part->getDeleteMarkBitmap())
+            deleted = delete_mark->cardinality();
+        source_effective_rows += (part->rows_count - deleted);
+    }
+
+    if (source_effective_rows == new_part->rows_count)
+    {
+        LOG_DEBUG(log,
+            "dedupForFetch: part '{}' rows ({}) match source effective rows, skip",
+            new_part->name, new_part->rows_count);
+        return;
+    }
+
+    /// Quick check: if no source part has any delete marks, nothing to propagate.
+    bool any_delete_marks = false;
+    for (const auto & part : source_parts)
+    {
+        auto dm = part->getDeleteMarkBitmap();
+        if (dm && !dm->empty())
+        {
+            any_delete_marks = true;
+            break;
+        }
+    }
+
+    if (!any_delete_marks)
+    {
+        LOG_DEBUG(log,
+            "dedupForFetch: part '{}', source parts have no delete marks, skip",
+            new_part->name);
+        return;
+    }
+
+    /// Open SST readers for source parts and the fetched part.
+    auto source_part_readers = openSSTReadersForParts(source_parts, metadata_snapshot);
+    if (source_part_readers.empty())
+    {
+        LOG_DEBUG(log,
+            "dedupForFetch: part '{}', no source parts with SST, skip",
+            new_part->name);
+        return;
+    }
+
+    SCOPE_EXIT({ releaseAllBufferMemory(source_part_readers); });
+
+    auto fetched_sst_reader = new_part->getOrOpenSSTReader(metadata_snapshot);
+    if (!fetched_sst_reader)
+    {
+        LOG_DEBUG(log,
+            "dedupForFetch: part '{}' has no unique projection SST, skip",
+            new_part->name);
+        return;
+    }
+
+    ProjectionIndexBitmapPtr result_bitmap;
+
+    propagateDeleteMarksByDualIterator(
+        source_part_readers,
+        fetched_sst_reader, new_part->rows_count,
+        result_bitmap, log);
+
+    if (result_bitmap && !result_bitmap->empty())
+        delta_deleted_rows_map[new_part.get()] = std::move(result_bitmap);
+
+    fetched_sst_reader->releaseBufferMemory();
+}
+
 void MergeTreeDedupPartManager::dedupForMerge(
     const DataPartPtr & new_part,
     const StorageMetadataPtr & metadata_snapshot,
-    MergeTreeData::DataPartsVector & visible_parts,
+    const DataPartsVector & source_parts,
     const MergeTreeData::DeleteMarkSnapshotMap & source_delete_mark_snapshots)
 {
-    /// Collect source parts: those covered by the merged part's block range.
-    /// These are the merge's input parts that will become Outdated after commit.
-    ///
     /// Merge only combines existing data — it does not introduce new
     /// unique keys. The only dedup work needed is propagating delete marks:
     /// if a concurrent INSERT marked a row as deleted in a source part, the
     /// corresponding row in the merged part must also be marked.
-    DataPartsVector source_parts;
+    ///
+    /// Source parts are pre-computed by `dedupPart` (covered by the merged
+    /// part's block range).
+
     size_t source_effective_rows = 0;
-    for (const auto & part : visible_parts)
+    for (const auto & part : source_parts)
     {
-        if (part->info.min_block >= new_part->info.min_block
-            && part->info.max_block <= new_part->info.max_block)
-        {
-            source_parts.push_back(part);
-            size_t deleted = 0;
-            if (auto delete_mark = part->getDeleteMarkBitmap())
-                deleted = delete_mark->cardinality();
-            source_effective_rows += (part->rows_count - deleted);
-        }
+        size_t deleted = 0;
+        if (auto delete_mark = part->getDeleteMarkBitmap())
+            deleted = delete_mark->cardinality();
+        source_effective_rows += (part->rows_count - deleted);
     }
 
     /// If the merged part's row count matches the sum of source parts'
@@ -470,26 +708,13 @@ void MergeTreeDedupPartManager::dedupForMerge(
 
 void MergeTreeDedupPartManager::dedupForMutation(
     const DataPartPtr & new_part,
-    const StorageMetadataPtr & /*metadata_snapshot*/,
-    MergeTreeData::DataPartsVector & visible_parts,
-    const MergeTreeData::DeleteMarkSnapshotMap & /*source_delete_mark_snapshots*/)
+    const DataPartPtr & source_part)
 {
     /// Mutation transforms exactly one source part into one new part.
-    /// The source part has the same block range but a lower mutation version.
-    DataPartPtr source_part;
-    for (const auto & part : visible_parts)
-    {
-        if (part->info.min_block == new_part->info.min_block
-            && part->info.max_block == new_part->info.max_block)
-        {
-            source_part = part;
-            break;
-        }
-    }
+    /// The source part (same block range, lower mutation version) is
+    /// pre-identified by `dedupPart`.
 
-    if (!source_part)
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "dedupForMutation: part '{}', no matching source part found in visible_parts", new_part->name);
+    chassert(source_part);
 
     /// Mutation preserves row count, so row offsets are unchanged.
     /// Clone the delete mark bitmap directly from the source part.
@@ -715,7 +940,6 @@ void MergeTreeDedupPartManager::tryDedupDeletedKeysFromSourceParts(
 
 void MergeTreeDedupPartManager::dedupPart(
     const DataPartPtr & new_part,
-    MergeTreeData::CommitOperation op,
     const MergeTreeData::DeleteMarkSnapshotMap & source_delete_mark_snapshots)
 {
     if (!new_part)
@@ -740,15 +964,102 @@ void MergeTreeDedupPartManager::dedupPart(
         return part->rows_count == 0 || part->name == new_part->name;
     });
 
-    if (op == MergeTreeData::CommitOperation::Merge)
-        dedupForMerge(new_part, metadata_snapshot, all_visible_parts, source_delete_mark_snapshots);
-    else if (op == MergeTreeData::CommitOperation::Mutation)
-        dedupForMutation(new_part, metadata_snapshot, all_visible_parts, source_delete_mark_snapshots);
-    else
+    /// Infer operation type from part metadata and context:
+    ///
+    ///   level == 0 + mutation == 0                  → Insert  (full cross-part dedup)
+    ///   level == 0 + mutation > 0                   → Mutation of level-0 part (clone delete marks)
+    ///   level > 0 + has snapshots + mutation source → Mutation (clone source delete marks)
+    ///   level > 0 + has snapshots + no mut. source  → Merge   (propagate source delete marks)
+    ///   level > 0 + no snapshots + mutation source  → Mutation (clone source delete marks)
+    ///   level > 0 + no snapshots + no mut. source   → Fetch   (full cross-part dedup)
+    ///
+    /// Source parts are collected in a single scan of visible_parts:
+    ///   - source_parts: all parts covered by the new part's block range
+    ///     (used by merge to propagate delete marks).
+    ///   - mutation_source: a part with the exact same block range but lower
+    ///     mutation version (the hallmark of a local mutation).
+
+    const auto & info = new_part->info;
+
+    DataPartsVector source_parts;
+    DataPartPtr mutation_source;
+
+    if (info.level > 0)
+    {
+        for (const auto & part : all_visible_parts)
+        {
+            if (part->info.min_block >= info.min_block
+                && part->info.max_block <= info.max_block)
+            {
+                source_parts.push_back(part);
+
+                /// Mutation source: exact same block range, lower mutation version.
+                if (!mutation_source
+                    && info.mutation > 0
+                    && part->info.min_block == info.min_block
+                    && part->info.max_block == info.max_block
+                    && part->info.mutation < info.mutation)
+                {
+                    mutation_source = part;
+                }
+            }
+        }
+    }
+
+    const char * op_name = "insert";
+
+    if (info.level == 0 && info.mutation == 0)
+    {
+        /// Level-0 part with no mutation version — a fresh INSERT.
         dedupForInsert(new_part, metadata_snapshot, all_visible_parts);
+    }
+    else if (info.mutation > 0 && (info.level == 0 || mutation_source))
+    {
+        /// Part has a mutation version AND either:
+        ///   - level == 0 (mutation of an insert part — find source inline), or
+        ///   - a source part with the same block range exists (local mutation).
+        /// Clone the source part's delete marks.
+        op_name = "mutation";
+
+        if (!mutation_source)
+        {
+            /// Level-0 mutation: source has the same block range at level 0.
+            for (const auto & part : all_visible_parts)
+            {
+                if (part->info.min_block == info.min_block
+                    && part->info.max_block == info.max_block
+                    && part->info.mutation < info.mutation)
+                {
+                    mutation_source = part;
+                    break;
+                }
+            }
+        }
+
+        if (!mutation_source)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "dedupPart: mutation part '{}' has no matching source part in visible_parts", new_part->name);
+
+        dedupForMutation(new_part, mutation_source);
+    }
+    else if (!source_delete_mark_snapshots.empty())
+    {
+        /// Has delete mark snapshots — this is a locally-produced merge.
+        /// Propagate source parts' delete marks into the merged part.
+        op_name = "merge";
+        dedupForMerge(new_part, metadata_snapshot, source_parts, source_delete_mark_snapshots);
+    }
+    else
+    {
+        /// Level > 0, no snapshots, no matching source part — a fetched part.
+        /// Try optimized dual-iterator path; falls back to full dedup if
+        /// source parts have block gaps.
+        op_name = "fetch";
+        dedupForFetch(new_part, metadata_snapshot, source_parts, all_visible_parts);
+    }
 
     LOG_DEBUG(log, "dedupPart: part '{}', op={}, visible_parts={}, elapsed={}us",
-        new_part->name, static_cast<int>(op), all_visible_parts.size(), dedup_watch.elapsedMicroseconds());
+        new_part->name, op_name, all_visible_parts.size(), dedup_watch.elapsedMicroseconds());
 }
 
 void MergeTreeDedupPartManager::commitDeleteMarkBuffers(const DataPartsLock & /*lock*/)

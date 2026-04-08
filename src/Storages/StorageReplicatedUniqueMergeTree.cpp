@@ -1,5 +1,5 @@
 
-#include <Storages/StorageUniqueMergeTree.h>
+#include <Storages/StorageReplicatedUniqueMergeTree.h>
 
 #include <Storages/MergeTree/MergeTreeDedupPartManager.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
@@ -13,6 +13,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
+    extern const int NOT_IMPLEMENTED;
 }
 
 /// Validate that the named unique projection exists in metadata and has the correct type.
@@ -29,43 +30,49 @@ static void validateUniqueProjection(
 
         if (!projection.index)
             throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                "StorageUniqueMergeTree: projection '{}' exists but has no index in table '{}'",
+                "StorageReplicatedUniqueMergeTree: projection '{}' exists but has no index in table '{}'",
                 projection_name, full_table_name);
 
         const auto * idx = dynamic_cast<const ProjectionIndexUnique *>(projection.index.get());
         if (!idx)
             throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                "StorageUniqueMergeTree: projection '{}' has index but it is not of TYPE unique in table '{}'",
+                "StorageReplicatedUniqueMergeTree: projection '{}' has index but it is not of TYPE unique in table '{}'",
                 projection_name, full_table_name);
 
         return;
     }
 
     throw Exception(ErrorCodes::BAD_ARGUMENTS,
-        "StorageUniqueMergeTree requires a projection named '{}' with TYPE unique, "
+        "StorageReplicatedUniqueMergeTree requires a projection named '{}' with TYPE unique, "
         "but it was not found in table '{}' (total projections: {})",
         projection_name, full_table_name, projections.size());
 }
 
-StorageUniqueMergeTree::StorageUniqueMergeTree(
+StorageReplicatedUniqueMergeTree::StorageReplicatedUniqueMergeTree(
+    const TableZnodeInfo & zookeeper_info_,
+    LoadingStrictnessLevel mode,
     const StorageID & table_id_,
     const String & relative_data_path_,
     const StorageInMemoryMetadata & metadata_,
-    LoadingStrictnessLevel mode,
     ContextMutablePtr context_,
     const String & date_column_name,
     const MergingParams & merging_params_,
-    std::unique_ptr<MergeTreeSettings> storage_settings_,
+    std::unique_ptr<MergeTreeSettings> settings_,
+    bool need_check_structure,
+    const ZooKeeperRetriesInfo & create_query_zookeeper_retries_info_,
     const String & unique_projection_name_)
-    : StorageMergeTree(
+    : StorageReplicatedMergeTree(
+          zookeeper_info_,
+          mode,
           table_id_,
           relative_data_path_,
           metadata_,
-          mode,
           context_,
           date_column_name,
           merging_params_,
-          std::move(storage_settings_))
+          std::move(settings_),
+          need_check_structure,
+          create_query_zookeeper_retries_info_)
     , unique_projection_name(unique_projection_name_)
 {
     if (unique_projection_name.empty())
@@ -83,7 +90,7 @@ StorageUniqueMergeTree::StorageUniqueMergeTree(
         });
 }
 
-std::any StorageUniqueMergeTree::onBeforeTransactionCommit(
+std::any StorageReplicatedUniqueMergeTree::onBeforeTransactionCommit(
     const MutableDataParts & parts, const BeforeCommitHookContext & before_commit_context)
 {
     /// Serialize concurrent commits: only one thread computes delete bitmaps at a time.
@@ -103,7 +110,23 @@ std::any StorageUniqueMergeTree::onBeforeTransactionCommit(
     return std::make_shared<UniqueProcessLock>(std::move(unique_lock));
 }
 
-void StorageUniqueMergeTree::startup()
+void StorageReplicatedUniqueMergeTree::replacePartitionFrom(
+    const StoragePtr & /*source_table*/, const ASTPtr & /*partition*/, bool /*replace*/, ContextPtr /*query_context*/)
+{
+    throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+        "REPLACE PARTITION is not supported for ReplicatedUniqueMergeTree. "
+        "The operation bypasses the dedup commit hook and would produce incorrect results");
+}
+
+void StorageReplicatedUniqueMergeTree::movePartitionToTable(
+    const StoragePtr & /*dest_table*/, const ASTPtr & /*partition*/, ContextPtr /*query_context*/)
+{
+    throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+        "MOVE PARTITION TO TABLE is not supported for ReplicatedUniqueMergeTree. "
+        "The operation bypasses the dedup commit hook and would produce incorrect results");
+}
+
+void StorageReplicatedUniqueMergeTree::startup()
 {
     /// Rebuild delete marks for all active parts before background tasks start,
     /// so that merges/mutations observe correct dedup state.
@@ -111,7 +134,7 @@ void StorageUniqueMergeTree::startup()
 
     LOG_INFO(log, "Delete marks rebuilt for all active parts, starting background tasks");
 
-    StorageMergeTree::startup();
+    StorageReplicatedMergeTree::startup();
 }
 
 }
