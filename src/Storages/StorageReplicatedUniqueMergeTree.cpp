@@ -97,12 +97,16 @@ std::any StorageReplicatedUniqueMergeTree::onBeforeTransactionCommit(
     auto unique_lock = dedup_manager->lockUniqueProcess();
 
     DeleteMarkSnapshotMap delete_mark_snapshots;
+    std::optional<DeleteMarkSnapshotMap> opt_snapshots;
     if (before_commit_context.data.has_value())
+    {
         delete_mark_snapshots = std::any_cast<DeleteMarkSnapshotMap>(before_commit_context.data);
+        opt_snapshots = std::move(delete_mark_snapshots);
+    }
 
     for (const auto & part : parts)
     {
-        dedup_manager->dedupPart(part, delete_mark_snapshots);
+        dedup_manager->dedupPart(part, opt_snapshots);
     }
 
     /// Wrap in shared_ptr because std::any requires CopyConstructible,

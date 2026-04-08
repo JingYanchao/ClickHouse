@@ -176,8 +176,7 @@ void MergePlainMergeTreeTask::finish()
     /// Pass delete mark snapshots to the before-commit hook for diff-based dedup.
     {
         MergeTreeData::BeforeCommitHookContext hook_ctx;
-        if (!source_delete_mark_snapshots.empty())
-            hook_ctx.data = std::move(source_delete_mark_snapshots);
+        hook_ctx.data = std::move(source_delete_mark_snapshots);
         transaction.setBeforeCommitHookContext(std::move(hook_ctx));
     }
 

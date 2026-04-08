@@ -391,7 +391,7 @@ std::vector<MergeTreeDedupPartManager::PartWithSSTReader> MergeTreeDedupPartMana
 MergeTreeDedupPartManager::DedupPartWithSSTReaders MergeTreeDedupPartManager::prepareSSTReadersForDedup(
     const DataPartPtr & input_part,
     const StorageMetadataPtr & metadata_snapshot,
-    MergeTreeData::DataPartsVector & visible_parts)
+    const DataPartsVector & other_parts)
 {
     DedupPartWithSSTReaders ctx;
 
@@ -407,8 +407,8 @@ MergeTreeDedupPartManager::DedupPartWithSSTReaders MergeTreeDedupPartManager::pr
     }
     ctx.input = {input_part, std::move(input_reader)};
 
-    /// Build visible part SST readers from cache.
-    ctx.visible_parts = openSSTReadersForParts(visible_parts, metadata_snapshot);
+    /// Build SST readers for the other parts (visible parts or source parts) from cache.
+    ctx.visible_parts = openSSTReadersForParts(other_parts, metadata_snapshot);
     return ctx;
 }
 
@@ -416,7 +416,7 @@ MergeTreeDedupPartManager::DedupPartWithSSTReaders MergeTreeDedupPartManager::pr
 void MergeTreeDedupPartManager::dedupForInsert(
     const DataPartPtr & new_part,
     const StorageMetadataPtr & metadata_snapshot,
-    MergeTreeData::DataPartsVector & visible_parts)
+    const DataPartsVector & visible_parts)
 {
     /// Open the input part's SST reader (from cache) for cross-part dedup.
     auto sst_ctx = prepareSSTReadersForDedup(new_part, metadata_snapshot, visible_parts);
@@ -570,7 +570,7 @@ void MergeTreeDedupPartManager::dedupForFetch(
     const DataPartPtr & new_part,
     const StorageMetadataPtr & metadata_snapshot,
     const DataPartsVector & source_parts,
-    MergeTreeData::DataPartsVector & all_visible_parts)
+    const DataPartsVector & all_visible_parts)
 {
     /// Check if source parts fully cover the fetched part's block range.
     /// If there are gaps (some source parts are missing on this replica),
@@ -637,9 +637,12 @@ void MergeTreeDedupPartManager::dedupForFetch(
         return;
     }
 
-    /// Open SST readers for source parts and the fetched part.
-    auto source_part_readers = openSSTReadersForParts(source_parts, metadata_snapshot);
-    if (source_part_readers.empty())
+    /// Open SST readers for the fetched part and source parts.
+    auto sst_ctx = prepareSSTReadersForDedup(new_part, metadata_snapshot, source_parts);
+    if (!sst_ctx.input.reader)
+        return;
+
+    if (sst_ctx.visible_parts.empty())
     {
         LOG_DEBUG(log,
             "dedupForFetch: part '{}', no source parts with SST, skip",
@@ -647,28 +650,17 @@ void MergeTreeDedupPartManager::dedupForFetch(
         return;
     }
 
-    SCOPE_EXIT({ releaseAllBufferMemory(source_part_readers); });
-
-    auto fetched_sst_reader = new_part->getOrOpenSSTReader(metadata_snapshot);
-    if (!fetched_sst_reader)
-    {
-        LOG_DEBUG(log,
-            "dedupForFetch: part '{}' has no unique projection SST, skip",
-            new_part->name);
-        return;
-    }
+    SCOPE_EXIT({ sst_ctx.releaseBufferMemory(); });
 
     ProjectionIndexBitmapPtr result_bitmap;
 
     propagateDeleteMarksByDualIterator(
-        source_part_readers,
-        fetched_sst_reader, new_part->rows_count,
+        sst_ctx.visible_parts,
+        sst_ctx.input.reader, new_part->rows_count,
         result_bitmap, log);
 
     if (result_bitmap && !result_bitmap->empty())
         delta_deleted_rows_map[new_part.get()] = std::move(result_bitmap);
-
-    fetched_sst_reader->releaseBufferMemory();
 }
 
 void MergeTreeDedupPartManager::dedupForMerge(
@@ -857,8 +849,16 @@ void MergeTreeDedupPartManager::tryDedupDeletedKeysFromSourceParts(
     const MergeTreeData::DeleteMarkSnapshotMap & delete_mark_snapshots)
 {
     Stopwatch watch;
-    auto source_part_readers = openSSTReadersForParts(source_parts, metadata_snapshot);
 
+    /// Open SST readers for the merged part and source parts.
+    auto sst_ctx = prepareSSTReadersForDedup(new_part, metadata_snapshot, source_parts);
+    if (!sst_ctx.input.reader)
+        return;
+
+    /// Ensure SST buffer memory is released on all exit paths.
+    SCOPE_EXIT({ sst_ctx.releaseBufferMemory(); });
+
+    auto & source_part_readers = sst_ctx.visible_parts;
     if (source_part_readers.empty())
     {
         LOG_DEBUG(log,
@@ -866,9 +866,6 @@ void MergeTreeDedupPartManager::tryDedupDeletedKeysFromSourceParts(
             new_part->name, watch.elapsedMicroseconds());
         return;
     }
-
-    /// Ensure SST buffer memory is released on all exit paths.
-    SCOPE_EXIT({ releaseAllBufferMemory(source_part_readers); });
 
     /// Compute diff bitmaps: diff = current_delete_marks AND NOT snapshot_delete_marks.
     /// Only entries in the diff were newly deleted by concurrent INSERTs during merge/mutation.
@@ -921,19 +918,15 @@ void MergeTreeDedupPartManager::tryDedupDeletedKeysFromSourceParts(
     /// For each source part, scan its SST for keys whose offsets are in the diff
     /// bitmap (newly deleted by concurrent INSERTs), then look them up in the
     /// merged part's SST to propagate the deletion.
-    auto merged_sst_reader = new_part->getOrOpenSSTReader(metadata_snapshot);
-
     ProjectionIndexBitmapPtr result_bitmap;
 
     propagateDeletedKeysPerSourcePart(
         source_part_readers, diff_bitmaps,
-        merged_sst_reader, new_part->rows_count,
+        sst_ctx.input.reader, new_part->rows_count,
         result_bitmap, log);
 
     if (result_bitmap && !result_bitmap->empty())
         delta_deleted_rows_map[new_part.get()] = std::move(result_bitmap);
-
-    merged_sst_reader->releaseBufferMemory();
 
     LOG_DEBUG(log,
         "tryDedupDeletedKeysFromSourceParts: part '{}', source_parts={}, diff_count={}, elapsed={}us",
@@ -942,7 +935,7 @@ void MergeTreeDedupPartManager::tryDedupDeletedKeysFromSourceParts(
 
 void MergeTreeDedupPartManager::dedupPart(
     const DataPartPtr & new_part,
-    const MergeTreeData::DeleteMarkSnapshotMap & source_delete_mark_snapshots)
+    const std::optional<MergeTreeData::DeleteMarkSnapshotMap> & source_delete_mark_snapshots)
 {
     if (!new_part)
         return;
@@ -968,12 +961,11 @@ void MergeTreeDedupPartManager::dedupPart(
 
     /// Infer operation type from part metadata and context:
     ///
-    ///   level == 0 + mutation == 0                  → Insert  (full cross-part dedup)
-    ///   level == 0 + mutation > 0                   → Mutation of level-0 part (clone delete marks)
-    ///   level > 0 + has snapshots + mutation source → Mutation (clone source delete marks)
-    ///   level > 0 + has snapshots + no mut. source  → Merge   (propagate source delete marks)
-    ///   level > 0 + no snapshots + mutation source  → Mutation (clone source delete marks)
-    ///   level > 0 + no snapshots + no mut. source   → Fetch   (full cross-part dedup)
+    ///   level == 0 + mutation == 0                              → Insert  (full cross-part dedup)
+    ///   level == 0 + mutation > 0                               → Mutation of level-0 part (clone delete marks)
+    ///   level > 0 + mutation source found                       → Mutation (clone source delete marks)
+    ///   level > 0 + has snapshots (has_value) + no mut. source  → Merge   (propagate source delete marks)
+    ///   level > 0 + no snapshots (nullopt) + no mut. source     → Fetch   (full cross-part dedup)
     ///
     /// Source parts are collected in a single scan of visible_parts:
     ///   - source_parts: all parts covered by the new part's block range
@@ -1044,12 +1036,13 @@ void MergeTreeDedupPartManager::dedupPart(
 
         dedupForMutation(new_part, mutation_source);
     }
-    else if (!source_delete_mark_snapshots.empty())
+    else if (source_delete_mark_snapshots.has_value())
     {
         /// Has delete mark snapshots — this is a locally-produced merge.
-        /// Propagate source parts' delete marks into the merged part.
+        /// The map may be empty when none of the source parts had delete marks,
+        /// but has_value() == true distinguishes it from a fetched part.
         op_name = "merge";
-        dedupForMerge(new_part, metadata_snapshot, source_parts, source_delete_mark_snapshots);
+        dedupForMerge(new_part, metadata_snapshot, source_parts, *source_delete_mark_snapshots);
     }
     else
     {

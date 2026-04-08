@@ -67,9 +67,12 @@ explicit MergeTreeDedupPartManager(const MergeTreeData & storage_);
     /// The optional delete_mark_snapshots carries a snapshot of source parts'
     /// delete marks taken at merge/mutation start, enabling diff-based dedup
     /// that only processes newly deleted keys instead of scanning all keys.
+    /// When the optional has a value (even an empty map), the part is treated
+    /// as a locally-produced merge; when it is nullopt, the part is treated
+    /// as a fetch (or insert/mutation, which are handled by earlier branches).
     void dedupPart(
         const DataPartPtr & new_part,
-        const MergeTreeData::DeleteMarkSnapshotMap & source_part_delete_mark_snapshots = {});
+        const std::optional<MergeTreeData::DeleteMarkSnapshotMap> & source_part_delete_mark_snapshots = std::nullopt);
 
     /// Apply accumulated delta delete bitmaps to each part's delete_mark_bitmap.
     /// Should be called under DataPartsLock to ensure atomicity with part state transitions.
@@ -111,6 +114,13 @@ explicit MergeTreeDedupPartManager(const MergeTreeData & storage_);
     {
         PartWithSSTReader input;
         std::vector<PartWithSSTReader> visible_parts;
+
+        /// Release ReadBuffer memory for all held SST readers.
+        void releaseBufferMemory() const
+        {
+            input.releaseBufferMemory();
+            releaseAllBufferMemory(visible_parts);
+        }
     };
 
     /// Lightweight multi-way merge iterator over rocksdb SST iterators.
@@ -172,14 +182,14 @@ private:
     DedupPartWithSSTReaders prepareSSTReadersForDedup(
         const DataPartPtr & input_part,
         const StorageMetadataPtr & metadata_snapshot,
-        MergeTreeData::DataPartsVector & visible_parts);
+        const DataPartsVector & other_parts);
 
     /// Dedup path for INSERT-produced parts: cross-part dedup against all
     /// active visible parts using parallel SST key comparison.
     void dedupForInsert(
         const DataPartPtr & new_part,
         const StorageMetadataPtr & metadata_snapshot,
-        MergeTreeData::DataPartsVector & visible_parts);
+        const DataPartsVector & visible_parts);
 
     /// Dedup path for FETCH-produced parts: optimized path that avoids full
     /// cross-part dedup when source parts fully cover the fetched part's block
@@ -191,7 +201,7 @@ private:
         const DataPartPtr & new_part,
         const StorageMetadataPtr & metadata_snapshot,
         const DataPartsVector & source_parts,
-        MergeTreeData::DataPartsVector & all_visible_parts);
+        const DataPartsVector & all_visible_parts);
 
     /// Dedup path for MERGE-produced parts: propagate delete marks from
     /// source parts into the merged part via deleted-keys optimization.
