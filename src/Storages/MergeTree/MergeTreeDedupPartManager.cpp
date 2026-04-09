@@ -440,9 +440,6 @@ void MergeTreeDedupPartManager::dedupForInsert(
 ///     source parts fully cover the fetched part's block range (no gaps).
 ///   - Keys in source parts but not in the fetched part: these are losers
 ///     eliminated during merge — skip them.
-///
-/// Complexity: O(N_source * log(K) + N_fetched) with pure sequential IO,
-/// where K = number of source parts.
 static void propagateDeleteMarksByDualIterator(
     std::vector<PartWithSSTReader> & source_part_readers,
     const SSTFileReaderPtr & fetched_sst_reader,
@@ -524,18 +521,32 @@ static void propagateDeleteMarksByDualIterator(
 
             if (cmp_result < 0)
             {
-                /// Source key < fetched key: merge loser or irrelevant key, skip.
+                /// Source key < fetched key: merge loser or irrelevant key.
+                /// Aggressively skip ALL source entries below fetched_key
+                /// in a tight loop (no value decode, no bitmap lookup).
                 merge_iter.next();
                 ++source_keys_scanned;
+                while (merge_iter.valid() && merge_iter.key().compare(fetched_key) < 0)
+                {
+                    merge_iter.next();
+                    ++source_keys_scanned;
+                }
                 continue;
             }
 
             if (cmp_result == 0)
             {
                 /// Keys match and source entry is live → no deletion needed.
-                /// Advance both iterators past this key.
+                /// Advance merge_iter past this key (including duplicates
+                /// from other source parts). Use fetched_key as the
+                /// comparison target — it's still valid and equals source_key.
                 merge_iter.next();
                 ++source_keys_scanned;
+                while (merge_iter.valid() && merge_iter.key().compare(fetched_key) == 0)
+                {
+                    merge_iter.next();
+                    ++source_keys_scanned;
+                }
 
                 fetched_iter->Next();
                 ++fetched_keys_scanned;
@@ -610,9 +621,11 @@ void MergeTreeDedupPartManager::dedupForFetch(
     /// from source parts, no need for full cross-part dedup.
 
     /// Quick row-count check (analogous to dedupForMerge):
-    /// If the fetched part's row count matches the sum of source parts'
-    /// effective rows (rows - delete marks), no concurrent INSERT has
+    /// If the fetched part's row count is no greater than the sum of source
+    /// parts' effective rows (rows - delete marks), no concurrent INSERT has
     /// deleted any key in the source parts — nothing to propagate.
+    /// Delete marks are monotonically increasing, so source_effective_rows
+    /// can only be <= new_part->rows_count; using >= as a defensive check.
     size_t source_effective_rows = 0;
     for (const auto & part : source_parts)
     {
@@ -622,31 +635,11 @@ void MergeTreeDedupPartManager::dedupForFetch(
         source_effective_rows += (part->rows_count - deleted);
     }
 
-    if (source_effective_rows == new_part->rows_count)
+    if (source_effective_rows >= new_part->rows_count)
     {
         LOG_DEBUG(log,
-            "dedupForFetch: part '{}' rows ({}) match source effective rows, skip",
-            new_part->name, new_part->rows_count);
-        return;
-    }
-
-    /// Quick check: if no source part has any delete marks, nothing to propagate.
-    bool any_delete_marks = false;
-    for (const auto & part : source_parts)
-    {
-        auto dm = part->getDeleteMarkBitmap();
-        if (dm && !dm->empty())
-        {
-            any_delete_marks = true;
-            break;
-        }
-    }
-
-    if (!any_delete_marks)
-    {
-        LOG_DEBUG(log,
-            "dedupForFetch: part '{}', source parts have no delete marks, skip",
-            new_part->name);
+            "dedupForFetch: part '{}' rows ({}) match source effective rows ({}), skip",
+            new_part->name, new_part->rows_count, source_effective_rows);
         return;
     }
 
@@ -699,13 +692,15 @@ void MergeTreeDedupPartManager::dedupForMerge(
         source_effective_rows += (part->rows_count - deleted);
     }
 
-    /// If the merged part's row count matches the sum of source parts'
-    /// effective rows (rows - delete marks), no concurrent INSERT has
+    /// If the merged part's row count is no greater than the sum of source
+    /// parts' effective rows (rows - delete marks), no concurrent INSERT has
     /// deleted any key in the source parts — nothing to propagate.
-    if (source_effective_rows == new_part->rows_count)
+    /// Delete marks are monotonically increasing, so source_effective_rows
+    /// can only be <= new_part->rows_count; using >= as a defensive check.
+    if (source_effective_rows >= new_part->rows_count)
     {
-        LOG_TRACE(log, "dedupForMerge: part '{}' rows ({}) match source effective rows, skip",
-            new_part->name, new_part->rows_count);
+        LOG_TRACE(log, "dedupForMerge: part '{}' rows ({}) match source effective rows ({}), skip",
+            new_part->name, new_part->rows_count, source_effective_rows);
         return;
     }
 
