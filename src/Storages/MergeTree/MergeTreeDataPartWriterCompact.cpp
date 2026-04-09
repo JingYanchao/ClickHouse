@@ -170,6 +170,7 @@ void writeColumnSingleGranule(
         serialize_settings.write_statistics = ISerialization::SerializeBinaryBulkSettings::StatisticsMode::PREFIX_EMPTY;
     serialize_settings.use_specialized_prefixes_and_suffixes_substreams = true;
     serialize_settings.data_part_type = MergeTreeDataPartType::Compact;
+    serialize_settings.sst_write_stream_getter = std::move(sst_write_stream_getter);
 
     /// Use the sample column (from block_sample) for the state prefix because
     /// serializeBinaryBulkStatePrefix only reads column structure and statistics
@@ -202,7 +203,6 @@ ISerialization::SerializeBinaryBulkSettings MergeTreeDataPartWriterCompact::getS
     serialize_settings.write_statistics = ISerialization::SerializeBinaryBulkSettings::StatisticsMode::PREFIX;
     serialize_settings.use_specialized_prefixes_and_suffixes_substreams = true;
     serialize_settings.data_part_type = MergeTreeDataPartType::Compact;
-    serialize_settings.sst_write_stream_getter = std::move(sst_write_stream_getter);
 
     return serialize_settings;
 }
