@@ -191,12 +191,11 @@ private:
         const StorageMetadataPtr & metadata_snapshot,
         const DataPartsVector & visible_parts);
 
-    /// Dedup path for FETCH-produced parts: optimized path that avoids full
-    /// cross-part dedup when source parts fully cover the fetched part's block
-    /// range (no gaps). Uses a dual-iterator approach: builds a merging iterator
-    /// over source parts' SSTs and a plain iterator over the fetched part's SST,
-    /// then walks both in key order to propagate delete marks from source parts.
-    /// Falls back to `dedupForInsert` when source parts have block gaps.
+    /// Dedup path for FETCH-produced parts: uses reverse dedup approach.
+    /// Iterates the small visible parts' SST keys and MultiGet into the
+    /// large fetched part's SST. When dedup_snapshot_max_block is available,
+    /// parts with max_block <= snapshot are skipped entirely, dramatically
+    /// reducing the dedup scope.
     void dedupForFetch(
         const DataPartPtr & new_part,
         const StorageMetadataPtr & metadata_snapshot,

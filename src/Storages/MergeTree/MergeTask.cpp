@@ -552,6 +552,12 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare() const
     builder->withPartType(global_ctx->future_part->part_format.part_type);
 
     global_ctx->new_data_part = std::move(*builder).build();
+
+    /// Propagate dedup_snapshot_max_block to the new part so it gets
+    /// written to dedup_snapshot.txt during finalization.
+    if (global_ctx->dedup_snapshot_max_block.has_value())
+        global_ctx->new_data_part->dedup_snapshot_max_block = global_ctx->dedup_snapshot_max_block;
+
     auto data_part_storage = global_ctx->new_data_part->getDataPartStoragePtr();
 
     if (data_part_storage->exists())

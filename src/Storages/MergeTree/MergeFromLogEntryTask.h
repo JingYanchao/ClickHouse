@@ -64,6 +64,10 @@ private:
     /// Snapshot of source parts' delete marks taken before merge starts.
     /// Used by dedup to detect concurrent INSERT deletions during merge.
     MergeTreeData::DeleteMarkSnapshotMap source_delete_mark_snapshots;
+
+    /// The maximum max_block among all active parts in the partition
+    /// at the time of snapshotting delete marks.
+    std::optional<UInt64> dedup_snapshot_max_block;
 };
 
 

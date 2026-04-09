@@ -275,6 +275,12 @@ public:
     /// Populated by MergeTreeDedupPartManager during dedup or rebuild.
     mutable ProjectionIndexBitmapPtr delete_mark_bitmap;
 
+    /// For UniqueMergeTree merge parts: the maximum max_block among all active
+    /// parts in the partition at the time of snapshotting delete marks.
+    /// Stored in dedup_snapshot.txt and used by the fetch path on other replicas
+    /// to skip dedup for parts that were already visible to the merge.
+    std::optional<UInt64> dedup_snapshot_max_block;
+
     /// If true, the destructor will delete the directory with the part.
     /// FIXME Why do we need this flag? What's difference from Temporary and DeleteOnDestroy state? Can we get rid of this?
     bool is_temp = false;
@@ -564,6 +570,10 @@ public:
 
     /// File that contains list of substreams in order of serialization/deserialization for each column.
     static constexpr auto COLUMNS_SUBSTREAMS_FILE_NAME = "columns_substreams.txt";
+
+    /// File that stores the snapshot_max_block at merge time for UniqueMergeTree.
+    /// Used by the fetch path on other replicas to narrow the dedup scope.
+    static constexpr auto DEDUP_SNAPSHOT_FILE_NAME = "dedup_snapshot.txt";
 
     /// Checks that all TTLs (table min/max, column ttls, so on) for part
     /// calculated. Part without calculated TTL may exist if TTL was added after

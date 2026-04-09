@@ -345,6 +345,16 @@ MergedBlockOutputStream::WrittenFiles MergedBlockOutputStream::finalizePartOnDis
         writeIntText(rows_count, buffer);
     });
 
+    /// Write dedup snapshot max_block for UniqueMergeTree merge parts.
+    /// This allows the fetch path on other replicas to narrow the dedup scope.
+    if (new_part->dedup_snapshot_max_block.has_value())
+    {
+        write_hashed_file(IMergeTreeDataPart::DEDUP_SNAPSHOT_FILE_NAME, [&](auto & buffer)
+        {
+            writeIntText(*new_part->dedup_snapshot_max_block, buffer);
+        });
+    }
+
     if (!new_part->ttl_infos.empty())
     {
         write_hashed_file("ttl.txt", [&](auto & buffer)
