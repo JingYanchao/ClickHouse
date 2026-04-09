@@ -4164,7 +4164,7 @@ void Context::clearSSTFileReaderCache() const
         cache->clear();
 }
 
-void Context::updateSSTFileReaderCacheConfiguration(const Poco::Util::AbstractConfiguration & config)
+void Context::updateSSTFileReaderCacheConfiguration(const Poco::Util::AbstractConfiguration & config, size_t max_cache_size)
 {
     std::lock_guard lock(shared->mutex);
 
@@ -4172,6 +4172,11 @@ void Context::updateSSTFileReaderCacheConfiguration(const Poco::Util::AbstractCo
         throw Exception(ErrorCodes::LOGICAL_ERROR, "SST file reader cache was not created yet.");
 
     size_t max_size = config.getUInt64("sst_reader_cache_size", DEFAULT_SST_READER_CACHE_MAX_SIZE);
+    if (max_size > max_cache_size)
+    {
+        max_size = max_cache_size;
+        LOG_DEBUG(shared->log, "Lowered SST file reader cache size to {} because the system has limited RAM", formatReadableSizeWithBinarySuffix(max_size));
+    }
     shared->sst_file_reader_cache->setMaxSizeInBytes(max_size);
 }
 
