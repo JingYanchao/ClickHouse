@@ -213,7 +213,8 @@ private:
         const DataPartPtr & new_part,
         const StorageMetadataPtr & metadata_snapshot,
         const DataPartsVector & source_parts,
-        const MergeTreeData::DeleteMarkSnapshotMap & delete_mark_snapshots);
+        const MergeTreeData::DeleteMarkSnapshotMap & delete_mark_snapshots,
+        const DataPartsVector & all_visible_parts);
 
     /// Dedup path for MUTATION-produced parts: a mutation transforms exactly
     /// one source part into one new part.

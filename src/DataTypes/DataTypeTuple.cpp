@@ -222,7 +222,7 @@ MutableColumnPtr DataTypeTuple::createColumn(const ISerialization & serializatio
     if (const auto * serialization_detached = typeid_cast<const SerializationDetached *>(current_serialization))
         return createColumn(*serialization_detached->getNested());
 
-    const auto * serialization_tuple = typeid_cast<const SerializationTuple *>(current_serialization);
+    const auto * serialization_tuple = dynamic_cast<const SerializationTuple *>(current_serialization);
     if (!serialization_tuple)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected serialization to create column of type Tuple");
 
