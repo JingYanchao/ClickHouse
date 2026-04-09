@@ -9,7 +9,13 @@
 #include <Common/logger_useful.h>
 #include <Common/setThreadName.h>
 #include <Common/threadPoolCallbackRunner.h>
+#include <Core/ServerSettings.h>
 #include <base/scope_guard.h>
+
+namespace ServerSetting
+{
+    extern const ServerSettingsUInt64 unique_key_dedup_max_parallel_threads;
+}
 
 namespace CurrentMetrics
 {
@@ -34,11 +40,6 @@ namespace ErrorCodes
     extern const int INCORRECT_DATA;
     extern const int LOGICAL_ERROR;
 }
-
-/// Default number of parallel dedup threads.
-static constexpr size_t DEDUP_MAX_PARALLEL = 16;
-/// Minimum number of keys to trigger parallel dedup; below this threshold, single-threaded path is used.
-static constexpr size_t MIN_KEYS_FOR_PARALLEL = 16 * 16 * 2;
 
 /// Maximum number of keys to batch in a single MultiGet call.
 static constexpr size_t MULTI_GET_BATCH_SIZE = 16;
@@ -219,7 +220,7 @@ static std::vector<std::string> sampleBoundaryKeysFromSST(
     size_t total_keys,
     size_t max_shards)
 {
-    const size_t num_shards = (total_keys < MIN_KEYS_FOR_PARALLEL) ? 1 : std::min(max_shards, total_keys);
+    const size_t num_shards = std::min(max_shards, total_keys);
     const size_t stride = total_keys / num_shards;
 
     std::vector<std::string> boundary_keys;
@@ -246,7 +247,8 @@ static std::vector<std::string> sampleBoundaryKeysFromSST(
 /// Returns a map from part pointer to the computed delete mark bitmap.
 static PartDeleteBitmapMap dedupKeysThroughNewCommitParts(
     const PartWithSSTReader & input,
-    const std::vector<PartWithSSTReader> & visible_parts)
+    const std::vector<PartWithSSTReader> & visible_parts,
+    size_t max_parallel)
 {
     PartDeleteBitmapMap result;
 
@@ -266,7 +268,7 @@ static PartDeleteBitmapMap dedupKeysThroughNewCommitParts(
     if (total_keys == 0)
         return result;
 
-    auto boundary_keys = sampleBoundaryKeysFromSST(input.reader, total_keys, DEDUP_MAX_PARALLEL);
+    auto boundary_keys = sampleBoundaryKeysFromSST(input.reader, total_keys, max_parallel);
 
     const size_t actual_shards = boundary_keys.size();
     if (actual_shards == 0)
@@ -424,7 +426,8 @@ void MergeTreeDedupPartManager::dedupForInsert(
         return;
 
     /// Cross-part dedup against all visible parts.
-    delta_deleted_rows_map = dedupKeysThroughNewCommitParts(sst_ctx.input, sst_ctx.visible_parts);
+    const size_t max_parallel = storage.getContext()->getServerSettings()[ServerSetting::unique_key_dedup_max_parallel_threads];
+    delta_deleted_rows_map = dedupKeysThroughNewCommitParts(sst_ctx.input, sst_ctx.visible_parts, max_parallel);
 }
 
 /// Propagate delete marks from source parts to the fetched part using a
@@ -1234,7 +1237,8 @@ void MergeTreeDedupPartManager::buildAllDeleteMarksOnStartup()
     size_t total_parts_deduped = 0;
     {
         const size_t num_partitions = parts_by_partition.size();
-        const size_t pool_size = std::min(num_partitions, DEDUP_MAX_PARALLEL);
+        const size_t max_parallel = storage.getContext()->getServerSettings()[ServerSetting::unique_key_dedup_max_parallel_threads];
+        const size_t pool_size = std::min(num_partitions, max_parallel);
 
         ThreadPool partition_pool(
             CurrentMetrics::UniqueKeyDedupThreads,

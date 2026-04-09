@@ -390,6 +390,11 @@ namespace
     A value of `0` means all cores.
     :::
     )", 0) \
+    DECLARE(UInt64, unique_key_dedup_max_parallel_threads, 16, R"(
+    The maximum number of parallel threads for unique key deduplication.
+    Controls the parallelism of SST key-space sharding during INSERT dedup
+    and the partition-level parallelism during startup delete-mark rebuild.
+    )", 0) \
     \
     /* Database Catalog */ \
     DECLARE(UInt64, database_atomic_delay_before_drop_table_sec, 8 * 60, R"(
