@@ -11,11 +11,9 @@
 #include <Common/threadPoolCallbackRunner.h>
 #include <Core/ServerSettings.h>
 #include <base/scope_guard.h>
-
-namespace ServerSetting
-{
-    extern const ServerSettingsUInt64 unique_key_dedup_max_parallel_threads;
-}
+#include <Interpreters/Context.h>
+#include <boost/range/join.hpp>
+#include <boost/range/iterator_range.hpp>
 
 namespace CurrentMetrics
 {
@@ -34,6 +32,11 @@ namespace ProfileEvents
 
 namespace DB
 {
+
+namespace ServerSetting
+{
+    extern const ServerSettingsUInt64 unique_key_dedup_max_parallel_threads;
+}
 
 namespace ErrorCodes
 {
@@ -318,27 +321,21 @@ static PartDeleteBitmapMap dedupKeysThroughNewCommitParts(
     ProfileEvents::increment(ProfileEvents::UniqueKeyDedupParallelProcessMicroseconds, parallel_process_watch.elapsedMicroseconds());
 
     /// Merge all per-shard delta bitmaps into the final output.
-    /// Iterate by part: for each part, create a new bitmap by merging all shard deltas.
     /// Include the input part as well — it may have rows marked as deleted
     /// when a visible part wins the version comparison.
-    auto mergeDeltaBitmaps = [&](const IMergeTreeDataPart * part_ptr, size_t rows_count)
+    auto input_range = boost::make_iterator_range(&input, &input + 1);
+    for (const auto & [part, reader] : boost::join(visible_parts, input_range))
     {
-        auto bitmap = ProjectionIndexBitmap::create(rows_count);
+        auto bitmap = ProjectionIndexBitmap::create(part->rows_count);
         for (const auto & shard_delta : delta_bitmaps)
         {
-            auto it = shard_delta.find(part_ptr);
+            auto it = shard_delta.find(part.get());
             if (it != shard_delta.end() && it->second && !it->second->empty())
                 bitmap->unionWith(*it->second);
         }
         if (!bitmap->empty())
-            result.emplace(part_ptr, std::move(bitmap));
-    };
-
-    for (const auto & [part, reader] : visible_parts)
-        mergeDeltaBitmaps(part.get(), part->rows_count);
-
-    /// Input part can also have rows deleted when visible parts win.
-    mergeDeltaBitmaps(input.part.get(), input.part->rows_count);
+            result.emplace(part.get(), std::move(bitmap));
+    }
 
     return result;
 }
@@ -395,23 +392,23 @@ MergeTreeDedupPartManager::DedupPartWithSSTReaders MergeTreeDedupPartManager::pr
     const StorageMetadataPtr & metadata_snapshot,
     const DataPartsVector & other_parts)
 {
-    DedupPartWithSSTReaders ctx;
+    DedupPartWithSSTReaders sst_readers;
 
     if (input_part->rows_count == 0)
-        return ctx;
+        return sst_readers;
 
     /// Get cached SST reader for input part.
     auto input_reader = input_part->getOrOpenSSTReader(metadata_snapshot);
     if (!input_reader)
     {
         LOG_DEBUG(log, "part '{}' has no unique projection SST, skip dedup", input_part->name);
-        return ctx;
+        return sst_readers;
     }
-    ctx.input = {input_part, std::move(input_reader)};
+    sst_readers.input = {input_part, std::move(input_reader)};
 
     /// Build SST readers for the other parts (visible parts or source parts) from cache.
-    ctx.visible_parts = openSSTReadersForParts(other_parts, metadata_snapshot);
-    return ctx;
+    sst_readers.visible_parts = openSSTReadersForParts(other_parts, metadata_snapshot);
+    return sst_readers;
 }
 
 
@@ -421,13 +418,13 @@ void MergeTreeDedupPartManager::dedupForInsert(
     const DataPartsVector & visible_parts)
 {
     /// Open the input part's SST reader (from cache) for cross-part dedup.
-    auto sst_ctx = prepareSSTReadersForDedup(new_part, metadata_snapshot, visible_parts);
-    if (!sst_ctx.input.reader)
+    auto sst_readers = prepareSSTReadersForDedup(new_part, metadata_snapshot, visible_parts);
+    if (!sst_readers.input.reader)
         return;
 
     /// Cross-part dedup against all visible parts.
     const size_t max_parallel = storage.getContext()->getServerSettings()[ServerSetting::unique_key_dedup_max_parallel_threads];
-    delta_deleted_rows_map = dedupKeysThroughNewCommitParts(sst_ctx.input, sst_ctx.visible_parts, max_parallel);
+    delta_deleted_rows_map = dedupKeysThroughNewCommitParts(sst_readers.input, sst_readers.visible_parts, max_parallel);
 }
 
 /// Propagate delete marks from source parts to the fetched part using a
@@ -647,11 +644,11 @@ void MergeTreeDedupPartManager::dedupForFetch(
     }
 
     /// Open SST readers for the fetched part and source parts.
-    auto sst_ctx = prepareSSTReadersForDedup(new_part, metadata_snapshot, source_parts);
-    if (!sst_ctx.input.reader)
+    auto sst_readers = prepareSSTReadersForDedup(new_part, metadata_snapshot, source_parts);
+    if (!sst_readers.input.reader)
         return;
 
-    if (sst_ctx.visible_parts.empty())
+    if (sst_readers.visible_parts.empty())
     {
         LOG_DEBUG(log,
             "dedupForFetch: part '{}', no source parts with SST, skip",
@@ -659,13 +656,13 @@ void MergeTreeDedupPartManager::dedupForFetch(
         return;
     }
 
-    SCOPE_EXIT({ sst_ctx.releaseBufferMemory(); });
+    SCOPE_EXIT({ sst_readers.releaseBufferMemory(); });
 
     ProjectionIndexBitmapPtr result_bitmap;
 
     propagateDeleteMarksByDualIterator(
-        sst_ctx.visible_parts,
-        sst_ctx.input.reader, new_part->rows_count,
+        sst_readers.visible_parts,
+        sst_readers.input.reader, new_part->rows_count,
         result_bitmap, log);
 
     if (result_bitmap && !result_bitmap->empty())
@@ -777,14 +774,17 @@ static void propagateDeletedKeysPerSourcePart(
     std::vector<std::string> key_batch;
     key_batch.reserve(MULTI_GET_BATCH_SIZE);
 
+    /// P2: Reuse key_slices across flushBatch calls to avoid repeated allocation.
+    std::vector<rocksdb::Slice> key_slices;
+    key_slices.reserve(MULTI_GET_BATCH_SIZE);
+
     /// Flush the current batch: look up keys in the merged part and mark deletions.
     auto flushBatch = [&]()
     {
         if (key_batch.empty())
             return;
 
-        std::vector<rocksdb::Slice> key_slices;
-        key_slices.reserve(key_batch.size());
+        key_slices.clear();
         for (const auto & k : key_batch)
             key_slices.emplace_back(k);
 
@@ -819,6 +819,9 @@ static void propagateDeletedKeysPerSourcePart(
         if (!diff || diff->empty())
             continue;
 
+        /// P0: Track remaining diff keys so we can break early once all are found.
+        size_t diff_remaining = diff->cardinality();
+
         auto iter = source_part_readers[idx].reader->newIterator(opts);
         for (iter->SeekToFirst(); iter->Valid(); iter->Next())
         {
@@ -836,9 +839,14 @@ static void propagateDeletedKeysPerSourcePart(
 
             key_batch.push_back(iter->key().ToString());
             ++keys_collected;
+            --diff_remaining;
 
             if (key_batch.size() >= MULTI_GET_BATCH_SIZE)
                 flushBatch();
+
+            /// P0: All diff keys for this source part have been collected.
+            if (diff_remaining == 0)
+                break;
         }
     }
 
@@ -862,14 +870,14 @@ void MergeTreeDedupPartManager::tryDedupDeletedKeysFromSourceParts(
     Stopwatch watch;
 
     /// Open SST readers for the merged part and source parts.
-    auto sst_ctx = prepareSSTReadersForDedup(new_part, metadata_snapshot, source_parts);
-    if (!sst_ctx.input.reader)
+    auto sst_readers = prepareSSTReadersForDedup(new_part, metadata_snapshot, source_parts);
+    if (!sst_readers.input.reader)
         return;
 
     /// Ensure SST buffer memory is released on all exit paths.
-    SCOPE_EXIT({ sst_ctx.releaseBufferMemory(); });
+    SCOPE_EXIT({ sst_readers.releaseBufferMemory(); });
 
-    auto & source_part_readers = sst_ctx.visible_parts;
+    auto & source_part_readers = sst_readers.visible_parts;
     if (source_part_readers.empty())
     {
         LOG_DEBUG(log,
@@ -933,7 +941,7 @@ void MergeTreeDedupPartManager::tryDedupDeletedKeysFromSourceParts(
 
     propagateDeletedKeysPerSourcePart(
         source_part_readers, diff_bitmaps,
-        sst_ctx.input.reader, new_part->rows_count,
+        sst_readers.input.reader, new_part->rows_count,
         result_bitmap, log);
 
     if (result_bitmap && !result_bitmap->empty())

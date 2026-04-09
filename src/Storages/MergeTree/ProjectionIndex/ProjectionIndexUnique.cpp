@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <bit>
 #include <numeric>
+#include <pdqsort.h>
 
 namespace DB
 {
@@ -307,16 +308,20 @@ Block ProjectionIndexUnique::calculate(
     /// When perm_ptr is present (INSERT path), compute the inverse permutation:
     /// perm_ptr maps sorted_pos -> original_pos, but we need original_pos -> sorted_pos
     /// because part_offset must reflect the row's position in the sorted part on disk.
-    std::vector<UInt64> part_offsets(num_rows);
+    /// When perm_ptr is absent, part_offset is a simple linear function of row index,
+    /// so we avoid allocating the array entirely.
+    std::vector<UInt64> part_offsets;
+    auto get_part_offset = [&](size_t row_idx) -> UInt64
+    {
+        if (perm_ptr)
+            return part_offsets[row_idx];
+        return starting_offset + row_idx;
+    };
     if (perm_ptr)
     {
+        part_offsets.resize(num_rows);
         for (size_t k = 0; k < num_rows; ++k)
             part_offsets[(*perm_ptr)[k]] = starting_offset + k;
-    }
-    else
-    {
-        for (size_t i = 0; i < num_rows; ++i)
-            part_offsets[i] = starting_offset + i;
     }
 
     /// 3. Sort by key (lexicographic), then by (version, part_offset) descending
@@ -329,63 +334,68 @@ Block ProjectionIndexUnique::calculate(
         key_refs[i] = all_keys->getDataAt(i);
 
     const auto * ver_data = version_col ? version_col->getData().data() : nullptr;
-    std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b)
-    {
-        int cmp = key_refs[a].compare(key_refs[b]);
-        if (cmp != 0)
-            return cmp < 0;
-        /// Same key: larger (version, part_offset) comes first.
-        UInt64 ver_a = ver_data ? ver_data[a] : 0;
-        UInt64 ver_b = ver_data ? ver_data[b] : 0;
-        return std::tie(ver_a, part_offsets[a]) > std::tie(ver_b, part_offsets[b]);
-    });
 
-    /// 4. Deduplicate: keep only the first index for each unique key.
-    std::vector<size_t> deduped;
-    deduped.reserve(num_rows);
-    for (size_t i = 0; i < indices.size(); ++i)
+    /// Split sort comparator by version mode to eliminate per-comparison branch.
+    if (with_version)
     {
-        if (i == 0 || key_refs[indices[i]] != key_refs[indices[i - 1]])
-            deduped.push_back(indices[i]);
+        ::pdqsort(indices.begin(), indices.end(), [&](size_t a, size_t b)
+        {
+            int cmp = key_refs[a].compare(key_refs[b]);
+            if (cmp != 0)
+                return cmp < 0;
+            /// Same key: larger (version, part_offset) comes first.
+            if (ver_data[a] != ver_data[b])
+                return ver_data[a] > ver_data[b];
+            return get_part_offset(a) > get_part_offset(b);
+        });
+    }
+    else
+    {
+        ::pdqsort(indices.begin(), indices.end(), [&](size_t a, size_t b)
+        {
+            int cmp = key_refs[a].compare(key_refs[b]);
+            if (cmp != 0)
+                return cmp < 0;
+            /// Same key: larger part_offset comes first.
+            return get_part_offset(a) > get_part_offset(b);
+        });
     }
 
-    /// 5. Build the output block with a single SortedStringKV column.
-    ///    Extract deduplicated keys from all_keys and build value column.
+    /// 4. Build the output block with a single SortedStringKV column.
+    ///    Deduplicate inline: keep only the first index for each unique key
+    ///    and write directly into the output columns, avoiding an intermediate vector.
     auto key_column = ColumnString::create();
-    key_column->reserve(deduped.size());
+    key_column->reserve(num_rows); /// upper bound; exact count unknown before dedup
 
     const auto & sample = projection_desc.sample_block;
     chassert(sample.columns() == 1);
     const auto & sample_tuple = assert_cast<const ColumnTuple &>(*sample.getByPosition(0).column);
     auto value_column_mut = sample_tuple.getColumn(1).cloneEmpty();
 
-    /// Runtime-to-compile-time dispatch: write entries using the correct ValueTraits.
-    auto write_entries = [&]<ValueType V>()
+    /// Runtime-to-compile-time dispatch: deduplicate and write entries in a single pass.
+    auto dedup_and_write = [&]<ValueType V>()
     {
-        using Entry = ValueTraits<V>::Entry;
-        for (size_t idx : deduped)
+        using Entry = typename ValueTraits<V>::Entry;
+        for (size_t i = 0; i < indices.size(); ++i)
         {
+            if (i > 0 && key_refs[indices[i]] == key_refs[indices[i - 1]])
+                continue;
+
+            const size_t idx = indices[i];
             key_column->insertFrom(*all_keys, idx);
+
+            Entry entry;
             if constexpr (ValueTraits<V>::has_version)
-            {
-                Entry entry;
                 entry.version = ver_data[idx];
-                entry.part_offset = part_offsets[idx];
-                ValueTraits<V>::writeEntry(*value_column_mut, entry);
-            }
-            else
-            {
-                Entry entry;
-                entry.part_offset = part_offsets[idx];
-                ValueTraits<V>::writeEntry(*value_column_mut, entry);
-            }
+            entry.part_offset = get_part_offset(idx);
+            ValueTraits<V>::writeEntry(*value_column_mut, entry);
         }
     };
 
     if (with_version)
-        write_entries.template operator()<ValueType::VersionedPartOffset>();
+        dedup_and_write.template operator()<ValueType::VersionedPartOffset>();
     else
-        write_entries.template operator()<ValueType::PartOffset>();
+        dedup_and_write.template operator()<ValueType::PartOffset>();
 
     auto tuple_column = ColumnTuple::create(Columns{std::move(key_column), std::move(value_column_mut)});
 
