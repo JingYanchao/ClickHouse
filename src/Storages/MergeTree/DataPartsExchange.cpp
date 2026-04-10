@@ -12,6 +12,7 @@
 #include <Server/HTTP/HTMLForm.h>
 #include <Server/HTTP/HTTPServerResponse.h>
 #include <Storages/MergeTree/MergedBlockOutputStream.h>
+#include <Storages/MergeTree/MergeTreeDedupPartManager.h>
 #include <Storages/MergeTree/ReplicatedFetchList.h>
 #include <Storages/StorageReplicatedMergeTree.h>
 #include <Storages/MergeTree/DataPartStorageOnDiskFull.h>
@@ -206,7 +207,19 @@ void Service::processQuery(const HTMLForm & params, ReadBufferPtr body, WriteBuf
             }
         }
 
+        bool send_dedup_metadata = data.supportsUpsert();
+
         sendPartFromDisk(part, out, client_protocol_version, false, send_projections);
+
+        /// Append dedup metadata (delete mark + partition block ranges) after
+        /// the part data so the fetching replica can apply them directly
+        /// instead of recomputing from source parts.
+        if (send_dedup_metadata)
+        {
+            auto dedup_meta = data.getDedupManager()->collectDedupMetadataForFetch(part);
+            dedup_meta.serialize(out);
+        }
+
         data.addLastSentPart(part->info);
     }
     catch (...)
@@ -853,7 +866,16 @@ MergeTreeData::MutableDataPartPtr Fetcher::downloadPartToDisk(
         throw;
     }
 
+    /// For UniqueMergeTree: read dedup metadata (delete mark + partition
+    /// block ranges) appended after the part data by the source replica.
+    /// The server only sends dedup metadata for non-zero-copy fetches.
+    /// Deserialize before assertEOF so the stream is fully consumed.
+    std::optional<DedupMetadataForFetch> dedup_meta;
+    if (!to_remote_disk && data.supportsUpsert())
+        dedup_meta = DedupMetadataForFetch::deserialize(in);
+
     assertEOF(in);
+
     MergeTreeData::MutableDataPartPtr new_data_part;
     try
     {
@@ -870,6 +892,17 @@ MergeTreeData::MutableDataPartPtr Fetcher::downloadPartToDisk(
         new_data_part->remove_tmp_policy = IMergeTreeDataPart::BlobsRemovalPolicyForTemporaryParts::PRESERVE_BLOBS;
         new_data_part->modification_time = time(nullptr);
         new_data_part->loadColumnsChecksumsIndexes(true, false);
+
+        if (dedup_meta)
+        {
+            new_data_part->delete_mark_bitmap = std::move(dedup_meta->delete_mark);
+            new_data_part->fetch_dedup_block_ranges = std::move(dedup_meta->block_ranges);
+
+            LOG_DEBUG(log, "Received dedup metadata for part {}: has_delete_mark={}, block_ranges_intervals={}",
+                new_data_part->name,
+                new_data_part->delete_mark_bitmap != nullptr,
+                boost::icl::interval_count(new_data_part->fetch_dedup_block_ranges));
+        }
     }
 #if USE_AWS_S3
     catch (const S3Exception & ex)

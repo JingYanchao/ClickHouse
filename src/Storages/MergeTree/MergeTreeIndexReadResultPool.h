@@ -10,6 +10,9 @@
 namespace DB
 {
 
+class ReadBuffer;
+class WriteBuffer;
+
 class IMergeTreeDataPart;
 using DataPartPtr = std::shared_ptr<const IMergeTreeDataPart>;
 
@@ -134,6 +137,14 @@ struct ProjectionIndexBitmap
     ///
     /// Returns true if at least one value in the bitmap falls within the specified range.
     bool appendToFilter(PaddedPODArray<UInt8> & filter, size_t starting_row, size_t num_rows) const;
+
+    /// Portable serialization for UniqueMergeTree delete marks.
+    /// Format: 4 bytes size + 32-bit roaring portable data (no type tag).
+    void serializePortable(WriteBuffer & out) const;
+
+    /// Portable deserialization for UniqueMergeTree delete marks.
+    /// Always creates a Bitmap32. Returns a new ProjectionIndexBitmapPtr.
+    static ProjectionIndexBitmapPtr deserializePortable(ReadBuffer & in);
 };
 
 class MergeTreeSelectProcessor;

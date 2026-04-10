@@ -1,5 +1,7 @@
 #include <Storages/MergeTree/MergeTreeIndexReadResultPool.h>
 
+#include <IO/ReadBuffer.h>
+#include <IO/WriteBuffer.h>
 #include <Storages/MergeTree/MergeTreeDataSelectExecutor.h>
 #include <Storages/MergeTree/MergeTreeReadPoolProjectionIndex.h>
 #include <Storages/MergeTree/MergeTreeSelectProcessor.h>
@@ -21,6 +23,7 @@ namespace DB
 
 namespace ErrorCodes
 {
+    extern const int INCORRECT_DATA;
     extern const int MEMORY_LIMIT_EXCEEDED;
 }
 
@@ -393,6 +396,38 @@ bool ProjectionIndexBitmap::appendToFilter(PaddedPODArray<UInt8> & filter, size_
         roaring::api::roaring64_iterator_free(it);
         return has_value;
     }
+}
+
+void ProjectionIndexBitmap::serializePortable(WriteBuffer & out) const
+{
+    /// Format: 4 bytes serialized size + serialized 32-bit roaring data.
+    /// No type tag — UniqueMergeTree delete marks always use Bitmap32.
+    chassert(type == BitmapType::Bitmap32);
+
+    size_t size = roaring_bitmap_portable_size_in_bytes(data.bitmap32);
+    UInt32 size32 = static_cast<UInt32>(size);
+    out.write(reinterpret_cast<const char *>(&size32), sizeof(size32));
+
+    std::vector<char> buf(size);
+    roaring_bitmap_portable_serialize(data.bitmap32, buf.data());
+    out.write(buf.data(), size);
+}
+
+ProjectionIndexBitmapPtr ProjectionIndexBitmap::deserializePortable(ReadBuffer & in)
+{
+    /// Always deserialize as Bitmap32 — UniqueMergeTree delete marks use 32-bit bitmaps.
+    UInt32 size32 = 0;
+    in.readStrict(reinterpret_cast<char *>(&size32), sizeof(size32));
+
+    std::vector<char> buf(size32);
+    in.readStrict(buf.data(), size32);
+
+    auto bitmap = std::make_shared<ProjectionIndexBitmap>(BitmapType::Bitmap32);
+    roaring_bitmap_free(bitmap->data.bitmap32);
+    bitmap->data.bitmap32 = roaring_bitmap_portable_deserialize_safe(buf.data(), size32);
+    if (!bitmap->data.bitmap32)
+        throw Exception(ErrorCodes::INCORRECT_DATA, "Failed to deserialize 32-bit roaring bitmap");
+    return bitmap;
 }
 
 bool ProjectionIndexBitmap::contains(UInt64 value)

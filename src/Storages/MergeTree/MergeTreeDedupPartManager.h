@@ -12,10 +12,14 @@
 #include <Storages/MergeTree/SSTFileUtil.h>
 #include <rocksdb/comparator.h>
 #include <rocksdb/iterator.h>
+#include <boost/icl/interval_set.hpp>
 #include <queue>
 
 namespace DB
 {
+
+class WriteBuffer;
+class ReadBuffer;
 
 class IMergeTreeDataPart;
 struct DataPartsLock;
@@ -28,7 +32,23 @@ using ProjectionIndexBitmapPtr = std::shared_ptr<ProjectionIndexBitmap>;
 
 using PartDeleteBitmapMap = std::unordered_map<const IMergeTreeDataPart *, ProjectionIndexBitmapPtr>;
 
+/// Dedup metadata collected by the source replica for a fetched part.
+/// Contains the part's delete mark and the union of all active parts'
+/// block ranges in the same partition, captured atomically under the
+/// dedup lock.
+struct DedupMetadataForFetch
+{
+    ProjectionIndexBitmapPtr delete_mark;
+    boost::icl::interval_set<Int64> block_ranges;
 
+    /// Serialize the metadata (delete mark + block ranges) into a write buffer.
+    void serialize(WriteBuffer & out) const;
+
+    /// Deserialize the metadata from a read buffer.
+    /// Fields are populated into the returned struct; the caller is
+    /// responsible for moving them into the fetched part.
+    static DedupMetadataForFetch deserialize(ReadBuffer & in);
+};
 
 struct UniqueProcessLock
 {
@@ -84,6 +104,11 @@ explicit MergeTreeDedupPartManager(const MergeTreeData & storage_);
     void buildAllDeleteMarksOnStartup();
 
     UniqueProcessLock lockUniqueProcess() { return UniqueProcessLock(unique_process_mutex); }
+
+    /// Collect dedup metadata needed by the fetching replica.
+    /// Acquires the dedup lock internally, captures the part's delete mark
+    /// and the union of all active parts' block ranges in the same partition.
+    DedupMetadataForFetch collectDedupMetadataForFetch(const DataPartPtr & part);
 
     /// A data part paired with its SST reader, used uniformly for both
     /// the input part and visible parts during dedup.
@@ -193,9 +218,12 @@ private:
 
     /// Dedup path for FETCH-produced parts: uses reverse dedup approach.
     /// Iterates the small visible parts' SST keys and MultiGet into the
-    /// large fetched part's SST. When dedup_snapshot_max_block is available,
-    /// parts with max_block <= snapshot are skipped entirely, dramatically
-    /// reducing the dedup scope.
+    /// large fetched part's SST. When fetch_dedup_block_ranges (the union of
+    /// all active parts' block ranges obtained from the source replica at
+    /// fetch time) is available, visible parts fully covered by those ranges
+    /// are skipped entirely, dramatically reducing the dedup scope. The source
+    /// replica's delete mark is applied directly to the fetched part, avoiding
+    /// diff computation.
     void dedupForFetch(
         const DataPartPtr & new_part,
         const StorageMetadataPtr & metadata_snapshot,

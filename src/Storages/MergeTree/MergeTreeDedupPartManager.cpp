@@ -14,6 +14,9 @@
 #include <Interpreters/Context.h>
 #include <boost/range/join.hpp>
 #include <boost/range/iterator_range.hpp>
+#include <boost/icl/interval_set.hpp>
+#include <IO/ReadHelpers.h>
+#include <IO/WriteHelpers.h>
 
 namespace CurrentMetrics
 {
@@ -472,12 +475,15 @@ void MergeTreeDedupPartManager::dedupForFetch(
 
     /// Filter visible parts:
     /// 1. Skip parts covered by the fetched part's block range (source parts).
-    /// 2. If snapshot_max_block is available, skip parts that were already
-    ///    visible to the merge on the source replica.
+    /// 2. Use fetch-time block ranges from source replica to skip parts that
+    ///    were already visible on the source replica at fetch/merge time.
     DataPartsVector filtered_visible_parts;
     filtered_visible_parts.reserve(all_visible_parts.size());
 
-    auto snapshot_max_block = new_part->dedup_snapshot_max_block;
+    /// Fetch-time block ranges from source replica (obtained atomically
+    /// with the delete mark at fetch time).
+    const auto & block_ranges = new_part->fetch_dedup_block_ranges;
+    bool has_block_ranges = !boost::icl::is_empty(block_ranges);
 
     for (const auto & part : all_visible_parts)
     {
@@ -486,20 +492,35 @@ void MergeTreeDedupPartManager::dedupForFetch(
             && part->info.max_block <= new_part->info.max_block)
             continue;
 
-        /// If snapshot is available, skip parts that were visible at snapshot time.
-        if (snapshot_max_block.has_value()
-            && static_cast<UInt64>(part->info.max_block) <= *snapshot_max_block)
+        /// If block ranges are available, skip parts whose [min_block, max_block]
+        /// is fully contained within the source replica's active block ranges.
+        if (has_block_ranges
+            && boost::icl::within(
+                boost::icl::discrete_interval<Int64>::closed(part->info.min_block, part->info.max_block),
+                block_ranges))
             continue;
 
         filtered_visible_parts.push_back(part);
     }
 
+    /// Apply the delete mark obtained from the source replica at fetch time.
+    /// This directly reflects the source replica's dedup state for this part,
+    /// eliminating the need for tryDedupDeletedKeysFromSourceParts diff computation.
+    if (new_part->delete_mark_bitmap && !new_part->delete_mark_bitmap->empty())
+    {
+        delta_deleted_rows_map[new_part.get()] = new_part->delete_mark_bitmap;
+        LOG_DEBUG(log,
+            "dedupForFetch: part '{}', applied {} delete marks from source replica",
+            new_part->name,
+            new_part->delete_mark_bitmap->cardinality());
+    }
+
     if (filtered_visible_parts.empty())
     {
         LOG_DEBUG(log,
-            "dedupForFetch: part '{}', snapshot_max_block={}, all filtered out, skip, elapsed={}us",
+            "dedupForFetch: part '{}', has_block_ranges={}, all filtered out, skip, elapsed={}us",
             new_part->name,
-            snapshot_max_block.has_value() ? std::to_string(*snapshot_max_block) : "none",
+            has_block_ranges,
             watch.elapsedMicroseconds());
         return;
     }
@@ -547,9 +568,9 @@ void MergeTreeDedupPartManager::dedupForFetch(
     }
 
     LOG_DEBUG(log,
-        "dedupForFetch [REVERSE]: part '{}', snapshot_max_block={}, total_visible={}, filtered_visible={}, elapsed={}us",
+        "dedupForFetch [REVERSE]: part '{}', has_block_ranges={}, total_visible={}, filtered_visible={}, elapsed={}us",
         new_part->name,
-        snapshot_max_block.has_value() ? std::to_string(*snapshot_max_block) : "none",
+        has_block_ranges,
         all_visible_parts.size(),
         filtered_visible_parts.size(),
         watch.elapsedMicroseconds());
@@ -1055,6 +1076,77 @@ void MergeTreeDedupPartManager::commitDeleteMarkBuffers(const DataPartsLock & /*
 {
     applyCrossPartDeleteMarks(delta_deleted_rows_map);
     delta_deleted_rows_map.clear();
+}
+
+DedupMetadataForFetch MergeTreeDedupPartManager::collectDedupMetadataForFetch(const DataPartPtr & part)
+{
+    DedupMetadataForFetch result;
+
+    /// Level-0 parts are fresh INSERTs — the fetching replica will run
+    /// dedupForInsert which does not use source-replica metadata at all,
+    /// so skip the lock and return an empty result.
+    if (part->info.level == 0)
+        return result;
+
+    auto lock = storage.readLockParts();
+
+    result.delete_mark = part->getDeleteMarkBitmap();
+
+    auto partition_parts = storage.getDataPartsVectorInPartitionForInternalUsage(
+        MergeTreeData::DataPartState::Active, part->info.getPartitionId(), lock);
+    for (const auto & p : partition_parts)
+        result.block_ranges += boost::icl::discrete_interval<Int64>::closed(
+            p->info.min_block, p->info.max_block);
+
+    return result;
+}
+
+void DedupMetadataForFetch::serialize(WriteBuffer & out) const
+{
+    bool has_delete_mark = (delete_mark && !delete_mark->empty());
+    writeBoolText(has_delete_mark, out);
+    writeChar('\n', out);
+    if (has_delete_mark)
+        delete_mark->serializePortable(out);
+
+    /// Write the number of intervals, then each [lower, upper] pair.
+    size_t interval_count = boost::icl::interval_count(block_ranges);
+    writeIntText(interval_count, out);
+    writeChar('\n', out);
+    for (const auto & interval : block_ranges)
+    {
+        writeIntText(interval.lower(), out);
+        writeChar(' ', out);
+        writeIntText(interval.upper(), out);
+        writeChar('\n', out);
+    }
+}
+
+DedupMetadataForFetch DedupMetadataForFetch::deserialize(ReadBuffer & in)
+{
+    DedupMetadataForFetch result;
+
+    bool has_delete_mark = false;
+    readBoolText(has_delete_mark, in);
+    assertChar('\n', in);
+    if (has_delete_mark)
+        result.delete_mark = ProjectionIndexBitmap::deserializePortable(in);
+
+    size_t interval_count = 0;
+    readIntText(interval_count, in);
+    assertChar('\n', in);
+    for (size_t i = 0; i < interval_count; ++i)
+    {
+        Int64 lower = 0;
+        Int64 upper = 0;
+        readIntText(lower, in);
+        assertChar(' ', in);
+        readIntText(upper, in);
+        assertChar('\n', in);
+        result.block_ranges += boost::icl::discrete_interval<Int64>::closed(lower, upper);
+    }
+
+    return result;
 }
 
 /// ---- SSTMergingIterator implementation ----

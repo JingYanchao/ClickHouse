@@ -383,17 +383,6 @@ ReplicatedMergeMutateTaskBase::PrepareResult MergeFromLogEntryTask::prepare()
         for (const auto & p : parts)
             source_parts.push_back(p);
         source_delete_mark_snapshots = storage.getDeleteMarksSnapshot(source_parts);
-
-        /// Compute snapshot_max_block at the same moment as delete mark snapshot.
-        {
-            auto lock = storage.readLockParts();
-            auto partition_parts = storage.getDataPartsVectorInPartitionForInternalUsage(
-                MergeTreeData::DataPartState::Active, future_merged_part->part_info.getPartitionId(), lock);
-            UInt64 max_block = 0;
-            for (const auto & p : partition_parts)
-                max_block = std::max(max_block, static_cast<UInt64>(p->info.max_block));
-            dedup_snapshot_max_block = max_block;
-        }
     }
 
     merge_task = storage.merger_mutator.mergePartsToTemporaryPart(
@@ -415,9 +404,6 @@ ReplicatedMergeMutateTaskBase::PrepareResult MergeFromLogEntryTask::prepare()
     /// same data, keeping the merge reader and commit-time dedup aligned.
     if (!source_delete_mark_snapshots.empty())
         merge_task->setDeleteMarkSnapshots(source_delete_mark_snapshots);
-
-    if (dedup_snapshot_max_block.has_value())
-        merge_task->setDedupSnapshotMaxBlock(*dedup_snapshot_max_block);
 
     /// Adjust priority
     for (auto & item : future_merged_part->parts)

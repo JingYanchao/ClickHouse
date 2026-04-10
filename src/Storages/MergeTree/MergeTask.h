@@ -183,14 +183,6 @@ public:
         global_ctx->delete_mark_snapshots = std::move(snapshots);
     }
 
-    /// Set the snapshot_max_block computed at merge start time.
-    /// This value will be written into the merged part's metadata
-    /// so that the fetch path on other replicas can narrow the dedup scope.
-    void setDedupSnapshotMaxBlock(UInt64 max_block)
-    {
-        global_ctx->dedup_snapshot_max_block = max_block;
-    }
-
     bool execute();
 
     void cancel() noexcept;
@@ -235,11 +227,6 @@ private:
         /// re-snapshotting, so that the merge reader and the commit-time dedup
         /// see exactly the same snapshot.
         MergeTreeData::DeleteMarkSnapshotMap delete_mark_snapshots;
-
-        /// The maximum max_block among all active parts in the partition
-        /// at the time of snapshotting delete marks. Passed to the merged
-        /// part so that the fetch path can skip dedup for older parts.
-        std::optional<UInt64> dedup_snapshot_max_block;
 
         FutureMergedMutatedPartPtr future_part{nullptr};
         std::vector<AlterConversionsPtr> alter_conversions;

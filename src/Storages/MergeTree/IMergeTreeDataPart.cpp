@@ -1205,15 +1205,6 @@ void IMergeTreeDataPart::loadColumnsChecksumsIndexes(bool require_columns_checks
 
         loadDefaultCompressionCodec();
         loadSourcePartsSet();
-
-        /// Load dedup snapshot max_block if present (UniqueMergeTree merge parts only).
-        if (checksums.files.contains(DEDUP_SNAPSHOT_FILE_NAME))
-        {
-            auto buf = readFile(DEDUP_SNAPSHOT_FILE_NAME);
-            UInt64 val = 0;
-            readIntText(val, *buf);
-            dedup_snapshot_max_block = val;
-        }
     }
     catch (...)
     {
