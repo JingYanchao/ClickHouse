@@ -96,6 +96,13 @@ static void deduplicateKeyByBucket(
     auto input_iter = input.reader->newIterator(opts);
     input_iter->Seek(rocksdb::Slice(start_key));
 
+    /// Delete mark bitmap for the input part. In reverse dedup (dedupForFetch),
+    /// the input is a local visible part that may already have delete marks from
+    /// earlier INSERTs. Keys marked as deleted must be skipped — otherwise a
+    /// stale (deleted) key could incorrectly win the version comparison and
+    /// produce wrong delete marks on the fetched part.
+    auto input_delete_bitmap = input.part->getDeleteMarkBitmap();
+
     /// Reusable batch buffer to avoid repeated allocations.
     std::vector<InputKeyEntry> batch;
     batch.reserve(MULTI_GET_BATCH_SIZE);
@@ -121,6 +128,10 @@ static void deduplicateKeyByBucket(
 
             const auto & value_slice = input_iter->value();
             auto input_entry = decodeUniqueValueEntry(value_slice.data(), value_slice.size());
+
+            /// Skip keys already marked as deleted in the input part.
+            if (input_delete_bitmap && input_delete_bitmap->contains(input_entry.part_offset))
+                continue;
 
             batch.push_back({input_iter->key().ToString(), input_entry});
         }
@@ -469,6 +480,13 @@ void MergeTreeDedupPartManager::dedupForFetch(
             new_part->name,
             all_visible_parts.size(),
             non_covered_visible_parts.size());
+
+        /// Discard the delete mark fetched from the source replica — it was
+        /// computed under a different set of visible parts and is unreliable
+        /// when source-part block gaps exist. dedupForInsert will recompute
+        /// delete marks from scratch against the local visible parts.
+        new_part->delete_mark_bitmap = nullptr;
+
         dedupForInsert(new_part, metadata_snapshot, non_covered_visible_parts);
         return;
     }
@@ -487,11 +505,6 @@ void MergeTreeDedupPartManager::dedupForFetch(
 
     for (const auto & part : all_visible_parts)
     {
-        /// Skip source parts covered by the fetched part's block range.
-        if (part->info.min_block >= new_part->info.min_block
-            && part->info.max_block <= new_part->info.max_block)
-            continue;
-
         /// If block ranges are available, skip parts whose [min_block, max_block]
         /// is fully contained within the source replica's active block ranges.
         if (has_block_ranges

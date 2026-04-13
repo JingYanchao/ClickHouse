@@ -207,14 +207,12 @@ void Service::processQuery(const HTMLForm & params, ReadBufferPtr body, WriteBuf
             }
         }
 
-        bool send_dedup_metadata = data.supportsUpsert();
-
         sendPartFromDisk(part, out, client_protocol_version, false, send_projections);
 
         /// Append dedup metadata (delete mark + partition block ranges) after
         /// the part data so the fetching replica can apply them directly
         /// instead of recomputing from source parts.
-        if (send_dedup_metadata)
+        if (data.supportsUpsert())
         {
             auto dedup_meta = data.getDedupManager()->collectDedupMetadataForFetch(part);
             dedup_meta.serialize(out);
