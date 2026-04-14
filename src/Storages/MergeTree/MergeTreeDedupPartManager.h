@@ -209,24 +209,16 @@ private:
     /// multi-way merge of their SST iterators. This is O(N·log(N)·K)
     /// where N = number of parts and K = total keys, compared to the
     /// previous O(N²·K) approach.
-    void buildAllDeleteMarksForPartition(
+    void buildAllDeleteMarksForPartitionOnStartup(
         const DataPartsVector & partition_parts,
         const StorageMetadataPtr & metadata_snapshot);
 
-    /// Propagate delete marks from source parts into the merged part.
-    /// For each source part, scans its SST for keys whose offsets are in the
-    /// diff bitmap (newly deleted by concurrent INSERTs), then looks them up
-    /// in the merged part's SST to propagate the deletion.
-    ///
-    /// Version transitivity guarantees correctness: if the merge winner is
-    /// deleted by a concurrent INSERT (which must have a higher version),
-    /// all losers are necessarily deleted too. Therefore, checking any single
-    /// source part that has the key deleted is sufficient — no need to verify
-    /// that ALL source entries are deleted.
-    ///
-    /// Complexity: O(Σ N_source + D × log(N_merged))
-    ///   where D = keys deleted by concurrent INSERTs (typically D << N_merged).
-    void tryDedupDeletedKeysFromSourceParts(
+    /// Propagate newly deleted keys from source parts into the merged part.
+    /// Only processes keys whose delete status changed since the merge started
+    /// (diff between current and snapshot delete marks).
+    /// Correctness relies on version transitivity: a higher-version INSERT
+    /// that deletes a merge winner necessarily deletes all its losers too.
+    void dedupDeletedKeysFromSourceParts(
         const DataPartPtr & new_part,
         const DataPartsVector & source_parts,
         const StorageMetadataPtr & metadata_snapshot,
