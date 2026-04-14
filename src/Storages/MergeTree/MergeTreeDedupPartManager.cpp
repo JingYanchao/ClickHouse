@@ -649,12 +649,6 @@ void MergeTreeDedupPartManager::dedupForMutation(
     const DataPartPtr & new_part,
     const DataPartPtr & source_part)
 {
-    /// Mutation transforms exactly one source part into one new part.
-    /// The source part (same block range, lower mutation version) is
-    /// pre-identified by `dedupPart`.
-
-    chassert(source_part);
-
     /// Mutation preserves row count, so row offsets are unchanged.
     /// Clone the delete mark bitmap directly from the source part.
     if (new_part->rows_count != source_part->rows_count)
@@ -664,33 +658,15 @@ void MergeTreeDedupPartManager::dedupForMutation(
 
     auto source_delete_mark = source_part->getDeleteMarkBitmap();
     if (!source_delete_mark || source_delete_mark->empty())
-    {
-        LOG_TRACE(log, "dedupForMutation: part '{}', source part '{}' has no delete marks, skip",
-            new_part->name, source_part->name);
         return;
-    }
 
     delta_deleted_rows_map[new_part.get()] = source_delete_mark;
-
-    LOG_DEBUG(log, "dedupForMutation: part '{}', cloned {} delete marks from source part '{}'",
-        new_part->name, source_delete_mark->cardinality(), source_part->name);
 }
 
-/// Deduplicate deleted keys for a single source part against the merged part.
-///
-/// Scans the source part's SST for keys whose `part_offset` is in the diff
-/// bitmap (newly deleted by concurrent INSERTs), then batch-lookups those
-/// keys in the merged part's SST to find the new offsets and mark them as
-/// deleted.
-///
-/// Uses the same Phase1/Phase2 batching pattern as `deduplicateKeyByBucket`:
-///   Phase 1: collect a batch of keys from the source SST iterator.
-///   Phase 2: batch MultiGet into the merged part's SST.
-///
-/// Returns a bitmap of row offsets in the merged part that should be marked
-/// as deleted, or nullptr if no keys need propagation.
-///
-/// Thread-safe: only reads from merged_sst_reader (RocksDB SST multiGet is const).
+/// For a single source part, find keys in the diff bitmap (newly deleted
+/// since merge started) and look them up in the merged part's SST to get
+/// the corresponding merged-part offsets.
+/// Returns a bitmap of merged-part offsets to mark as deleted, or nullptr.
 static ProjectionIndexBitmapPtr dedupDeletedKeysForOneSourcePart(
     const PartWithSSTReader & source_part_with_sst_reader,
     const SSTFileReaderPtr & merged_sst_reader,
@@ -801,12 +777,12 @@ static std::vector<ProjectionIndexBitmapPtr> computeDeleteMarkDiffs(
 }
 
 void MergeTreeDedupPartManager::dedupDeletedKeysFromSourceParts(
-    const DataPartPtr & new_part,
-    const DataPartsVector & source_parts,
+    const DataPartPtr & new_merged_part,
+    const DataPartsVector & source_covered_parts,
     const StorageMetadataPtr & metadata_snapshot,
     const MergeTreeData::DeleteMarkSnapshotMap & delete_mark_snapshots)
 {
-    auto sst_readers = prepareSSTReadersForDedup(new_part, metadata_snapshot, source_parts);
+    auto sst_readers = prepareSSTReadersForDedup(new_merged_part, metadata_snapshot, source_covered_parts);
     SCOPE_EXIT({ sst_readers.releaseBufferMemory(); });
 
     auto & source_part_readers = sst_readers.visible_parts;
@@ -840,7 +816,7 @@ void MergeTreeDedupPartManager::dedupDeletedKeysFromSourceParts(
     runner.waitForAllToFinishAndRethrowFirstError();
 
     /// Merge per-part bitmaps into the final result.
-    auto result_bitmap = ProjectionIndexBitmap::create(new_part->rows_count);
+    auto result_bitmap = ProjectionIndexBitmap::create(new_merged_part->rows_count);
     for (size_t i = 0; i < num_parts; ++i)
     {
         if (per_part_bitmaps[i] && !per_part_bitmaps[i]->empty())
@@ -848,7 +824,7 @@ void MergeTreeDedupPartManager::dedupDeletedKeysFromSourceParts(
     }
 
     if (!result_bitmap->empty())
-        delta_deleted_rows_map[new_part.get()] = std::move(result_bitmap);
+        delta_deleted_rows_map[new_merged_part.get()] = std::move(result_bitmap);
 }
 
 void MergeTreeDedupPartManager::dedupPart(
