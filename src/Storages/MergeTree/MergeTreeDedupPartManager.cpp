@@ -758,9 +758,18 @@ static std::vector<ProjectionIndexBitmapPtr> computeDeleteMarkDiffs(
         }
 
         auto it = snapshots.find(part->name);
-        if (it == snapshots.end() || !it->second)
+        if (it == snapshots.end())
         {
-            /// No snapshot — all current delete marks are new.
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "computeDeleteMarkDiffs: source part '{}' has no delete mark snapshot entry, "
+                "snapshots and source parts are misaligned",
+                part->name);
+        }
+
+        if (!it->second)
+        {
+            /// Snapshot exists but is nullptr — the part had no delete marks
+            /// when the merge started, so all current marks are new.
             diffs.push_back(std::move(current_marks));
         }
         else
