@@ -47,9 +47,12 @@ public:
 
     bool supportsTrivialCountOptimization(const StorageSnapshotPtr &, ContextPtr) const override { return false; }
 
-    /// Override startup to rebuild delete marks BEFORE background tasks start.
-    /// This ensures no merge/mutate can run until dedup state is fully restored.
-    void startup() override;
+    /// DROP PART is not supported for ReplicatedUniqueMergeTree because
+    /// dropping a single part would leave stale delete marks on other parts
+    /// that reference the dropped part's keys, leading to incorrect query
+    /// results. DROP PARTITION is safe because it removes all parts (and
+    /// their delete marks) in the partition atomically.
+    void dropPart(const String & part_name, bool detach, ContextPtr query_context) override;
 
     /// REPLACE PARTITION and MOVE PARTITION TO TABLE are not yet supported
     /// for ReplicatedUniqueMergeTree because their commit paths bypass the

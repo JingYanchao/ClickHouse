@@ -583,7 +583,7 @@ void MergeTreeDedupPartManager::dedupForMerge(
     const StorageMetadataPtr & metadata_snapshot,
     const DataPartsVector & source_parts,
     const MergeTreeData::DeleteMarkSnapshotMap & source_delete_mark_snapshots,
-    const DataPartsVector & all_visible_parts)
+    const DataPartsVector & /*all_visible_parts*/)
 {
     /// Merge only combines existing data — it does not introduce new
     /// unique keys. The only dedup work needed is propagating delete marks:
@@ -606,43 +606,7 @@ void MergeTreeDedupPartManager::dedupForMerge(
     if (!new_part->rows_count || source_effective_rows >= new_part->rows_count)
         return;
 
-    /// ============================================================
-    /// A/B performance comparison: toggle between two dedup strategies.
-    ///   false = tryDedupDeletedKeysFromSourceParts (incremental, default)
-    ///   true  = dedupForInsert (full cross-part dedup)
-    /// ============================================================
-    constexpr bool USE_FULL_DEDUP_FOR_MERGE = false;
-
-    if constexpr (USE_FULL_DEDUP_FOR_MERGE)
-    {
-        /// Strategy B: treat the merged part like a fresh INSERT and do
-        /// full cross-part dedup against all visible parts (excluding
-        /// source parts that are covered by the merged part's block range).
-        DataPartsVector non_source_visible_parts;
-        non_source_visible_parts.reserve(all_visible_parts.size());
-        for (const auto & part : all_visible_parts)
-        {
-            if (part->info.min_block >= new_part->info.min_block
-                && part->info.max_block <= new_part->info.max_block)
-                continue; /// Covered by the merged part, skip.
-            non_source_visible_parts.push_back(part);
-        }
-
-        Stopwatch watch;
-        dedupForInsert(new_part, metadata_snapshot, non_source_visible_parts);
-        LOG_DEBUG(log,
-            "dedupForMerge [FULL DEDUP]: part '{}', visible_parts={}, elapsed={}us",
-            new_part->name, non_source_visible_parts.size(), watch.elapsedMicroseconds());
-    }
-    else
-    {
-        /// Strategy A (default): incremental propagation of newly-deleted keys.
-        Stopwatch watch;
-        dedupDeletedKeysFromSourceParts(new_part, source_parts, metadata_snapshot, source_delete_mark_snapshots);
-        LOG_DEBUG(log,
-            "dedupForMerge [INCREMENTAL]: part '{}', source_parts={}, elapsed={}us",
-            new_part->name, source_parts.size(), watch.elapsedMicroseconds());
-    }
+    dedupDeletedKeysFromSourceParts(new_part, source_parts, metadata_snapshot, source_delete_mark_snapshots);
 }
 
 void MergeTreeDedupPartManager::dedupForMutation(
@@ -842,6 +806,11 @@ void MergeTreeDedupPartManager::dedupPart(
 {
     if (!new_part)
         return;
+
+    /// Defensive check: `buildAllDeleteMarksOnStartup` must complete before
+    /// any background merge/mutation/fetch calls `dedupPart`. If this fires,
+    /// someone has reordered the startup sequence.
+    chassert(startup_completed.load(std::memory_order_acquire));
 
     delta_deleted_rows_map.clear();
     Stopwatch dedup_watch;
@@ -1069,6 +1038,7 @@ void MergeTreeDedupPartManager::buildAllDeleteMarksForPartitionOnStartup(
 
     std::string last_key;
     IteratorEntryInfo last_max_entry_info{};
+    bool has_last_key = false;
 
     /// Step 2: Walk the merged stream — cross-part dedup in a single pass.
     for (; merge_iter.valid(); merge_iter.next())
@@ -1081,10 +1051,11 @@ void MergeTreeDedupPartManager::buildAllDeleteMarksForPartitionOnStartup(
         auto current_key = merge_iter.key();
         UInt64 current_version = getRowVersion(parts[idx], entry, val.size());
 
-        if (last_key != current_key.ToString())
+        if (!has_last_key || current_key != rocksdb::Slice(last_key))
         {
             /// New key group — this entry becomes the current max.
-            last_key = current_key.ToString();
+            last_key.assign(current_key.data(), current_key.size());
+            has_last_key = true;
             last_max_entry_info = {idx, entry, current_version};
         }
         else
@@ -1158,6 +1129,8 @@ void MergeTreeDedupPartManager::buildAllDeleteMarksOnStartup()
 
         runner.waitForAllToFinishAndRethrowFirstError();
     }
+
+    startup_completed.store(true, std::memory_order_release);
 
     LOG_INFO(log, "buildAllDeleteMarksOnStartup: complete, deduped {} parts across {} partitions, total elapsed={}ms",
              total_parts_deduped, parts_by_partition.size(), total_watch.elapsedMilliseconds());

@@ -81,6 +81,8 @@ StorageUniqueMergeTree::StorageUniqueMergeTree(
         {
             return onBeforeTransactionCommit(parts, context);
         });
+
+    has_lightweight_delete_parts.store(true);
 }
 
 std::any StorageUniqueMergeTree::onBeforeTransactionCommit(

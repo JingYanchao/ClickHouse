@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -227,6 +228,13 @@ private:
     const MergeTreeData & storage;
     std::mutex unique_process_mutex;
     PartDeleteBitmapMap delta_deleted_rows_map; /// protected by unique_process_mutex
+
+    /// Defensive flag: set to true after `buildAllDeleteMarksOnStartup` completes.
+    /// `dedupPart` asserts this flag to catch accidental reordering of startup
+    /// steps that would allow background merges/mutations to run before the
+    /// initial delete mark rebuild is finished.
+    std::atomic<bool> startup_completed{false};
+
     LoggerPtr log;
 };
 using MergeTreeDedupPartManagerPtr = std::shared_ptr<MergeTreeDedupPartManager>;

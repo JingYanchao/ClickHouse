@@ -88,6 +88,8 @@ StorageReplicatedUniqueMergeTree::StorageReplicatedUniqueMergeTree(
         {
             return onBeforeTransactionCommit(parts, context);
         });
+
+    has_lightweight_delete_parts.store(true);
 }
 
 std::any StorageReplicatedUniqueMergeTree::onBeforeTransactionCommit(
@@ -114,6 +116,16 @@ std::any StorageReplicatedUniqueMergeTree::onBeforeTransactionCommit(
     return std::make_shared<UniqueProcessLock>(std::move(unique_lock));
 }
 
+void StorageReplicatedUniqueMergeTree::dropPart(
+    const String & part_name, bool /*detach*/, ContextPtr /*query_context*/)
+{
+    throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+        "DROP PART is not supported for ReplicatedUniqueMergeTree (part: {}). "
+        "Dropping a single part would leave stale delete marks on other parts. "
+        "Use DROP PARTITION instead to remove an entire partition atomically",
+        part_name);
+}
+
 void StorageReplicatedUniqueMergeTree::replacePartitionFrom(
     const StoragePtr & /*source_table*/, const ASTPtr & /*partition*/, bool /*replace*/, ContextPtr /*query_context*/)
 {
@@ -129,16 +141,4 @@ void StorageReplicatedUniqueMergeTree::movePartitionToTable(
         "MOVE PARTITION TO TABLE is not supported for ReplicatedUniqueMergeTree. "
         "The operation bypasses the dedup commit hook and would produce incorrect results");
 }
-
-void StorageReplicatedUniqueMergeTree::startup()
-{
-    /// Rebuild delete marks for all active parts before background tasks start,
-    /// so that merges/mutations observe correct dedup state.
-    dedup_manager->buildAllDeleteMarksOnStartup();
-
-    LOG_INFO(log, "Delete marks rebuilt for all active parts, starting background tasks");
-
-    StorageReplicatedMergeTree::startup();
-}
-
 }
