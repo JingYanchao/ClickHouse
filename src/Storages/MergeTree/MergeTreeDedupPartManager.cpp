@@ -4,6 +4,7 @@
 #include <Storages/MergeTree/MergeTreeIndexReadResultPool.h>
 #include <Storages/MergeTree/ProjectionIndex/ProjectionIndexUnique.h>
 #include <Storages/MergeTree/SSTFileUtil.h>
+#include <Storages/MergeTree/SSTMergingIterator.h>
 #include <Common/CurrentMetrics.h>
 #include <Common/Stopwatch.h>
 #include <Common/logger_useful.h>
@@ -552,8 +553,6 @@ void MergeTreeDedupPartManager::dedupForFetch(
     /// the fetched part becomes the sole visible part, and each visible part
     /// takes turns being the input.
     auto sst_readers = prepareSSTReadersForDedup(new_part, metadata_snapshot, filtered_visible_parts);
-    if (!sst_readers.input.reader)
-        return;
 
     const size_t max_parallel = storage.getContext()->getServerSettings()[ServerSetting::unique_key_dedup_max_parallel_threads];
 
@@ -1091,13 +1090,10 @@ void MergeTreeDedupPartManager::commitDeleteMarkBuffers(const DataPartsLock & /*
     delta_deleted_rows_map.clear();
 }
 
-DedupMetadataForFetch MergeTreeDedupPartManager::collectDedupMetadataForFetch(const DataPartPtr & part)
+DedupMetadataForFetch MergeTreeDedupPartManager::collectDedupMetadataForFetch(const DataPartPtr & part) const
 {
     DedupMetadataForFetch result;
 
-    /// Level-0 parts are fresh INSERTs — the fetching replica will run
-    /// dedupForInsert which does not use source-replica metadata at all,
-    /// so skip the lock and return an empty result.
     if (part->info.level == 0)
         return result;
 
@@ -1105,22 +1101,23 @@ DedupMetadataForFetch MergeTreeDedupPartManager::collectDedupMetadataForFetch(co
 
     result.delete_mark = part->getDeleteMarkBitmap();
 
-    auto partition_parts = storage.getDataPartsVectorInPartitionForInternalUsage(
-        MergeTreeData::DataPartState::Active, part->info.getPartitionId(), lock);
+    auto partition_parts
+        = storage.getDataPartsVectorInPartitionForInternalUsage(MergeTreeData::DataPartState::Active, part->info.getPartitionId(), lock);
     for (const auto & p : partition_parts)
-        result.block_ranges += boost::icl::discrete_interval<Int64>::closed(
-            p->info.min_block, p->info.max_block);
+        result.block_ranges += boost::icl::discrete_interval<Int64>::closed(p->info.min_block, p->info.max_block);
 
     return result;
 }
 
 void DedupMetadataForFetch::serialize(WriteBuffer & out) const
 {
-    bool has_delete_mark = (delete_mark && !delete_mark->empty());
-    writeBoolText(has_delete_mark, out);
-    writeChar('\n', out);
-    if (has_delete_mark)
+    /// Always serialize a bitmap — use the actual delete mark if present,
+    /// otherwise serialize an empty bitmap so the deserializer can always
+    /// call deserializePortable unconditionally.
+    if (delete_mark && !delete_mark->empty())
         delete_mark->serializePortable(out);
+    else
+        ProjectionIndexBitmap::create(0)->serializePortable(out);
 
     /// Write the number of intervals, then each [lower, upper] pair.
     size_t interval_count = boost::icl::interval_count(block_ranges);
@@ -1139,11 +1136,10 @@ DedupMetadataForFetch DedupMetadataForFetch::deserialize(ReadBuffer & in)
 {
     DedupMetadataForFetch result;
 
-    bool has_delete_mark = false;
-    readBoolText(has_delete_mark, in);
-    assertChar('\n', in);
-    if (has_delete_mark)
-        result.delete_mark = ProjectionIndexBitmap::deserializePortable(in);
+    /// Always deserialize a bitmap; discard it if empty.
+    auto bitmap = ProjectionIndexBitmap::deserializePortable(in);
+    if (bitmap && !bitmap->empty())
+        result.delete_mark = std::move(bitmap);
 
     size_t interval_count = 0;
     readIntText(interval_count, in);
@@ -1160,52 +1156,6 @@ DedupMetadataForFetch DedupMetadataForFetch::deserialize(ReadBuffer & in)
     }
 
     return result;
-}
-
-/// ---- SSTMergingIterator implementation ----
-MergeTreeDedupPartManager::SSTMergingIterator::SSTMergingIterator(
-    std::vector<std::unique_ptr<rocksdb::Iterator>> iters_,
-    std::vector<SSTFileReaderPtr> readers_)
-    : iters(std::move(iters_))
-    , readers(std::move(readers_))
-    , min_heap(Comparator(&iters))
-{
-}
-
-void MergeTreeDedupPartManager::SSTMergingIterator::seekToFirst()
-{
-    /// Rebuild the heap from scratch.
-    min_heap = MinHeap(Comparator(&iters));
-    for (size_t i = 0; i < iters.size(); ++i)
-    {
-        iters[i]->SeekToFirst();
-        if (iters[i]->Valid() && !iters[i]->key().empty())
-            min_heap.push(i);
-    }
-}
-
-void MergeTreeDedupPartManager::SSTMergingIterator::seek(const rocksdb::Slice & target)
-{
-    /// Rebuild the heap: each SST iterator uses O(log N) binary search
-    /// on index/data blocks, so total cost is O(K * log N_max + K * log K)
-    /// where K = number of iterators.
-    min_heap = MinHeap(Comparator(&iters));
-    for (size_t i = 0; i < iters.size(); ++i)
-    {
-        iters[i]->Seek(target);
-        if (iters[i]->Valid() && !iters[i]->key().empty())
-            min_heap.push(i);
-    }
-}
-
-void MergeTreeDedupPartManager::SSTMergingIterator::next()
-{
-    chassert(valid());
-    auto idx = min_heap.top();
-    min_heap.pop();
-    iters[idx]->Next();
-    if (iters[idx]->Valid() && !iters[idx]->key().empty())
-        min_heap.push(idx);
 }
 
 /// ---- buildAllDeleteMarksForPartition ----
