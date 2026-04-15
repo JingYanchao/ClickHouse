@@ -1,3 +1,14 @@
+-- Test: UniqueMergeTree merge dedup and delete mark propagation
+--
+-- Covers horizontal/vertical merge, write-version correctness,
+-- multi-part merge propagation, sequential merges, and merge with version column.
+
+-- ===================================================================
+-- Horizontal merge
+-- ===================================================================
+
+select '--- test horizontal ---';
+
 drop table if exists horizontal_upsert_table;
 CREATE TABLE horizontal_upsert_table
 (
@@ -8,7 +19,6 @@ CREATE TABLE horizontal_upsert_table
 )ENGINE = UniqueMergeTree()
 ORDER BY id;
 
-select '--- test horizontal ---';
 insert into horizontal_upsert_table (id, value1, value2) select number as id, number as value1, number as value2 from numbers(10);
 insert into horizontal_upsert_table (id, value1, value2) select number as id, number as value1, number as value2 from numbers(10);
 update horizontal_upsert_table set value1=100 where id=1;
@@ -16,7 +26,12 @@ OPTIMIZE table horizontal_upsert_table final;
 select * from horizontal_upsert_table order by id;
 drop table if exists horizontal_upsert_table;
 
+-- ===================================================================
+-- Vertical merge
+-- ===================================================================
+
 select '--- test vertical ---';
+
 drop table if exists vertical_upsert_table;
 CREATE TABLE vertical_upsert_table
 (
@@ -37,7 +52,12 @@ OPTIMIZE table vertical_upsert_table final;
 select * from vertical_upsert_table order by id;
 drop table if exists vertical_upsert_table;
 
+-- ===================================================================
+-- Horizontal merge: write-version correctness
+-- ===================================================================
+
 select '--- test horizontal version ---';
+
 drop table if exists horizontal_upsert_table_write_version;
 CREATE TABLE horizontal_upsert_table_write_version
 (
@@ -59,7 +79,12 @@ select count() from mergeTreeProjection(currentDatabase(), 'horizontal_upsert_ta
 select count(DISTINCT tupleElement(_unique_kv, 2)) from mergeTreeProjection(currentDatabase(), 'horizontal_upsert_table_write_version', '__unique_index');
 drop table if exists horizontal_upsert_table_write_version;
 
+-- ===================================================================
+-- Vertical merge: write-version correctness
+-- ===================================================================
+
 select '--- test vertical version ---';
+
 drop table if exists vertical_upsert_table_write_version;
 CREATE TABLE vertical_upsert_table_write_version
 (
@@ -83,7 +108,12 @@ select count() from mergeTreeProjection(currentDatabase(), 'vertical_upsert_tabl
 select count(DISTINCT tupleElement(_unique_kv, 2)) from mergeTreeProjection(currentDatabase(), 'vertical_upsert_table_write_version', '__unique_index');
 drop table if exists vertical_upsert_table_write_version;
 
+-- ===================================================================
+-- Vertical merge: simple unique key
+-- ===================================================================
+
 select '--- test vertical (simple unique key) ---';
+
 drop table if exists vertical_upsert_table_expr;
 CREATE TABLE vertical_upsert_table_expr
 (
@@ -103,3 +133,111 @@ update vertical_upsert_table_expr set value1=100 where id=1;
 OPTIMIZE table vertical_upsert_table_expr final;
 select * from vertical_upsert_table_expr order by id;
 drop table if exists vertical_upsert_table_expr;
+
+-- ===================================================================
+-- Merge propagation: multi-part insert then merge
+-- ===================================================================
+SELECT '--- merge propagation: basic ---';
+
+DROP TABLE IF EXISTS umt_merge_propagation;
+
+CREATE TABLE umt_merge_propagation
+(
+    id UInt32,
+    value UInt32,
+    PROJECTION __unique_index INDEX id TYPE unique
+)
+ENGINE = UniqueMergeTree()
+ORDER BY id;
+
+-- Create multiple parts
+INSERT INTO umt_merge_propagation SELECT number, 1 FROM numbers(10);
+INSERT INTO umt_merge_propagation SELECT number, 2 FROM numbers(10);
+INSERT INTO umt_merge_propagation SELECT number, 3 FROM numbers(10);
+
+-- Before merge: all keys should have value=3 (last write wins)
+SELECT count() FROM umt_merge_propagation;
+SELECT * FROM umt_merge_propagation ORDER BY id;
+
+-- Merge
+OPTIMIZE TABLE umt_merge_propagation FINAL;
+
+-- After merge: same result
+SELECT count() FROM umt_merge_propagation;
+SELECT * FROM umt_merge_propagation ORDER BY id;
+
+-- Insert after merge: should correctly dedup against merged part
+INSERT INTO umt_merge_propagation SELECT number, 4 FROM numbers(5);
+SELECT count() FROM umt_merge_propagation;
+SELECT * FROM umt_merge_propagation ORDER BY id;
+
+DROP TABLE umt_merge_propagation;
+
+-- ===================================================================
+-- Merge propagation: sequential merges
+-- ===================================================================
+SELECT '--- merge propagation: sequential merges ---';
+
+DROP TABLE IF EXISTS umt_merge_sequential;
+
+CREATE TABLE umt_merge_sequential
+(
+    id UInt32,
+    value UInt32,
+    PROJECTION __unique_index INDEX id TYPE unique
+)
+ENGINE = UniqueMergeTree()
+ORDER BY id;
+
+-- Round 1: insert and merge
+INSERT INTO umt_merge_sequential SELECT number, 1 FROM numbers(10);
+INSERT INTO umt_merge_sequential SELECT number, 2 FROM numbers(10);
+OPTIMIZE TABLE umt_merge_sequential FINAL;
+SELECT count() FROM umt_merge_sequential;
+
+-- Round 2: insert more and merge again
+INSERT INTO umt_merge_sequential SELECT number, 3 FROM numbers(10);
+INSERT INTO umt_merge_sequential SELECT number + 10, 3 FROM numbers(10);
+OPTIMIZE TABLE umt_merge_sequential FINAL;
+SELECT count() FROM umt_merge_sequential;
+SELECT * FROM umt_merge_sequential ORDER BY id;
+
+DROP TABLE umt_merge_sequential;
+
+-- ===================================================================
+-- Merge propagation: with version column
+-- ===================================================================
+SELECT '--- merge propagation: version ---';
+
+DROP TABLE IF EXISTS umt_merge_version;
+
+CREATE TABLE umt_merge_version
+(
+    id UInt32,
+    value UInt32,
+    version UInt64,
+    PROJECTION __unique_index INDEX id TYPE unique('version')
+)
+ENGINE = UniqueMergeTree()
+ORDER BY id;
+
+-- Insert with increasing versions
+INSERT INTO umt_merge_version SELECT number, 1, 1 FROM numbers(10);
+INSERT INTO umt_merge_version SELECT number, 2, 5 FROM numbers(10);
+-- Insert with LOWER version (should NOT win)
+INSERT INTO umt_merge_version SELECT number, 999, 2 FROM numbers(10);
+
+SELECT count() FROM umt_merge_version;
+SELECT id, value FROM umt_merge_version ORDER BY id;
+
+OPTIMIZE TABLE umt_merge_version FINAL;
+
+-- After merge: version 5 should still win
+SELECT count() FROM umt_merge_version;
+SELECT id, value FROM umt_merge_version ORDER BY id;
+
+-- Insert with even higher version
+INSERT INTO umt_merge_version SELECT number, 100, 10 FROM numbers(5);
+SELECT id, value FROM umt_merge_version ORDER BY id;
+
+DROP TABLE umt_merge_version;
