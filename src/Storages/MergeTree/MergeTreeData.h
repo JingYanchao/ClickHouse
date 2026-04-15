@@ -644,7 +644,7 @@ public:
 
     /// Snapshot of source parts' delete mark bitmaps, keyed by part name.
     /// Used to compute the diff between merge-start and commit-time delete marks.
-    using DeleteMarkSnapshotMap = std::unordered_map<String, ProjectionIndexBitmapPtr>;
+    using DeleteMarkSnapshotMap = std::unordered_map<String, DeleteBitmapPtr>;
 
     /// Snapshot for MergeTree contains the current set of data parts
     /// and mutations required to be applied at the moment of the start of query.

@@ -569,7 +569,7 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare() const
     if (global_ctx->data->supportsUpsert())
     {
         /// Directly copy the pre-computed snapshots into SnapshotData.
-        /// Both maps have the same type (unordered_map<String, ProjectionIndexBitmapPtr>)
+        /// Both maps have the same type (unordered_map<String, DeleteBitmapPtr>)
         /// and snapshotSourceDeleteMarks already excludes nullptr entries.
         auto snapshot_data = std::make_unique<MergeTreeData::SnapshotData>();
         snapshot_data->delete_mark_buffer_map = global_ctx->delete_mark_snapshots;

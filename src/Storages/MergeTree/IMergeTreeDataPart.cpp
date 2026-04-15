@@ -2071,29 +2071,34 @@ bool IMergeTreeDataPart::hasLightweightDelete() const
     return columns.contains(RowExistsColumn::name) || storage.supportsUpsert();
 }
 
-ProjectionIndexBitmapPtr & IMergeTreeDataPart::checkOrCreateDeleteMark() const
+MutableDeleteBitmapPtr & IMergeTreeDataPart::checkOrCreateDeleteBitmap() const
 {
-    if (!delete_mark_bitmap)
-        delete_mark_bitmap = ProjectionIndexBitmap::create(rows_count);
+    if (!delete_bitmap)
+        delete_bitmap = ProjectionIndexBitmap::create(rows_count);
 
-    return delete_mark_bitmap;
+    return delete_bitmap;
 }
 
-ProjectionIndexBitmapPtr IMergeTreeDataPart::getDeleteMarkBitmap() const
+DeleteBitmapPtr IMergeTreeDataPart::getDeleteBitmap() const
 {
-    return delete_mark_bitmap;
+    return delete_bitmap;
 }
 
-void IMergeTreeDataPart::setDeleteMarkBitmap(ProjectionIndexBitmapPtr bitmap) const
+MutableDeleteBitmapPtr IMergeTreeDataPart::getMutableDeleteBitmap() const
 {
-    delete_mark_bitmap = std::move(bitmap);
+    return delete_bitmap;
+}
+
+void IMergeTreeDataPart::replaceDeleteBitmap(MutableDeleteBitmapPtr bitmap) const
+{
+    delete_bitmap = std::move(bitmap);
 }
 
 size_t IMergeTreeDataPart::getDeleteMarksCount() const
 {
-    if (!delete_mark_bitmap)
+    if (!delete_bitmap)
         return 0;
-    return delete_mark_bitmap->cardinality();
+    return delete_bitmap->cardinality();
 }
 
 SSTFileReaderPtr IMergeTreeDataPart::getOrOpenSSTReader(const StorageMetadataPtr & metadata_snapshot) const

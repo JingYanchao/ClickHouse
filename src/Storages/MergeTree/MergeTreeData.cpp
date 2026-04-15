@@ -10572,7 +10572,7 @@ MergeTreeData::DeleteMarkSnapshotMap MergeTreeData::getDeleteMarksSnapshot(const
     auto lock = readLockParts();
     for (const auto & part : parts)
     {
-        const auto delete_mark = part->getDeleteMarkBitmap();
+        const auto delete_mark = part->getDeleteBitmap();
         if (delete_mark)
             snapshots.emplace(part->name, delete_mark);
     }
@@ -10607,8 +10607,8 @@ MergeTreeData::createStorageSnapshot(const StorageMetadataPtr & metadata_snapsho
 
         for (const auto & part : *parts)
         {
-            if (part.data_part->delete_mark_bitmap)
-                snapshot_data->delete_mark_buffer_map[part.data_part->name] = part.data_part->delete_mark_bitmap;
+            if (part.data_part->getDeleteBitmap())
+                snapshot_data->delete_mark_buffer_map[part.data_part->name] = part.data_part->getDeleteBitmap();
         }
 
         snapshot_data->parts = std::move(parts);

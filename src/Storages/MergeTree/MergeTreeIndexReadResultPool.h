@@ -99,10 +99,10 @@ struct ProjectionIndexBitmap
     bool empty() const;
 
     template <typename Offset>
-    bool contains(std::type_identity_t<Offset> value);
+    bool contains(std::type_identity_t<Offset> value) const;
 
     /// Type-dispatching overload: automatically calls Bitmap32 or Bitmap64 based on internal type.
-    bool contains(UInt64 value);
+    bool contains(UInt64 value) const;
 
     template <typename Offset>
     void add(std::type_identity_t<Offset> value);

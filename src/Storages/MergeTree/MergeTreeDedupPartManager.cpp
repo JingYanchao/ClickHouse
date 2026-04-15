@@ -102,7 +102,7 @@ static void deduplicateKeyByBucket(
     /// earlier INSERTs. Keys marked as deleted must be skipped — otherwise a
     /// stale (deleted) key could incorrectly win the version comparison and
     /// produce wrong delete marks on the fetched part.
-    auto input_delete_bitmap = input.part->getDeleteMarkBitmap();
+    auto input_delete_bitmap = input.part->getDeleteBitmap();
 
     /// Reusable batch buffer to avoid repeated allocations.
     std::vector<InputKeyEntry> batch;
@@ -170,7 +170,7 @@ static void deduplicateKeyByBucket(
 
             /// Process results — compare versions and mark losers.
             const auto & current_part = visible.part;
-            auto current_delete_bitmap = current_part->getDeleteMarkBitmap();
+            auto current_delete_bitmap = current_part->getDeleteBitmap();
 
             for (size_t c = 0; c < candidate_keys.size(); ++c)
             {
@@ -369,14 +369,14 @@ static void applyCrossPartDeleteMarks(const PartDeleteBitmapMap & cross_part_mar
 
         /// COW: create a fresh bitmap, copy existing marks if any, then add new ones.
         auto new_marks = ProjectionIndexBitmap::create(part_ptr->rows_count);
-        if (auto existing_marks = part_ptr->getDeleteMarkBitmap())
+        if (auto existing_marks = part_ptr->getDeleteBitmap())
             new_marks->unionWith(*existing_marks);
 
         new_marks->unionWith(*cross_part_marks);
 
         /// Replace the bitmap pointer. Readers that already captured the old shared_ptr
         /// in a snapshot continue to use it; new snapshots will pick up the updated bitmap.
-        part_ptr->setDeleteMarkBitmap(new_marks);
+        part_ptr->replaceDeleteBitmap(new_marks);
     }
 }
 
@@ -486,7 +486,7 @@ void MergeTreeDedupPartManager::dedupForFetch(
         /// computed under a different set of visible parts and is unreliable
         /// when source-part block gaps exist. dedupForInsert will recompute
         /// delete marks from scratch against the local visible parts.
-        new_part->delete_mark_bitmap = nullptr;
+        new_part->replaceDeleteBitmap(nullptr);
         dedupForInsert(new_part, metadata_snapshot, non_covered_visible_parts);
         return;
     }
@@ -593,7 +593,7 @@ void MergeTreeDedupPartManager::dedupForMerge(
     for (const auto & part : source_parts)
     {
         size_t deleted = 0;
-        if (auto delete_mark = part->getDeleteMarkBitmap())
+        if (auto delete_mark = part->getDeleteBitmap())
             deleted = delete_mark->cardinality();
         source_effective_rows += (part->rows_count - deleted);
     }
@@ -620,7 +620,7 @@ void MergeTreeDedupPartManager::dedupForMutation(
             "dedupForMutation: part '{}' has {} rows, but source part '{}' has {} rows",
             new_part->name, new_part->rows_count, source_part->name, source_part->rows_count);
 
-    auto source_delete_mark = source_part->getDeleteMarkBitmap();
+    auto source_delete_mark = source_part->getMutableDeleteBitmap();
     if (!source_delete_mark || source_delete_mark->empty())
         return;
 
@@ -634,7 +634,7 @@ void MergeTreeDedupPartManager::dedupForMutation(
 static ProjectionIndexBitmapPtr dedupDeletedKeysForOneSourcePart(
     const PartWithSSTReader & source_part_with_sst_reader,
     const SSTFileReaderPtr & merged_sst_reader,
-    const ProjectionIndexBitmapPtr & diff_bitmap)
+    const DeleteBitmapPtr & diff_bitmap)
 {
     if (!diff_bitmap || diff_bitmap->cardinality() == 0)
         return nullptr;
@@ -705,16 +705,16 @@ static ProjectionIndexBitmapPtr dedupDeletedKeysForOneSourcePart(
     return bitmap->empty() ? nullptr : bitmap;
 }
 
-static std::vector<ProjectionIndexBitmapPtr> computeDeleteMarkDiffs(
+static std::vector<DeleteBitmapPtr> computeDeleteMarkDiffs(
     const std::vector<PartWithSSTReader> & source_part_readers,
     const MergeTreeData::DeleteMarkSnapshotMap & snapshots)
 {
-    std::vector<ProjectionIndexBitmapPtr> diffs;
+    std::vector<DeleteBitmapPtr> diffs;
     diffs.reserve(source_part_readers.size());
 
     for (const auto & [part, reader] : source_part_readers)
     {
-        auto current_marks = part->getDeleteMarkBitmap();
+        auto current_marks = part->getDeleteBitmap();
         if (!current_marks || current_marks->empty())
         {
             diffs.push_back(nullptr);
@@ -935,7 +935,7 @@ DedupMetadataForFetch MergeTreeDedupPartManager::collectDedupMetadataForFetch(co
 
     auto lock = storage.readLockParts();
 
-    result.delete_mark = part->getDeleteMarkBitmap();
+    result.delete_mark = part->getMutableDeleteBitmap();
 
     auto partition_parts
         = storage.getDataPartsVectorInPartitionForInternalUsage(MergeTreeData::DataPartState::Active, part->info.getPartitionId(), lock);
@@ -1065,14 +1065,14 @@ void MergeTreeDedupPartManager::buildAllDeleteMarksForPartitionOnStartup(
                     && parts[idx]->info.max_block >= parts[last_max_entry_info.part_index]->info.max_block))
             {
                 /// Current entry has higher version — mark the previous max as deleted.
-                parts[last_max_entry_info.part_index]->checkOrCreateDeleteMark()
+                parts[last_max_entry_info.part_index]->checkOrCreateDeleteBitmap()
                     ->add(last_max_entry_info.entry.part_offset);
                 last_max_entry_info = {idx, entry, current_version};
             }
             else
             {
                 /// Current entry loses — mark it as deleted.
-                parts[idx]->checkOrCreateDeleteMark()
+                parts[idx]->checkOrCreateDeleteBitmap()
                     ->add(entry.part_offset);
             }
         }

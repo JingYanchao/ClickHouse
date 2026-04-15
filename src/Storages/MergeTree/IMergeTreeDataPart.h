@@ -62,6 +62,10 @@ using MergeTreeReadTaskInfoPtr = std::shared_ptr<const MergeTreeReadTaskInfo>;
 struct ProjectionIndexBitmap;
 using ProjectionIndexBitmapPtr = std::shared_ptr<ProjectionIndexBitmap>;
 
+/// Immutable and mutable smart-pointer aliases for delete bitmaps.
+using DeleteBitmapPtr = std::shared_ptr<const ProjectionIndexBitmap>;
+using MutableDeleteBitmapPtr = std::shared_ptr<ProjectionIndexBitmap>;
+
 class PrimaryIndexCache;
 using PrimaryIndexCachePtr = std::shared_ptr<PrimaryIndexCache>;
 
@@ -272,16 +276,12 @@ public:
     /// When the part is removed from the working set. Changes once.
     mutable std::atomic<time_t> remove_time { std::numeric_limits<time_t>::max() };
 
-    /// Delete mark bitmap for unique dedup: bits set to 1 represent deleted (deduped) rows.
-    /// Populated by MergeTreeDedupPartManager during dedup or rebuild.
-    mutable ProjectionIndexBitmapPtr delete_mark_bitmap;
-
     /// For UniqueMergeTree: the union of all active parts' block ranges in the
     /// partition, obtained from the source replica at fetch time. Used to skip
     /// reverse-dedup for visible parts whose [min_block, max_block] is fully
     /// contained within the source replica's active block ranges.
     /// The delete mark from the source replica is assigned directly to
-    /// delete_mark_bitmap above.
+    /// delete_bitmap below.
     boost::icl::interval_set<Int64> fetch_dedup_block_ranges;
 
     /// If true, the destructor will delete the directory with the part.
@@ -612,18 +612,26 @@ public:
     /// True if here is lightweight deleted mask file in part.
     bool hasLightweightDelete() const;
 
+    /// Returns an immutable (const) view of the delete bitmap.
+    /// Returns nullptr if no bitmap is set.
+    DeleteBitmapPtr getDeleteBitmap() const;
+
+    /// Returns a mutable view of the delete bitmap.
+    /// Returns nullptr if no bitmap is set.
+    MutableDeleteBitmapPtr getMutableDeleteBitmap() const;
+
+    /// Replaces the delete bitmap with a new one (or nullptr to clear).
+    /// Readers that already captured the old shared_ptr in a snapshot
+    /// continue to use it; new snapshots will pick up the updated bitmap.
+    void replaceDeleteBitmap(MutableDeleteBitmapPtr bitmap) const;
+
     /// Ensures the delete mark bitmap is initialized for this part.
-    /// Throws LOGICAL_ERROR for Compact parts (not supported).
-    /// Returns a reference to the bitmap for direct modification.
-    ProjectionIndexBitmapPtr & checkOrCreateDeleteMark() const;
+    /// If not yet created, allocates a new bitmap sized to rows_count.
+    /// Returns a mutable reference to the internal bitmap pointer for
+    /// direct in-place modification (used by dedup).
+    MutableDeleteBitmapPtr & checkOrCreateDeleteBitmap() const;
 
-    /// Returns the delete mark bitmap for this part (may be nullptr if not set).
-    ProjectionIndexBitmapPtr getDeleteMarkBitmap() const;
-
-    /// Sets the delete mark bitmap for this part.
-    void setDeleteMarkBitmap(ProjectionIndexBitmapPtr bitmap) const;
-
-    /// Returns the number of rows marked as deleted in the delete mark bitmap.
+    /// Returns the number of rows marked as deleted in the delete bitmap.
     size_t getDeleteMarksCount() const;
 
     /// Returns cached SST reader for the unique projection of this part.
@@ -872,6 +880,10 @@ private:
 
     /// Returns the name of the part state as a string.
     String stateToString() const;
+
+    /// Delete bitmap for unique dedup: bits set to 1 represent deleted (deduped) rows.
+    /// Populated by MergeTreeDedupPartManager during dedup or rebuild.
+    mutable MutableDeleteBitmapPtr delete_bitmap;
 
     /// This ugly flag is needed for debug assertions only
     mutable bool part_is_probably_removed_from_disk = false;

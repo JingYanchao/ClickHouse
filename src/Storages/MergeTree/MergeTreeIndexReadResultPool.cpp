@@ -216,7 +216,7 @@ bool ProjectionIndexBitmap::empty() const
 }
 
 template <typename Offset>
-bool ProjectionIndexBitmap::contains(std::type_identity_t<Offset> value)
+bool ProjectionIndexBitmap::contains(std::type_identity_t<Offset> value) const
 {
     static_assert(
         std::is_same_v<Offset, UInt32> || std::is_same_v<Offset, UInt64>,
@@ -431,7 +431,7 @@ ProjectionIndexBitmapPtr ProjectionIndexBitmap::deserializePortable(ReadBuffer &
     return bitmap;
 }
 
-bool ProjectionIndexBitmap::contains(UInt64 value)
+bool ProjectionIndexBitmap::contains(UInt64 value) const
 {
     if (type == BitmapType::Bitmap32)
         return roaring_bitmap_contains(data.bitmap32, static_cast<UInt32>(value));
@@ -447,8 +447,8 @@ void ProjectionIndexBitmap::add(UInt64 value)
         roaring64_bitmap_add(data.bitmap64, value);
 }
 
-template bool ProjectionIndexBitmap::contains<UInt32>(UInt32 value);
-template bool ProjectionIndexBitmap::contains<UInt64>(UInt64 value);
+template bool ProjectionIndexBitmap::contains<UInt32>(UInt32 value) const;
+template bool ProjectionIndexBitmap::contains<UInt64>(UInt64 value) const;
 
 template void ProjectionIndexBitmap::add<UInt32>(UInt32 value);
 template void ProjectionIndexBitmap::add<UInt64>(UInt64 value);
