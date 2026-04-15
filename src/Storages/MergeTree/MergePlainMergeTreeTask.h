@@ -95,9 +95,9 @@ private:
 
     ContextMutablePtr task_context;
 
-    /// Snapshot of source parts' delete mark bitmaps taken at merge start.
+    /// Snapshot of source parts' delete bitmaps taken at merge start.
     /// Used for diff-based dedup optimization at commit time.
-    MergeTreeData::DeleteMarkSnapshotMap source_delete_mark_snapshots;
+    MergeTreeData::DeleteBitmapSnapshotMap source_delete_bitmap_snapshots;
 
     ContextMutablePtr createTaskContext() const;
 };

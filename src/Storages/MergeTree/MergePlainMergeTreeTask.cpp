@@ -142,7 +142,7 @@ void MergePlainMergeTreeTask::prepare()
         DataPartsVector source_parts;
         for (const auto & p : future_part->parts)
             source_parts.push_back(p);
-        source_delete_mark_snapshots = storage.getDeleteMarksSnapshot(source_parts);
+        source_delete_bitmap_snapshots = storage.getDeleteBitmapSnapshot(source_parts);
     }
 
     merge_task = storage.merger_mutator.mergePartsToTemporaryPart(
@@ -162,8 +162,8 @@ void MergePlainMergeTreeTask::prepare()
 
     /// Pass the snapshot to MergeTask so it builds StorageSnapshot from the
     /// same data, keeping the merge reader and commit-time dedup aligned.
-    if (!source_delete_mark_snapshots.empty())
-        merge_task->setDeleteMarkSnapshots(source_delete_mark_snapshots);
+    if (!source_delete_bitmap_snapshots.empty())
+        merge_task->setDeleteBitmapSnapshots(source_delete_bitmap_snapshots);
 }
 
 
@@ -176,7 +176,7 @@ void MergePlainMergeTreeTask::finish()
     /// Pass delete mark snapshots to the before-commit hook for diff-based dedup.
     {
         MergeTreeData::BeforeCommitHookContext hook_ctx;
-        hook_ctx.data = std::move(source_delete_mark_snapshots);
+        hook_ctx.data = std::move(source_delete_bitmap_snapshots);
         transaction.setBeforeCommitHookContext(std::move(hook_ctx));
     }
 

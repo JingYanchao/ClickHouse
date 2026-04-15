@@ -638,12 +638,12 @@ void IMergeTreeReader::fillMemoryRowExistsColumn(ColumnPtr column, size_t max_ro
 
     /// Retrieve the delete mark bitmap from the storage snapshot instead of directly from the part.
     /// The snapshot captures a consistent copy of the bitmap at query start time under lockParts,
-    /// which avoids race conditions with concurrent commitDeleteMarkBuffers writes.
+    /// which avoids race conditions with concurrent commitDeleteBitmapBuffers writes.
     const auto & part_name = data_part_info_for_read->getPartName();
     const auto & snapshot_data = assert_cast<const MergeTreeData::SnapshotData &>(*storage_snapshot->data);
-    const auto & delete_mark_buffer_map = snapshot_data.delete_mark_buffer_map;
-    const auto iter = delete_mark_buffer_map.find(part_name);
-    auto delete_bitmap = iter != delete_mark_buffer_map.end() ? iter->second : nullptr;
+    const auto & delete_bitmap_buffer_map = snapshot_data.delete_bitmap_buffer_map;
+    const auto iter = delete_bitmap_buffer_map.find(part_name);
+    auto delete_bitmap = iter != delete_bitmap_buffer_map.end() ? iter->second : nullptr;
 
     ColumnVector<UInt8>::Container & container = derived_column->getData();
     auto initial_size = container.size();

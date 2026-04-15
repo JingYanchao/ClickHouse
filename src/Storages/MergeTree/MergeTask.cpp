@@ -570,9 +570,9 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare() const
     {
         /// Directly copy the pre-computed snapshots into SnapshotData.
         /// Both maps have the same type (unordered_map<String, DeleteBitmapPtr>)
-        /// and snapshotSourceDeleteMarks already excludes nullptr entries.
+        /// and snapshotSourceDeleteBitmaps already excludes nullptr entries.
         auto snapshot_data = std::make_unique<MergeTreeData::SnapshotData>();
-        snapshot_data->delete_mark_buffer_map = global_ctx->delete_mark_snapshots;
+        snapshot_data->delete_bitmap_buffer_map = global_ctx->delete_bitmap_snapshots;
         global_ctx->storage_snapshot = std::make_shared<StorageSnapshot>(*global_ctx->data, global_ctx->metadata_snapshot, std::move(snapshot_data));
     }
     else
@@ -831,7 +831,7 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare() const
     if (global_ctx->data->supportsUpsert())
     {
         for (const auto & part : global_ctx->future_part->parts)
-            ctx->sum_input_rows_upper_bound -= part->getDeleteMarksCount();
+            ctx->sum_input_rows_upper_bound -= part->getDeleteBitmapCount();
     }
     ctx->sum_compressed_bytes_upper_bound = global_ctx->merge_list_element_ptr->total_size_bytes_compressed;
     ctx->sum_uncompressed_bytes_upper_bound = global_ctx->merge_list_element_ptr->total_size_bytes_uncompressed;
@@ -3007,7 +3007,7 @@ MergeAlgorithm MergeTask::ExecuteAndFinalizeHorizontalPart::chooseMergeAlgorithm
     if (global_ctx->data->supportsUpsert())
     {
         for (const auto & part : global_ctx->future_part->parts)
-            total_rows_count -= part->getDeleteMarksCount();
+            total_rows_count -= part->getDeleteBitmapCount();
     }
     const size_t total_size_bytes_uncompressed = global_ctx->merge_list_element_ptr->total_size_bytes_uncompressed;
     const auto & merge_tree_settings = global_ctx->data_settings;

@@ -632,7 +632,7 @@ public:
     MutableDeleteBitmapPtr & checkOrCreateDeleteBitmap() const;
 
     /// Returns the number of rows marked as deleted in the delete bitmap.
-    size_t getDeleteMarksCount() const;
+    size_t getDeleteBitmapCount() const;
 
     /// Returns cached SST reader for the unique projection of this part.
     /// Looks up or creates the reader in the global SSTFileReaderCache.

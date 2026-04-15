@@ -382,7 +382,7 @@ ReplicatedMergeMutateTaskBase::PrepareResult MergeFromLogEntryTask::prepare()
         DataPartsVector source_parts;
         for (const auto & p : parts)
             source_parts.push_back(p);
-        source_delete_mark_snapshots = storage.getDeleteMarksSnapshot(source_parts);
+        source_delete_bitmap_snapshots = storage.getDeleteBitmapSnapshot(source_parts);
     }
 
     merge_task = storage.merger_mutator.mergePartsToTemporaryPart(
@@ -402,8 +402,8 @@ ReplicatedMergeMutateTaskBase::PrepareResult MergeFromLogEntryTask::prepare()
 
     /// Pass the snapshot to MergeTask so it builds StorageSnapshot from the
     /// same data, keeping the merge reader and commit-time dedup aligned.
-    if (!source_delete_mark_snapshots.empty())
-        merge_task->setDeleteMarkSnapshots(source_delete_mark_snapshots);
+    if (!source_delete_bitmap_snapshots.empty())
+        merge_task->setDeleteBitmapSnapshots(source_delete_bitmap_snapshots);
 
     /// Adjust priority
     for (auto & item : future_merged_part->parts)
@@ -430,7 +430,7 @@ bool MergeFromLogEntryTask::finalize(ReplicatedMergeMutateTaskBase::PartLogWrite
     if (storage.supportsUpsert())
     {
         MergeTreeData::BeforeCommitHookContext hook_ctx;
-        hook_ctx.data = std::move(source_delete_mark_snapshots);
+        hook_ctx.data = std::move(source_delete_bitmap_snapshots);
         transaction_ptr->setBeforeCommitHookContext(std::move(hook_ctx));
     }
 

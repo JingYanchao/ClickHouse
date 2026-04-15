@@ -915,10 +915,10 @@ MergeTreeData::MutableDataPartPtr Fetcher::downloadPartToDisk(
 
         if (dedup_meta)
         {
-            new_data_part->replaceDeleteBitmap(std::move(dedup_meta->delete_mark));
+            new_data_part->replaceDeleteBitmap(std::move(dedup_meta->delete_bitmap));
             new_data_part->fetch_dedup_block_ranges = std::move(dedup_meta->block_ranges);
 
-            LOG_DEBUG(log, "Received dedup metadata for part {}: has_delete_mark={}, block_ranges_intervals={}",
+            LOG_DEBUG(log, "Received dedup metadata for part {}: has_delete_bitmap={}, block_ranges_intervals={}",
                 new_data_part->name,
                 new_data_part->getDeleteBitmap() != nullptr,
                 boost::icl::interval_count(new_data_part->fetch_dedup_block_ranges));

@@ -86,34 +86,10 @@ StorageReplicatedUniqueMergeTree::StorageReplicatedUniqueMergeTree(
     setBeforeTransactionCommitHook(
         [this](const MutableDataParts & parts, const BeforeCommitHookContext & context) -> std::any
         {
-            return onBeforeTransactionCommit(parts, context);
+            return dedup_manager->dedupPartsBeforeTransactionCommit(parts, context);
         });
 
     has_lightweight_delete_parts.store(true);
-}
-
-std::any StorageReplicatedUniqueMergeTree::onBeforeTransactionCommit(
-    const MutableDataParts & parts, const BeforeCommitHookContext & before_commit_context)
-{
-    /// Serialize concurrent commits: only one thread computes delete bitmaps at a time.
-    auto unique_lock = dedup_manager->lockUniqueProcess();
-
-    DeleteMarkSnapshotMap delete_mark_snapshots;
-    std::optional<DeleteMarkSnapshotMap> opt_snapshots;
-    if (before_commit_context.data.has_value())
-    {
-        delete_mark_snapshots = std::any_cast<DeleteMarkSnapshotMap>(before_commit_context.data);
-        opt_snapshots = std::move(delete_mark_snapshots);
-    }
-
-    for (const auto & part : parts)
-    {
-        dedup_manager->dedupPart(part, opt_snapshots);
-    }
-
-    /// Wrap in shared_ptr because std::any requires CopyConstructible,
-    /// but UniqueProcessLock is move-only.
-    return std::make_shared<UniqueProcessLock>(std::move(unique_lock));
 }
 
 void StorageReplicatedUniqueMergeTree::dropPart(

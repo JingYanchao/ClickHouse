@@ -48,9 +48,6 @@ public:
 private:
     /// The name of the unique projection (from engine param or auto-detected).
     String unique_projection_name;
-
-    /// BeforeTransactionCommitHook implementation.
-    std::any onBeforeTransactionCommit(const MutableDataParts & parts, const BeforeCommitHookContext & context);
 };
 
 }

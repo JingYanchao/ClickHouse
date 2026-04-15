@@ -2094,7 +2094,7 @@ void IMergeTreeDataPart::replaceDeleteBitmap(MutableDeleteBitmapPtr bitmap) cons
     delete_bitmap = std::move(bitmap);
 }
 
-size_t IMergeTreeDataPart::getDeleteMarksCount() const
+size_t IMergeTreeDataPart::getDeleteBitmapCount() const
 {
     if (!delete_bitmap)
         return 0;

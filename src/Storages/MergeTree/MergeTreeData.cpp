@@ -8639,7 +8639,7 @@ MergeTreeData::DataPartsVector MergeTreeData::Transaction::commit(DataPartsLock 
                     ++add_parts;
 
                     if (data.supportsUpsert())
-                        data.dedup_manager->commitDeleteMarkBuffers(acquired_parts_lock);
+                    data.dedup_manager->commitDeleteBitmapBuffers(acquired_parts_lock);
 
                     data.modifyPartState(part, DataPartState::Active, acquired_parts_lock);
                     data.addPartContributionToColumnAndSecondaryIndexSizes(part);
@@ -10566,15 +10566,15 @@ StorageMetadataPtr MergeTreeData::getInMemoryMetadataPtr(bool bypass_metadata_ca
 }
 
 
-MergeTreeData::DeleteMarkSnapshotMap MergeTreeData::getDeleteMarksSnapshot(const DataPartsVector & parts) const
+MergeTreeData::DeleteBitmapSnapshotMap MergeTreeData::getDeleteBitmapSnapshot(const DataPartsVector & parts) const
 {
-    DeleteMarkSnapshotMap snapshots;
+    DeleteBitmapSnapshotMap snapshots;
     auto lock = readLockParts();
     for (const auto & part : parts)
     {
-        const auto delete_mark = part->getDeleteBitmap();
-        if (delete_mark)
-            snapshots.emplace(part->name, delete_mark);
+        const auto delete_bitmap = part->getDeleteBitmap();
+        if (delete_bitmap)
+            snapshots.emplace(part->name, delete_bitmap);
     }
     return snapshots;
 }
@@ -10602,13 +10602,13 @@ MergeTreeData::createStorageSnapshot(const StorageMetadataPtr & metadata_snapsho
         std::erase_if(*parts, [](const auto & part)
         {
             return part.data_part->rows_count == 0
-                || part.data_part->rows_count == part.data_part->getDeleteMarksCount();
+                || part.data_part->rows_count == part.data_part->getDeleteBitmapCount();
         });
 
         for (const auto & part : *parts)
         {
             if (part.data_part->getDeleteBitmap())
-                snapshot_data->delete_mark_buffer_map[part.data_part->name] = part.data_part->getDeleteBitmap();
+                snapshot_data->delete_bitmap_buffer_map[part.data_part->name] = part.data_part->getDeleteBitmap();
         }
 
         snapshot_data->parts = std::move(parts);

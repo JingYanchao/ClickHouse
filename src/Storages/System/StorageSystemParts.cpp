@@ -192,7 +192,7 @@ void StorageSystemParts::processNextStorage(
         if (columns_mask[src_index++])
             columns[res_index++]->insert(part->rows_count);
         if (columns_mask[src_index++])
-            columns[res_index++]->insert(part->getDeleteMarksCount());
+columns[res_index++]->insert(part->getDeleteBitmapCount());
         if (columns_mask[src_index++])
             columns[res_index++]->insert(part->checksums.files.size());
         if (columns_mask[src_index++])

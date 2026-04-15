@@ -362,7 +362,7 @@ public:
     /// callers to pass an explicit enum.
     struct BeforeCommitHookContext
     {
-        std::any data;  /// Arbitrary payload, e.g. DeleteMarkSnapshotMap
+        std::any data;  /// Arbitrary payload, e.g. DeleteBitmapSnapshotMap
     };
 
     class Transaction : private boost::noncopyable
@@ -642,9 +642,9 @@ public:
 
     using MutationsSnapshotPtr = std::shared_ptr<const IMutationsSnapshot>;
 
-    /// Snapshot of source parts' delete mark bitmaps, keyed by part name.
-    /// Used to compute the diff between merge-start and commit-time delete marks.
-    using DeleteMarkSnapshotMap = std::unordered_map<String, DeleteBitmapPtr>;
+    /// Snapshot of source parts' delete bitmaps, keyed by part name.
+    /// Used to compute the diff between merge-start and commit-time delete bitmaps.
+    using DeleteBitmapSnapshotMap = std::unordered_map<String, DeleteBitmapPtr>;
 
     /// Snapshot for MergeTree contains the current set of data parts
     /// and mutations required to be applied at the moment of the start of query.
@@ -660,14 +660,14 @@ public:
 
         MutationsSnapshotPtr mutations_snapshot;
 
-        DeleteMarkSnapshotMap delete_mark_buffer_map;
+        DeleteBitmapSnapshotMap delete_bitmap_buffer_map;
     };
 
-    /// Snapshot the current delete mark bitmaps for the given parts.
+    /// Snapshot the current delete bitmaps for the given parts.
     /// Should be called at merge/mutation start (before the merge executes)
     /// so that at commit time we can compute the diff and only process
     /// newly deleted keys. Thread-safe: reads COW bitmap pointers.
-    DeleteMarkSnapshotMap getDeleteMarksSnapshot(const DataPartsVector & parts) const;
+    DeleteBitmapSnapshotMap getDeleteBitmapSnapshot(const DataPartsVector & parts) const;
 
     StorageSnapshotPtr getStorageSnapshot(const StorageMetadataPtr & metadata_snapshot, ContextPtr query_context) const override;
 

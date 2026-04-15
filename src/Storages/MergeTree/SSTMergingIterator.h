@@ -14,7 +14,7 @@ namespace DB
 /// Lightweight multi-way merge iterator over rocksdb SST iterators.
 /// Produces keys in sorted order; when keys are equal, the iterator
 /// with the smaller index (older part) comes first.
-/// Used by `buildAllDeleteMarksForPartition` for startup dedup.
+/// Used by `buildAllDeleteBitmapsForPartition` for startup dedup.
 class SSTMergingIterator
 {
 public:

@@ -61,9 +61,9 @@ private:
 
     std::map<String, UInt64> projections_merge_time;
 
-    /// Snapshot of source parts' delete marks taken before merge starts.
+    /// Snapshot of source parts' delete bitmaps taken before merge starts.
     /// Used by dedup to detect concurrent INSERT deletions during merge.
-    MergeTreeData::DeleteMarkSnapshotMap source_delete_mark_snapshots;
+    MergeTreeData::DeleteBitmapSnapshotMap source_delete_bitmap_snapshots;
 };
 
 
