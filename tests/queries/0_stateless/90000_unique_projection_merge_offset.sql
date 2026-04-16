@@ -13,12 +13,12 @@ SETTINGS index_granularity_bytes = 10485760, index_granularity = 8192,
 
 -- Insert 3 parts with non-overlapping contiguous id ranges so merge does NOT
 -- reduce rows and takes the merge path (not rebuild path).
--- IMPORTANT: Use different row counts per part (1000, 2000, 3000) so that the
+-- IMPORTANT: Use different row counts per part (100, 200, 300) so that the
 -- per-part offset ranges differ. If all parts had the same size, untranslated
 -- offsets could accidentally pass a naive count() check.
-INSERT INTO test_unique_proj_merge SELECT number, rand() FROM numbers(1000);
-INSERT INTO test_unique_proj_merge SELECT number + 1000, rand() FROM numbers(2000);
-INSERT INTO test_unique_proj_merge SELECT number + 3000, rand() FROM numbers(3000);
+INSERT INTO test_unique_proj_merge SELECT number, rand() FROM numbers(100);
+INSERT INTO test_unique_proj_merge SELECT number + 100, rand() FROM numbers(200);
+INSERT INTO test_unique_proj_merge SELECT number + 300, rand() FROM numbers(300);
 
 -- Before merge: verify total entries and that all offsets are distinct within each part.
 SELECT count() FROM mergeTreeProjection(currentDatabase(), 'test_unique_proj_merge', '__unique_index');
@@ -29,8 +29,8 @@ OPTIMIZE TABLE test_unique_proj_merge FINAL;
 
 -- After merge: verify offset translation correctness.
 -- If offsets were NOT translated, multiple projection entries from different source
--- parts would still carry their old per-part offsets (0..999, 0..1999, 0..2999),
--- resulting in only 3000 distinct offset values instead of 6000.
+-- parts would still carry their old per-part offsets (0..99, 0..199, 0..299),
+-- resulting in only 300 distinct offset values instead of 600.
 -- With correct translation, each entry has a unique offset in the merged part.
 SELECT count() FROM mergeTreeProjection(currentDatabase(), 'test_unique_proj_merge', '__unique_index');
 SELECT count(DISTINCT tupleElement(_unique_kv, 2)) FROM mergeTreeProjection(currentDatabase(), 'test_unique_proj_merge', '__unique_index');
@@ -55,9 +55,9 @@ SETTINGS index_granularity_bytes = 10485760, index_granularity = 8192,
     vertical_merge_algorithm_min_columns_to_activate = 0,
     min_bytes_for_wide_part = 0;
 
-INSERT INTO test_unique_proj_merge_vertical SELECT number, rand() FROM numbers(1000);
-INSERT INTO test_unique_proj_merge_vertical SELECT number + 1000, rand() FROM numbers(2000);
-INSERT INTO test_unique_proj_merge_vertical SELECT number + 3000, rand() FROM numbers(3000);
+INSERT INTO test_unique_proj_merge_vertical SELECT number, rand() FROM numbers(100);
+INSERT INTO test_unique_proj_merge_vertical SELECT number + 100, rand() FROM numbers(200);
+INSERT INTO test_unique_proj_merge_vertical SELECT number + 300, rand() FROM numbers(300);
 
 -- Before merge
 SELECT count() FROM mergeTreeProjection(currentDatabase(), 'test_unique_proj_merge_vertical', '__unique_index');

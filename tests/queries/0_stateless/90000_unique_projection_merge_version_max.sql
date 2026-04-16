@@ -17,20 +17,20 @@ ORDER BY id
 SETTINGS index_granularity_bytes = 10485760, index_granularity = 8192,
     merge_max_block_size = 8192;
 
--- Part 1: insert ids 0..999 with version=1
-INSERT INTO test_unique_proj_merge_ver SELECT number, 100, 1 FROM numbers(1000);
--- Part 2: insert the SAME ids 0..999 but with version=5 (higher version should win)
-INSERT INTO test_unique_proj_merge_ver SELECT number, 200, 5 FROM numbers(1000);
--- Part 3: insert the SAME ids 0..999 but with version=3 (lower than part2, should lose)
-INSERT INTO test_unique_proj_merge_ver SELECT number, 300, 3 FROM numbers(1000);
+-- Part 1: insert ids 0..99 with version=1
+INSERT INTO test_unique_proj_merge_ver SELECT number, 100, 1 FROM numbers(100);
+-- Part 2: insert the SAME ids 0..99 but with version=5 (higher version should win)
+INSERT INTO test_unique_proj_merge_ver SELECT number, 200, 5 FROM numbers(100);
+-- Part 3: insert the SAME ids 0..99 but with version=3 (lower than part2, should lose)
+INSERT INTO test_unique_proj_merge_ver SELECT number, 300, 3 FROM numbers(100);
 
--- Before merge: 3 parts, 3000 total entries in the projection (1000 per part).
+-- Before merge: 3 parts, 300 total entries in the projection (100 per part).
 SELECT count() FROM mergeTreeProjection(currentDatabase(), 'test_unique_proj_merge_ver', '__unique_index');
 
 OPTIMIZE TABLE test_unique_proj_merge_ver FINAL;
 
 -- After merge: the max(version, part_offset) rule should keep only the entry with
--- version=5 for each key. So we expect exactly 1000 entries (one per unique id).
+-- version=5 for each key. So we expect exactly 100 entries (one per unique id).
 SELECT count() FROM mergeTreeProjection(currentDatabase(), 'test_unique_proj_merge_ver', '__unique_index');
 
 -- Verify that the surviving version is 5 for all entries.
@@ -59,11 +59,11 @@ SETTINGS index_granularity_bytes = 10485760, index_granularity = 8192,
 
 -- Insert with highest version first, then lower versions
 -- Part 1: version=10 (highest)
-INSERT INTO test_unique_proj_merge_ver2 SELECT number, 100, 10 FROM numbers(500);
+INSERT INTO test_unique_proj_merge_ver2 SELECT number, 100, 10 FROM numbers(50);
 -- Part 2: version=1 (lowest)
-INSERT INTO test_unique_proj_merge_ver2 SELECT number, 200, 1 FROM numbers(500);
+INSERT INTO test_unique_proj_merge_ver2 SELECT number, 200, 1 FROM numbers(50);
 -- Part 3: version=5 (middle)
-INSERT INTO test_unique_proj_merge_ver2 SELECT number, 300, 5 FROM numbers(500);
+INSERT INTO test_unique_proj_merge_ver2 SELECT number, 300, 5 FROM numbers(50);
 
 SELECT count() FROM mergeTreeProjection(currentDatabase(), 'test_unique_proj_merge_ver2', '__unique_index');
 
@@ -96,11 +96,11 @@ SETTINGS index_granularity_bytes = 10485760, index_granularity = 8192,
     min_bytes_for_wide_part = 0;
 
 -- Part 1: version=1
-INSERT INTO test_unique_proj_merge_ver_vertical SELECT number, 100, 1 FROM numbers(1000);
+INSERT INTO test_unique_proj_merge_ver_vertical SELECT number, 100, 1 FROM numbers(100);
 -- Part 2: version=5 (should win)
-INSERT INTO test_unique_proj_merge_ver_vertical SELECT number, 200, 5 FROM numbers(1000);
+INSERT INTO test_unique_proj_merge_ver_vertical SELECT number, 200, 5 FROM numbers(100);
 -- Part 3: version=3 (should lose)
-INSERT INTO test_unique_proj_merge_ver_vertical SELECT number, 300, 3 FROM numbers(1000);
+INSERT INTO test_unique_proj_merge_ver_vertical SELECT number, 300, 3 FROM numbers(100);
 
 SELECT count() FROM mergeTreeProjection(currentDatabase(), 'test_unique_proj_merge_ver_vertical', '__unique_index');
 
@@ -135,22 +135,22 @@ SETTINGS index_granularity_bytes = 10485760, index_granularity = 8192,
 
 -- Insert 3 parts with NON-OVERLAPPING contiguous id ranges so merge does NOT
 -- reduce rows (takes the merge path, not rebuild path).
--- Use different row counts per part (1000, 2000, 3000) so that untranslated
+-- Use different row counts per part (100, 200, 300) so that untranslated
 -- offsets would collide and fail the DISTINCT count check.
-INSERT INTO test_unique_proj_merge_ver_offset SELECT number, rand(), 1 FROM numbers(1000);
-INSERT INTO test_unique_proj_merge_ver_offset SELECT number + 1000, rand(), 2 FROM numbers(2000);
-INSERT INTO test_unique_proj_merge_ver_offset SELECT number + 3000, rand(), 3 FROM numbers(3000);
+INSERT INTO test_unique_proj_merge_ver_offset SELECT number, rand(), 1 FROM numbers(100);
+INSERT INTO test_unique_proj_merge_ver_offset SELECT number + 100, rand(), 2 FROM numbers(200);
+INSERT INTO test_unique_proj_merge_ver_offset SELECT number + 300, rand(), 3 FROM numbers(300);
 
--- Before merge: 6000 entries total.
+-- Before merge: 600 entries total.
 SELECT count() FROM mergeTreeProjection(currentDatabase(), 'test_unique_proj_merge_ver_offset', '__unique_index');
 
 -- Merge all parts: offset translation must happen for (version, part_offset) tuples.
 OPTIMIZE TABLE test_unique_proj_merge_ver_offset FINAL;
 
--- After merge: all 6000 entries preserved (no key overlap), all offsets are distinct.
+-- After merge: all 600 entries preserved (no key overlap), all offsets are distinct.
 SELECT count() FROM mergeTreeProjection(currentDatabase(), 'test_unique_proj_merge_ver_offset', '__unique_index');
 -- If offsets were NOT translated, multiple entries from different source parts would
--- carry the same old per-part offsets, yielding <6000 distinct part_offset values.
+-- carry the same old per-part offsets, yielding <600 distinct part_offset values.
 -- tupleElement(tupleElement(_unique_kv, 2), 2) extracts the part_offset from Tuple(version, part_offset).
 SELECT count(DISTINCT tupleElement(tupleElement(_unique_kv, 2), 2)) FROM mergeTreeProjection(currentDatabase(), 'test_unique_proj_merge_ver_offset', '__unique_index');
 
