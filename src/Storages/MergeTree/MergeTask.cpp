@@ -1826,8 +1826,6 @@ bool MergeTask::MergeProjectionsStage::prepareProjections() const
         projection_merging_params.mode = MergeTreeData::MergingParams::Ordinary;
         if (projection->type == ProjectionDescription::Type::Aggregate)
             projection_merging_params.mode = MergeTreeData::MergingParams::Aggregating;
-        projection_merging_params.allow_tuple_element_aggregation
-            = (*global_ctx->data_settings)[MergeTreeSetting::allow_tuple_element_aggregation];
 
         ctx->tasks_for_projections.emplace_back(std::make_shared<MergeTask>(
             projection_future_part,
@@ -2898,6 +2896,10 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::createMergedStream() const
             max_dynamic_subcolumns = (*merge_tree_settings)[MergeTreeSetting::merge_max_dynamic_subcolumns_in_wide_part].valueOrNullopt();
         else if (global_ctx->future_part->part_format.part_type == MergeTreeDataPartType::Compact)
             max_dynamic_subcolumns = (*merge_tree_settings)[MergeTreeSetting::merge_max_dynamic_subcolumns_in_compact_part].valueOrNullopt();
+
+        if (global_ctx->projection)
+            global_ctx->merging_params.allow_tuple_element_aggregation
+                = (*merge_tree_settings)[MergeTreeSetting::allow_tuple_element_aggregation];
 
         auto merge_step = std::make_unique<MergePartsStep>(
             merge_parts_query_plan.getCurrentHeader(),
