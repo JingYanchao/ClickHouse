@@ -79,11 +79,19 @@ explicit MergeTreeDedupPartManager(MergeTreeData & storage_);
     ProjectionIndexBitmapPtr loadDeleteBitmapFromRocksDB(const std::string & part_name);
 
     /// Remove the persisted delete bitmap for the given part name from RocksDB.
-    void removeDeleteBitmap(const std::string & part_name);
+    void removeDeleteBitmap(const std::string & part_name) const;
 
     /// Check for parts whose delete bitmaps were not persisted to RocksDB
     /// (e.g. due to unexpected server restart). Re-dedup and persist them.
     void checkAndDedupPartsOnStartup();
+
+    /// Load persisted delete bitmaps from RocksDB for all active parts,
+    /// then check and re-dedup any parts that have no persisted bitmap.
+    /// This is the single entry point called during startup — it replaces
+    /// the per-part `loadDeleteBitmaps` that was previously in
+    /// `loadColumnsChecksumsIndexes`, avoiding the virtual-dispatch issue
+    /// where `supportsUpsert` returns false during parent-class construction.
+    void loadDeleteBitmapsAndCheckOnStartup();
 
     UniqueProcessLock lockUniqueProcess() { return UniqueProcessLock(unique_process_mutex); }
 

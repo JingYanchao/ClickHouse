@@ -147,6 +147,7 @@ namespace MergeTreeSetting
     extern const MergeTreeSettingsBool materialize_statistics_on_merge;
     extern const MergeTreeSettingsBool propagate_types_serialization_versions_to_nested_types;
     extern const MergeTreeSettingsMergeTreeMapSerializationVersion map_serialization_version;
+    extern const MergeTreeSettingsBool allow_tuple_element_aggregation;
 }
 
 namespace ErrorCodes
@@ -1825,6 +1826,8 @@ bool MergeTask::MergeProjectionsStage::prepareProjections() const
         projection_merging_params.mode = MergeTreeData::MergingParams::Ordinary;
         if (projection->type == ProjectionDescription::Type::Aggregate)
             projection_merging_params.mode = MergeTreeData::MergingParams::Aggregating;
+        projection_merging_params.allow_tuple_element_aggregation
+            = (*global_ctx->data_settings)[MergeTreeSetting::allow_tuple_element_aggregation];
 
         ctx->tasks_for_projections.emplace_back(std::make_shared<MergeTask>(
             projection_future_part,

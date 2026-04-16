@@ -490,11 +490,44 @@ ProjectionIndexBitmapPtr MergeTreeDedupPartManager::loadDeleteBitmapFromRocksDB(
     return bitmap ? bitmap : ProjectionIndexBitmap::create(0);
 }
 
-void MergeTreeDedupPartManager::removeDeleteBitmap(const std::string & part_name)
+void MergeTreeDedupPartManager::removeDeleteBitmap(const std::string & part_name) const
 {
     auto status = rocksdb_ptr->Delete(rocksdb::WriteOptions{}, part_name);
     if (!status.ok())
         LOG_WARNING(log, "Failed to remove delete bitmap for part {} from RocksDB: {}", part_name, status.ToString());
+}
+
+void MergeTreeDedupPartManager::loadDeleteBitmapsAndCheckOnStartup()
+{
+    Stopwatch watch;
+
+    /// Load persisted delete bitmaps from RocksDB for all active parts.
+    /// This replaces the per-part loading that was previously called inside
+    /// `loadColumnsChecksumsIndexes`, avoiding the virtual-dispatch issue
+    /// where `supportsUpsert` returns false during parent-class construction.
+    auto all_active_parts = storage.getDataPartsVectorForInternalUsage(
+        {MergeTreeData::DataPartState::Active});
+
+    size_t loaded = 0;
+    for (const auto & part : all_active_parts)
+    {
+        if (part->rows_count == 0)
+            continue;
+
+        auto bitmap = loadDeleteBitmapFromRocksDB(part->name);
+        if (bitmap)
+        {
+            part->replaceDeleteBitmap(std::move(bitmap));
+            ++loaded;
+        }
+    }
+
+    LOG_INFO(log, "Loaded {} delete bitmaps from RocksDB for {} active parts, elapsed={}ms",
+        loaded, all_active_parts.size(), watch.elapsedMilliseconds());
+
+    /// Now check for parts that still have no bitmap (RocksDB had no record)
+    /// and re-dedup them.
+    checkAndDedupPartsOnStartup();
 }
 
 void MergeTreeDedupPartManager::checkAndDedupPartsOnStartup()

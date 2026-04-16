@@ -1206,9 +1206,6 @@ void IMergeTreeDataPart::loadColumnsChecksumsIndexes(bool require_columns_checks
 
         loadDefaultCompressionCodec();
         loadSourcePartsSet();
-
-        if (storage.supportsUpsert())
-            loadDeleteBitmaps();
     }
     catch (...)
     {
@@ -2601,13 +2598,6 @@ IndexSize IMergeTreeDataPart::getIndexSizeFromFile() const
     }
 
     return {};
-}
-
-void IMergeTreeDataPart::loadDeleteBitmaps() const
-{
-    auto bitmap = storage.getDedupManager()->loadDeleteBitmapFromRocksDB(name);
-    if (bitmap)
-        delete_bitmap = std::move(bitmap);
 }
 
 void IMergeTreeDataPart::checkConsistencyBase() const
