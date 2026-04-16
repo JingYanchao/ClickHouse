@@ -180,7 +180,7 @@ bool ReplicatedMergeTreeRestartingThread::runImpl()
     /// On ZK session-expired reconnects the in-memory delete marks are still
     /// valid, so we skip the expensive rebuild.
     if (first_time && storage.supportsUpsert())
-        storage.getDedupManager()->buildAllDeleteBitmapsOnStartup();
+        storage.getDedupManager()->checkAndDedupPartsOnStartup();
 
     /// Start queue processing
     storage.background_operations_assignee.start();

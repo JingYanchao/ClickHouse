@@ -4,7 +4,6 @@
 #include <Storages/MergeTree/MergeTreeIndexReadResultPool.h>
 #include <Storages/MergeTree/ProjectionIndex/ProjectionIndexUnique.h>
 #include <Storages/MergeTree/SSTFileUtil.h>
-#include <Storages/MergeTree/SSTMergingIterator.h>
 #include <Common/CurrentMetrics.h>
 #include <Common/Stopwatch.h>
 #include <Common/logger_useful.h>
@@ -14,10 +13,11 @@
 #include <base/scope_guard.h>
 #include <Interpreters/Context.h>
 #include <boost/range/join.hpp>
-#include <boost/range/iterator_range.hpp>
 #include <boost/icl/interval_set.hpp>
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
+#include <IO/WriteBufferFromString.h>
+#include <IO/ReadBufferFromString.h>
 
 namespace CurrentMetrics
 {
@@ -44,6 +44,7 @@ namespace ServerSetting
 
 namespace ErrorCodes
 {
+    extern const int BAD_ARGUMENTS;
     extern const int INCORRECT_DATA;
     extern const int LOGICAL_ERROR;
 }
@@ -380,10 +381,34 @@ static void applyCrossPartDeleteBitmaps(const PartDeleteBitmapMap & cross_part_m
     }
 }
 
-MergeTreeDedupPartManager::MergeTreeDedupPartManager(const MergeTreeData & storage_)
+MergeTreeDedupPartManager::MergeTreeDedupPartManager(MergeTreeData & storage_)
     : storage(storage_)
     , log(getLogger(fmt::format("{} (MergeTreeDedupPartManager)", storage.getStorageID().getNameForLogs())))
 {
+    /// Initialize RocksDB for persistent delete bitmaps.
+    auto data_paths = storage.getDataPaths();
+    if (data_paths.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "No data paths available for MergeTreeDedupPartManager");
+
+    rocksdb_dir = std::filesystem::path(data_paths[0]) / "dedup_rocksdb";
+    std::filesystem::create_directories(rocksdb_dir);
+
+    rocksdb::Options options;
+    options.create_if_missing = true;
+    options.compression = rocksdb::CompressionType::kZSTD;
+    /// It is too verbose by default, and in fact we don't care about rocksdb logs at all.
+    options.info_log_level = rocksdb::ERROR_LEVEL;
+
+    rocksdb::DB * db = nullptr;
+    rocksdb::Status status = rocksdb::DB::Open(options, rocksdb_dir, &db);
+    if (!status.ok())
+    {
+        LOG_ERROR(log, "Failed to open RocksDB for table {} at {}: {}",
+            storage.getStorageID().getFullTableName(), rocksdb_dir, status.ToString());
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "Failed to open RocksDB path at: {}: {}", rocksdb_dir, status.ToString());
+    }
+    rocksdb_ptr.reset(db);
 }
 
 std::vector<MergeTreeDedupPartManager::PartWithSSTReader> MergeTreeDedupPartManager::openSSTReadersForParts(
@@ -424,6 +449,99 @@ MergeTreeDedupPartManager::prepareSSTReadersForDedup(
     return {std::move(input), std::move(visible_parts)};
 }
 
+void MergeTreeDedupPartManager::storeDeleteMarkBuffers(const std::unordered_map<std::string, DeleteBitmapPtr> & buffers)
+{
+    if (buffers.empty())
+        return;
+
+    WriteBufferFromOwnString out;
+    rocksdb::WriteBatch batch;
+    for (const auto & [part_name, bitmap] : buffers)
+    {
+        out.restart();
+        /// Always write a record for every part — even when the bitmap is
+        /// empty. On restart we check whether a RocksDB record exists to
+        /// verify that the previous commit completed successfully.
+        if (bitmap && !bitmap->empty())
+            bitmap->serializePortable(out);
+        else
+            ProjectionIndexBitmap::create(0)->serializePortable(out);
+        out.finalize();
+        batch.Put(part_name, out.str());
+    }
+
+    auto status = rocksdb_ptr->Write(rocksdb::WriteOptions{}, &batch);
+    if (!status.ok())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "RocksDB write error: {}", status.ToString());
+}
+
+ProjectionIndexBitmapPtr MergeTreeDedupPartManager::loadDeleteBitmapFromRocksDB(const std::string & part_name)
+{
+    std::string value;
+    auto status = rocksdb_ptr->Get(rocksdb::ReadOptions{}, part_name, &value);
+    if (!status.ok())
+        return nullptr;
+
+    ReadBufferFromString in(value);
+    auto bitmap = ProjectionIndexBitmap::deserializePortable(in);
+    /// Always return a non-null bitmap when RocksDB has a record — even
+    /// when the bitmap is empty. This lets callers distinguish "no record
+    /// in RocksDB" (nullptr) from "record exists but bitmap is empty".
+    return bitmap ? bitmap : ProjectionIndexBitmap::create(0);
+}
+
+void MergeTreeDedupPartManager::removeDeleteBitmap(const std::string & part_name)
+{
+    auto status = rocksdb_ptr->Delete(rocksdb::WriteOptions{}, part_name);
+    if (!status.ok())
+        LOG_WARNING(log, "Failed to remove delete bitmap for part {} from RocksDB: {}", part_name, status.ToString());
+}
+
+void MergeTreeDedupPartManager::checkAndDedupPartsOnStartup()
+{
+    Stopwatch watch;
+
+    /// Mark startup as completed early so that `dedupPart` (which asserts
+    /// `startup_completed`) can be called from within this function.
+    startup_completed.store(true, std::memory_order_release);
+
+    /// Get all active parts with non-zero rows.
+    auto all_active_parts = storage.getDataPartsVectorForInternalUsage(
+        {MergeTreeData::DataPartState::Active});
+
+    /// Phase 1: Collect parts whose delete bitmaps were not persisted to
+    /// RocksDB. This can happen when the server restarted unexpectedly
+    /// before the RocksDB write batch was committed.
+    /// Delete bitmaps are already loaded from RocksDB during part loading,
+    /// so a nullptr delete bitmap means RocksDB had no record for this part.
+    ///
+    /// We must collect first and process later because `commitDeleteBitmapBuffers`
+    /// modifies in-memory delete bitmaps — if we checked and committed in the
+    /// same loop, later iterations would see stale bitmap states.
+    DataPartsVector parts_to_dedup;
+    for (const auto & part : all_active_parts)
+    {
+        if (part->rows_count == 0)
+            continue;
+
+        if (!part->getDeleteBitmap())
+        {
+            LOG_TRACE(log, "Part '{}' has no persisted delete bitmap, will re-dedup", part->name);
+            parts_to_dedup.push_back(part);
+        }
+    }
+
+    /// Phase 2: Re-dedup and commit each collected part.
+    for (const auto & part : parts_to_dedup)
+    {
+        dedupPart(part);
+        auto parts_lock = storage.lockParts();
+        commitDeleteBitmapBuffers(parts_lock);
+    }
+
+    LOG_INFO(log, "checkAndDedupPartsOnStartup: {} — re-deduped {} parts, elapsed={}ms",
+        storage.getStorageID().getNameForLogs(), parts_to_dedup.size(), watch.elapsedMilliseconds());
+}
 
 void MergeTreeDedupPartManager::dedupForInsert(
     const DataPartPtr & new_part,
@@ -720,18 +838,11 @@ static std::vector<DeleteBitmapPtr> computeDeleteBitmapDiffs(
         }
 
         auto it = snapshots.find(part->name);
-        if (it == snapshots.end())
+        if (it == snapshots.end() || !it->second)
         {
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
-                "computeDeleteBitmapDiffs: source part '{}' has no delete bitmap snapshot entry, "
-                "snapshots and source parts are misaligned",
-                part->name);
-        }
-
-        if (!it->second)
-        {
-            /// Snapshot exists but is nullptr — the part had no delete marks
-            /// when the merge started, so all current marks are new.
+            /// No snapshot entry or snapshot is nullptr — the part had no
+            /// delete marks when the merge started, so all current marks
+            /// are new diffs produced by concurrent INSERTs.
             diffs.push_back(std::move(current_marks));
         }
         else
@@ -806,7 +917,7 @@ void MergeTreeDedupPartManager::dedupPart(
     if (!new_part)
         return;
 
-    /// Defensive check: `buildAllDeleteBitmapsOnStartup` must complete before
+    /// Defensive check: `checkAndDedupPartsOnStartup` must complete before
     /// any background merge/mutation/fetch calls `dedupPart`. If this fires,
     /// someone has reordered the startup sequence.
     chassert(startup_completed.load(std::memory_order_acquire));
@@ -915,6 +1026,14 @@ void MergeTreeDedupPartManager::dedupPart(
         dedupForFetch(new_part, metadata_snapshot, source_parts, all_visible_parts);
     }
 
+    /// Ensure the new part is always present in `delta_deleted_rows_map`
+    /// so that `commitDeleteBitmapBuffers` will write a RocksDB record
+    /// for it — even when no duplicate keys were found (empty bitmap).
+    /// On restart we rely on the existence of a RocksDB record to verify
+    /// that the previous commit completed successfully.
+    if (delta_deleted_rows_map.find(new_part.get()) == delta_deleted_rows_map.end())
+        delta_deleted_rows_map[new_part.get()] = nullptr;
+
     LOG_DEBUG(log, "dedupPart: part '{}', op={}, visible_parts={}, elapsed={}us",
         new_part->name, op_name, all_visible_parts.size(), dedup_watch.elapsedMicroseconds());
 }
@@ -922,6 +1041,16 @@ void MergeTreeDedupPartManager::dedupPart(
 void MergeTreeDedupPartManager::commitDeleteBitmapBuffers(const DataPartsLock & /*lock*/)
 {
     applyCrossPartDeleteBitmaps(delta_deleted_rows_map);
+
+    /// Persist delete bitmaps to RocksDB for every part in the delta map.
+    /// This includes the new part itself (guaranteed by `dedupPart`) even
+    /// when its bitmap is empty — on restart we check for the existence
+    /// of a RocksDB record to verify commit success.
+    std::unordered_map<std::string, DeleteBitmapPtr> buffers;
+    for (const auto & [part_ptr, bitmap] : delta_deleted_rows_map)
+        buffers.emplace(part_ptr->name, part_ptr->getDeleteBitmap());
+    storeDeleteMarkBuffers(buffers);
+
     delta_deleted_rows_map.clear();
 }
 
@@ -1018,147 +1147,6 @@ DedupMetadataForFetch DedupMetadataForFetch::deserialize(ReadBuffer & in)
     return result;
 }
 
-/// ---- buildAllDeleteBitmapsForPartition ----
-///
-/// Cross-part dedup for a single partition via multi-way merge: walks all
-/// SST iterators in key order. When the same key appears in multiple parts,
-/// the entry with the highest version wins
-void MergeTreeDedupPartManager::buildAllDeleteBitmapsForPartitionOnStartup(
-    const DataPartsVector & partition_parts,
-    const StorageMetadataPtr & metadata_snapshot)
-{
-    auto part_readers = openSSTReadersForParts(partition_parts, metadata_snapshot);
-    if (part_readers.empty())
-        return;
-
-    /// Ensure SST buffer memory is released when done.
-    SCOPE_EXIT({ releaseAllBufferMemory(part_readers); });
-
-    /// Step 1: Build the merging iterator over all parts' SST files.
-    std::vector<std::unique_ptr<rocksdb::Iterator>> sst_iters;
-    std::vector<SSTFileReaderPtr> sst_readers;
-    std::vector<DataPartPtr> parts;
-
-    rocksdb::ReadOptions opts;
-    opts.fill_cache = false;
-
-    for (const auto & [part, reader] : part_readers)
-    {
-        sst_iters.push_back(reader->newIterator(opts));
-        sst_readers.push_back(reader);
-        parts.push_back(part);
-    }
-
-    SSTMergingIterator merge_iter(std::move(sst_iters), std::move(sst_readers));
-    merge_iter.seekToFirst();
-
-    /// Tracks the entry with the highest version for the current key group.
-    struct IteratorEntryInfo
-    {
-        size_t part_index = 0;
-        UniqueValueEntryFull entry{};
-        UInt64 version = 0;
-    };
-
-    std::string last_key;
-    IteratorEntryInfo last_max_entry_info{};
-    bool has_last_key = false;
-
-    /// Step 2: Walk the merged stream — cross-part dedup in a single pass.
-    for (; merge_iter.valid(); merge_iter.next())
-    {
-        auto val = merge_iter.value();
-        auto entry = decodeUniqueValueEntry(val.data(), val.size());
-        size_t idx = merge_iter.currentIndex();
-
-        /// Cross-part dedup: compare entries sharing the same key.
-        auto current_key = merge_iter.key();
-        UInt64 current_version = getRowVersion(parts[idx], entry, val.size());
-
-        if (!has_last_key || current_key != rocksdb::Slice(last_key))
-        {
-            /// New key group — this entry becomes the current max.
-            last_key.assign(current_key.data(), current_key.size());
-            has_last_key = true;
-            last_max_entry_info = {idx, entry, current_version};
-        }
-        else
-        {
-            if (current_version > last_max_entry_info.version
-                || (current_version == last_max_entry_info.version
-                    && parts[idx]->info.max_block >= parts[last_max_entry_info.part_index]->info.max_block))
-            {
-                /// Current entry has higher version — mark the previous max as deleted.
-                parts[last_max_entry_info.part_index]->checkOrCreateDeleteBitmap()
-                    ->add(last_max_entry_info.entry.part_offset);
-                last_max_entry_info = {idx, entry, current_version};
-            }
-            else
-            {
-                /// Current entry loses — mark it as deleted.
-                parts[idx]->checkOrCreateDeleteBitmap()
-                    ->add(entry.part_offset);
-            }
-        }
-    }
-}
-
-void MergeTreeDedupPartManager::buildAllDeleteBitmapsOnStartup()
-{
-    Stopwatch total_watch;
-
-    auto metadata_snapshot = storage.getInMemoryMetadataPtr();
-
-    /// Get all active parts.
-    auto all_active_parts = storage.getDataPartsVectorForInternalUsage(
-        {MergeTreeData::DataPartState::Active});
-
-    if (all_active_parts.empty())
-        return;
-
-    LOG_INFO(log, "buildAllDeleteBitmapsOnStartup: starting build for {} active parts", all_active_parts.size());
-
-    /// Group parts by partition_id, skip empty parts.
-    std::unordered_map<String, DataPartsVector> parts_by_partition;
-    for (const auto & part : all_active_parts)
-    {
-        if (part->rows_count == 0)
-            continue;
-        parts_by_partition[part->info.getPartitionId()].push_back(part);
-    }
-
-    size_t total_parts_deduped = 0;
-    {
-        const size_t num_partitions = parts_by_partition.size();
-        const size_t max_parallel = storage.getContext()->getServerSettings()[ServerSetting::unique_key_dedup_max_parallel_threads];
-        const size_t pool_size = std::min(num_partitions, max_parallel);
-
-        ThreadPool partition_pool(
-            CurrentMetrics::UniqueKeyDedupThreads,
-            CurrentMetrics::UniqueKeyDedupThreadsActive,
-            CurrentMetrics::UniqueKeyDedupThreadsScheduled,
-            pool_size);
-
-        ThreadPoolCallbackRunnerLocal<void> runner(partition_pool, ThreadName::UNIQUE_KEY_DEDUP);
-
-        for (auto & [partition_id, partition_parts] : parts_by_partition)
-        {
-            total_parts_deduped += partition_parts.size();
-            runner.enqueueAndKeepTrack(
-                [this, &partition_parts, &metadata_snapshot, partition_id]
-                {
-                    buildAllDeleteBitmapsForPartitionOnStartup(partition_parts, metadata_snapshot);
-                });
-        }
-
-        runner.waitForAllToFinishAndRethrowFirstError();
-    }
-
-    startup_completed.store(true, std::memory_order_release);
-
-    LOG_INFO(log, "buildAllDeleteBitmapsOnStartup: complete, deduped {} parts across {} partitions, total elapsed={}ms",
-             total_parts_deduped, parts_by_partition.size(), total_watch.elapsedMilliseconds());
-}
 
 UniqueProcessLock::UniqueProcessLock(std::mutex & unique_process_lock_)
     : wait_watch(Stopwatch(CLOCK_MONOTONIC)), lock(unique_process_lock_), lock_watch(Stopwatch(CLOCK_MONOTONIC))

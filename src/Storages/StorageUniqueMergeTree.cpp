@@ -87,11 +87,11 @@ StorageUniqueMergeTree::StorageUniqueMergeTree(
 
 void StorageUniqueMergeTree::startup()
 {
-    /// Rebuild delete bitmaps for all active parts before background tasks start,
-    /// so that merges/mutations observe correct dedup state.
-    dedup_manager->buildAllDeleteBitmapsOnStartup();
+    /// Check and re-dedup parts whose delete bitmaps were not persisted
+    /// to RocksDB (e.g. due to unexpected server restart).
+    dedup_manager->checkAndDedupPartsOnStartup();
 
-    LOG_INFO(log, "Delete bitmaps rebuilt for all active parts, starting background tasks");
+    LOG_INFO(log, "Delete bitmaps checked/rebuilt for all active parts, starting background tasks");
 
     StorageMergeTree::startup();
 }

@@ -856,6 +856,8 @@ private:
     void loadDefaultCompressionCodec();
     void loadSourcePartsSet();
 
+    void loadDeleteBitmaps() const;
+
     ColumnsStatistics loadStatisticsPacked(const PackedFilesReader & reader, const NameSet & required_columns) const;
     ColumnsStatistics loadStatisticsWide(const NameSet & required_columns) const;
     PackedFilesReader * getStatisticsPackedReader() const;

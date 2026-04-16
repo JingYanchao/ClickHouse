@@ -60,7 +60,7 @@ private:
 class MergeTreeDedupPartManager
 {
 public:
-explicit MergeTreeDedupPartManager(const MergeTreeData & storage_);
+explicit MergeTreeDedupPartManager(MergeTreeData & storage_);
     ~MergeTreeDedupPartManager() = default;
 
     void dedupPart(
@@ -70,8 +70,20 @@ explicit MergeTreeDedupPartManager(const MergeTreeData & storage_);
     /// Apply accumulated delta delete bitmaps. Must be called under DataPartsLock.
     void commitDeleteBitmapBuffers(const DataPartsLock & lock);
 
-    /// Build delete bitmaps for all active parts on startup.
-    void buildAllDeleteBitmapsOnStartup();
+    /// Batch-write delete mark bitmaps to RocksDB for persistence.
+    /// Key: part name, Value: serialized delete bitmap.
+    void storeDeleteMarkBuffers(const std::unordered_map<std::string, DeleteBitmapPtr> & buffers);
+
+    /// Load a persisted delete bitmap for the given part name from RocksDB.
+    /// Returns nullptr if no bitmap is stored for this part.
+    ProjectionIndexBitmapPtr loadDeleteBitmapFromRocksDB(const std::string & part_name);
+
+    /// Remove the persisted delete bitmap for the given part name from RocksDB.
+    void removeDeleteBitmap(const std::string & part_name);
+
+    /// Check for parts whose delete bitmaps were not persisted to RocksDB
+    /// (e.g. due to unexpected server restart). Re-dedup and persist them.
+    void checkAndDedupPartsOnStartup();
 
     UniqueProcessLock lockUniqueProcess() { return UniqueProcessLock(unique_process_mutex); }
 
@@ -142,11 +154,6 @@ private:
         const DataPartPtr & new_part,
         const DataPartPtr & source_part);
 
-    /// Build delete bitmaps for all parts in a single partition on startup.
-    void buildAllDeleteBitmapsForPartitionOnStartup(
-        const DataPartsVector & partition_parts,
-        const StorageMetadataPtr & metadata_snapshot);
-
     /// Propagate newly deleted keys from source parts into the merged part.
     void dedupDeletedKeysFromSourceParts(
         const DataPartPtr & new_part,
@@ -154,11 +161,16 @@ private:
         const StorageMetadataPtr & metadata_snapshot,
         const MergeTreeData::DeleteBitmapSnapshotMap & source_delete_bitmap_snapshots = {});
 
-    const MergeTreeData & storage;
+    MergeTreeData & storage;
     std::mutex unique_process_mutex;
     PartDeleteBitmapMap delta_deleted_rows_map; /// protected by unique_process_mutex
 
-    /// Set to true after `buildAllDeleteBitmapsOnStartup` completes.
+    /// rocksdb to persistent delete bitmaps
+    using RocksDBPtr = std::unique_ptr<rocksdb::DB>;
+    RocksDBPtr rocksdb_ptr;
+    String rocksdb_dir;
+
+    /// Set to true after `checkAndDedupPartsOnStartup` completes.
     std::atomic<bool> startup_completed{false};
 
     LoggerPtr log;

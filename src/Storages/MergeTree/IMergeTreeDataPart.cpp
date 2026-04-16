@@ -29,6 +29,7 @@
 #include <Parsers/parseQuery.h>
 #include <Storages/ColumnsDescription.h>
 #include <Storages/MergeTree/MergeTreeData.h>
+#include <Storages/MergeTree/MergeTreeDedupPartManager.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/MergeTree/checkDataPart.h>
 #include <Storages/MergeTree/Backup.h>
@@ -1205,6 +1206,9 @@ void IMergeTreeDataPart::loadColumnsChecksumsIndexes(bool require_columns_checks
 
         loadDefaultCompressionCodec();
         loadSourcePartsSet();
+
+        if (storage.supportsUpsert())
+            loadDeleteBitmaps();
     }
     catch (...)
     {
@@ -2439,6 +2443,9 @@ void IMergeTreeDataPart::remove()
     /// with by parent part.
     if (isProjectionPart() && !is_temp)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Projection part {} should be removed by its parent {}", name, parent_part_name);
+    
+    if (storage.supportsUpsert())
+        storage.getDedupManager()->removeDeleteBitmap(name);
 
     std::list<IDataPartStorage::ProjectionChecksums> projection_checksums;
 
@@ -2594,6 +2601,13 @@ IndexSize IMergeTreeDataPart::getIndexSizeFromFile() const
     }
 
     return {};
+}
+
+void IMergeTreeDataPart::loadDeleteBitmaps() const
+{
+    auto bitmap = storage.getDedupManager()->loadDeleteBitmapFromRocksDB(name);
+    if (bitmap)
+        delete_bitmap = std::move(bitmap);
 }
 
 void IMergeTreeDataPart::checkConsistencyBase() const
