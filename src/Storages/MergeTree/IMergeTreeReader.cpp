@@ -614,6 +614,10 @@ std::unique_ptr<SSTFileReadStream> IMergeTreeReader::createSSTReadStream(
     static constexpr size_t marks_count = 1;
     auto stream_settings = settings;
     stream_settings.is_compressed = false;
+    /// Disable O_DIRECT and mmap for SST files: RocksDB issues unaligned reads
+    /// that violate O_DIRECT constraints, causing EINVAL from pread.
+    stream_settings.read_settings.direct_io_threshold = 0;
+    stream_settings.read_settings.mmap_threshold = 0;
     return std::make_unique<SSTFileReadStream>(
         data_part_info_for_read->getDataPartStorage(),
         stream_name,
