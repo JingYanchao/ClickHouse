@@ -30,7 +30,6 @@ namespace ProfileEvents
 {
     extern const Event UniqueProcessLockWaitMicroseconds;
     extern const Event UniqueProcessLockHoldMicroseconds;
-    extern const Event UniqueKeyDedupBoundaryKeyScanMicroseconds;
     extern const Event UniqueKeyDedupParallelProcessMicroseconds;
 }
 
@@ -77,9 +76,9 @@ static void deduplicateKeyByBucket(
     const PartWithSSTReader & input,
     const std::vector<PartWithSSTReader> & visible_parts,
     const std::string & start_key,
-    size_t num_keys,
+    const std::string & end_key,
     PartDeleteBitmapMap & delta_bitmaps,
-    size_t shard_id)
+    size_t bucket_id)
 {
     /// Cached entry from the input SST iterator, used for batching.
     struct InputKeyEntry
@@ -88,10 +87,7 @@ static void deduplicateKeyByBucket(
         UniqueValueEntryFull entry;
     };
 
-    if (num_keys == 0)
-        return;
-
-    Stopwatch shard_watch;
+    Stopwatch bucket_watch;
 
     rocksdb::ReadOptions opts;
     opts.fill_cache = false;
@@ -114,12 +110,19 @@ static void deduplicateKeyByBucket(
     std::vector<bool> matched;
     matched.reserve(MULTI_GET_BATCH_SIZE);
 
+    auto reached_end = [&]() -> bool
+    {
+        if (end_key.empty())
+            return false;
+        return input_iter->key().compare(rocksdb::Slice(end_key)) >= 0;
+    };
+
     size_t processed = 0;
-    while (processed < num_keys)
+    while (input_iter->Valid() && !reached_end())
     {
         /// Phase 1: Collect a batch of keys from the input iterator.
         batch.clear();
-        for (; input_iter->Valid() && processed < num_keys && batch.size() < MULTI_GET_BATCH_SIZE;
+        for (; input_iter->Valid() && !reached_end() && batch.size() < MULTI_GET_BATCH_SIZE;
              input_iter->Next(), ++processed)
         {
             if (unlikely(!input_iter->status().ok()))
@@ -227,42 +230,13 @@ static void deduplicateKeyByBucket(
 
     LOG_TEST(
         getLogger("deduplicateKeyByBucket"),
-        "shard={}, num_keys={}, processed={}, elapsed={}us",
-        shard_id, num_keys, processed, shard_watch.elapsedMicroseconds());
-}
-
-/// Sample boundary keys from a single SST reader by scanning every `stride`-th key.
-/// Returns up to `max_shards` boundary keys that partition the key space into roughly
-/// equal-sized shards. Shared by INSERT and Merge/Mutation parallel dedup paths.
-static std::vector<std::string> sampleBoundaryKeysFromSST(
-    const SSTFileReaderPtr & reader,
-    size_t total_keys,
-    size_t max_shards)
-{
-    const size_t num_shards = std::min(max_shards, total_keys);
-    const size_t stride = total_keys / num_shards;
-
-    std::vector<std::string> boundary_keys;
-    boundary_keys.reserve(num_shards);
-
-    Stopwatch boundary_scan_watch;
-    rocksdb::ReadOptions opts;
-    opts.fill_cache = false;
-    auto scan_iter = reader->newIterator(opts);
-    size_t idx = 0;
-    for (scan_iter->SeekToFirst(); scan_iter->Valid(); scan_iter->Next(), ++idx)
-    {
-        if (idx % stride == 0 && boundary_keys.size() < num_shards)
-            boundary_keys.push_back(scan_iter->key().ToString());
-    }
-    ProfileEvents::increment(ProfileEvents::UniqueKeyDedupBoundaryKeyScanMicroseconds, boundary_scan_watch.elapsedMicroseconds());
-
-    return boundary_keys;
+        "bucket={}, processed={}, elapsed={}us",
+        bucket_id, processed, bucket_watch.elapsedMicroseconds());
 }
 
 /// Deduplicate keys from the input part against visible parts using parallel threads.
-/// Splits the input SST key space into shards, processes each in a separate thread,
-/// then merges per-shard delta bitmaps into a result map.
+/// Splits the input SST key space into buckets, processes each in a separate thread,
+/// then merges per-bucket delta bitmaps into a result map.
 /// Returns a map from part pointer to the computed delete mark bitmap.
 static PartDeleteBitmapMap dedupKeysThroughNewCommitParts(
     const PartWithSSTReader & input,
@@ -281,54 +255,52 @@ static PartDeleteBitmapMap dedupKeysThroughNewCommitParts(
         MergeTreeDedupPartManager::releaseAllBufferMemory(visible_parts);
     });
 
-    /// Get total key count from SST properties — O(1), no scanning needed.
-    auto props = input.reader->getProperties();
-    const size_t total_keys = props ? props->num_entries : 0;
-    if (total_keys == 0)
+    /// Sample keys are pre-collected during SST write via SampleKeyCollector
+    /// and stored in SST file properties. No scanning needed.
+    auto all_sample_keys = input.reader->getSampleKeys();
+
+    if (all_sample_keys.empty())
         return result;
 
-    auto boundary_keys = sampleBoundaryKeysFromSST(input.reader, total_keys, max_parallel);
+    /// Downsample from all collected sample keys (up to 256) to the actual
+    /// parallelism level. For example, if we have 256 sample keys but only
+    /// 16 threads, pick every 16th sample key to get 16 evenly-spaced bucket
+    /// boundaries.
+    const size_t actual_buckets = std::min(all_sample_keys.size(), max_parallel);
+    std::vector<std::string> bucket_start_keys;
+    bucket_start_keys.reserve(actual_buckets);
+    for (size_t i = 0; i < actual_buckets; ++i)
+        bucket_start_keys.push_back(std::move(all_sample_keys[i * all_sample_keys.size() / actual_buckets]));
 
-    const size_t actual_shards = boundary_keys.size();
-    if (actual_shards == 0)
-        return result;
-
-    /// Recompute stride from actual_shards (which may differ from the
-    /// requested max_shards when the SST has fewer keys than expected).
-    const size_t stride = total_keys / actual_shards;
-
-    /// Allocate per-shard delta bitmaps.
-    std::vector<PartDeleteBitmapMap> delta_bitmaps(actual_shards);
+    /// Allocate per-bucket delta bitmaps.
+    std::vector<PartDeleteBitmapMap> delta_bitmaps(actual_buckets);
     Stopwatch parallel_process_watch;
     {
-        /// Unified parallel path: even for a single shard the thread pool
-        /// overhead is negligible, and deduplicateByUniqueKey handles num_keys == 0
-        /// with an early return so empty shards are essentially free.
+        /// Unified parallel path: even for a single bucket the thread pool
+        /// overhead is negligible, and deduplicateKeyByBucket with an empty
+        /// key range returns immediately so empty buckets are essentially free.
         ThreadPool dedup_pool(
             CurrentMetrics::UniqueKeyDedupThreads,
             CurrentMetrics::UniqueKeyDedupThreadsActive,
             CurrentMetrics::UniqueKeyDedupThreadsScheduled,
-            actual_shards);
+            actual_buckets);
 
         ThreadPoolCallbackRunnerLocal<void> runner(dedup_pool, ThreadName::UNIQUE_KEY_DEDUP);
 
-        for (size_t shard = 0; shard < actual_shards; ++shard)
+        for (size_t bucket = 0; bucket < actual_buckets; ++bucket)
         {
-            /// Last shard processes all remaining keys until the end of the SST.
-            /// Using SIZE_MAX lets the iterator naturally exhaust, which is safe
-            /// because `deduplicateKeyByBucket` stops when the iterator is invalid.
-            size_t shard_keys = (shard == actual_shards - 1) ? SIZE_MAX : stride;
+            std::string next_sample_key = (bucket + 1 < actual_buckets) ? bucket_start_keys[bucket + 1] : std::string{};
 
             runner.enqueueAndKeepTrack(
                 [&input,
                  &visible_parts,
-                 start_key = boundary_keys[shard],
-                 shard_keys,
-                 &delta_bitmap = delta_bitmaps[shard],
-                 shard]
+                 start_key = bucket_start_keys[bucket],
+                 end_key = std::move(next_sample_key),
+                 &delta_bitmap = delta_bitmaps[bucket],
+                 bucket]
                 {
                     deduplicateKeyByBucket(
-                        input, visible_parts, start_key, shard_keys, delta_bitmap, shard);
+                        input, visible_parts, start_key, end_key, delta_bitmap, bucket);
                 });
         }
 
@@ -336,7 +308,7 @@ static PartDeleteBitmapMap dedupKeysThroughNewCommitParts(
     }
     ProfileEvents::increment(ProfileEvents::UniqueKeyDedupParallelProcessMicroseconds, parallel_process_watch.elapsedMicroseconds());
 
-    /// Merge all per-shard delta bitmaps into the final output.
+    /// Merge all per-bucket delta bitmaps into the final output.
     /// Include the input part as well — it may have rows marked as deleted
     /// when a visible part wins the version comparison.
     auto input_range = boost::make_iterator_range(&input, &input + 1);

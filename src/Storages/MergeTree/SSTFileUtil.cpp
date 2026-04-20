@@ -8,6 +8,7 @@
 #include <rocksdb/sst_file_reader.h>
 #include <rocksdb/sst_file_writer.h>
 #include <Common/logger_useful.h>
+#include <fmt/format.h>
 
 namespace DB
 {
@@ -182,6 +183,115 @@ public:
 
 private:
     ReadBufferWrapperPtr read_buffer;
+};
+
+/// Sample key property keys stored in SST user_collected_properties.
+inline constexpr auto SAMPLE_KEY_COUNT_PROPERTY = "clickhouse.sample_key_count";
+inline constexpr auto SAMPLE_KEY_PROPERTY_PREFIX = "clickhouse.sample_key.";
+
+/// SampleKeyCollector: samples keys from unique keys during SST write.
+/// Uses stride-aware progressive thinning for approximately uniform spacing:
+///   1. Initially collect every key (stride = 1).
+///   2. When the buffer exceeds 2*max_shards, thin by keeping only
+///      even-indexed entries (drops half) and double the stride.
+///   3. After thinning, collect only every stride-th key, so new entries
+///      have the same density in key space as the surviving old entries.
+///   4. Repeat thinning as needed.
+/// The result is at most max_shards keys, uniformly spaced across the
+/// entire SST file.  Memory usage is O(max_shards) at all times.
+class SampleKeyCollector : public rocksdb::TablePropertiesCollector
+{
+public:
+    explicit SampleKeyCollector(size_t max_shards_)
+        : max_shards(max_shards_)
+    {
+    }
+
+    rocksdb::Status AddUserKey(
+        const rocksdb::Slice & key,
+        const rocksdb::Slice & /*value*/,
+        rocksdb::EntryType /*type*/,
+        rocksdb::SequenceNumber /*seq*/,
+        uint64_t /*file_size*/) override
+    {
+        ++keys_since_last_;
+        if (keys_since_last_ < stride_)
+            return rocksdb::Status::OK();
+
+        keys_since_last_ = 0;
+        sample_keys_.emplace_back(key.ToString());
+
+        /// Thin when buffer exceeds 2*max_shards: keep even-indexed entries.
+        if (sample_keys_.size() > max_shards * 2)
+        {
+            size_t write = 0;
+            for (size_t read = 0; read < sample_keys_.size(); read += 2)
+                sample_keys_[write++] = std::move(sample_keys_[read]);
+            sample_keys_.resize(write);
+            stride_ *= 2;
+        }
+        return rocksdb::Status::OK();
+    }
+
+    rocksdb::Status Finish(rocksdb::UserCollectedProperties * properties) override
+    {
+        /// Final uniform downsampling: if we collected more than max_shards keys,
+        /// select exactly max_shards evenly-spaced entries. This guarantees that
+        /// the output sample keys divide the SST key space into equal-sized shards
+        /// regardless of how many thinning rounds occurred.
+        if (sample_keys_.size() > max_shards)
+        {
+            std::vector<std::string> final_keys;
+            final_keys.reserve(max_shards);
+            for (size_t i = 0; i < max_shards; ++i)
+                final_keys.push_back(std::move(sample_keys_[i * sample_keys_.size() / max_shards]));
+            sample_keys_ = std::move(final_keys);
+        }
+
+        (*properties)[SAMPLE_KEY_COUNT_PROPERTY] = std::to_string(sample_keys_.size());
+        for (size_t i = 0; i < sample_keys_.size(); ++i)
+        {
+            auto prop_key = fmt::format("{}{}", SAMPLE_KEY_PROPERTY_PREFIX, i);
+            (*properties)[prop_key] = std::move(sample_keys_[i]);
+        }
+        return rocksdb::Status::OK();
+    }
+
+    rocksdb::UserCollectedProperties GetReadableProperties() const override
+    {
+        return {};
+    }
+
+    const char * Name() const override { return "SampleKeyCollector"; }
+
+    bool NeedCompact() const override { return false; }
+
+private:
+    size_t max_shards;
+    size_t stride_ = 1;
+    size_t keys_since_last_ = 0;
+    std::vector<std::string> sample_keys_;
+};
+
+/// Factory for SampleKeyCollector: creates one collector per SST file.
+class SampleKeyCollectorFactory : public rocksdb::TablePropertiesCollectorFactory
+{
+public:
+    explicit SampleKeyCollectorFactory(size_t max_shards_)
+        : max_shards(max_shards_)
+    {
+    }
+
+    rocksdb::TablePropertiesCollector * CreateTablePropertiesCollector(
+        rocksdb::TablePropertiesCollectorFactory::Context /*context*/) override
+    {
+        return new SampleKeyCollector(max_shards);
+    }
+
+    const char * Name() const override { return "SampleKeyCollectorFactory"; }
+
+private:
+    size_t max_shards;
 };
 
 class WriteBufferWritableFile : public rocksdb::FSWritableFile
@@ -805,6 +915,45 @@ SSTFileReader::IndexPropertiesPtr SSTFileReader::getProperties() const
     return index_reader->GetTableProperties();
 }
 
+std::vector<std::string> SSTFileReader::getSampleKeys() const
+{
+    auto props = getProperties();
+    if (!props)
+        return {};
+
+    /// Read sample key count from user_collected_properties.
+    auto it = props->user_collected_properties.find(SAMPLE_KEY_COUNT_PROPERTY);
+    if (it == props->user_collected_properties.end())
+        return {};
+
+    size_t count = 0;
+    try
+    {
+        count = std::stoul(it->second);
+    }
+    catch (...)
+    {
+        return {};
+    }
+
+    if (count == 0)
+        return {};
+
+    /// Retrieve each sample key by indexed property key.
+    std::vector<std::string> sample_keys;
+    sample_keys.reserve(count);
+    for (size_t i = 0; i < count; ++i)
+    {
+        auto prop_key = fmt::format("{}{}", SAMPLE_KEY_PROPERTY_PREFIX, i);
+        auto key_it = props->user_collected_properties.find(prop_key);
+        if (key_it == props->user_collected_properties.end())
+            break;
+        sample_keys.push_back(key_it->second);
+    }
+
+    return sample_keys;
+}
+
 SSTFileWriter::SSTFileWriter(WriteBuffer * write_buffer)
 {
     sst_env = createWriteBufferFileSystemEnv(write_buffer);
@@ -814,6 +963,13 @@ SSTFileWriter::SSTFileWriter(WriteBuffer * write_buffer)
     rocksdb::BlockBasedTableOptions table_options;
     table_options.filter_policy.reset(rocksdb::NewBloomFilterPolicy(12));
     options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+
+    /// Register SampleKeyCollectorFactory to sample keys during SST write
+    /// and embed them into SST file properties. Up to 256 sample keys are
+    /// collected to partition the key space for parallel dedup without
+    /// scanning the SST file.
+    options.table_properties_collector_factories.emplace_back(
+        std::make_shared<SampleKeyCollectorFactory>(256));
 
     writer = std::make_unique<rocksdb::SstFileWriter>(rocksdb::EnvOptions(), options);
     auto status = writer->Open("");

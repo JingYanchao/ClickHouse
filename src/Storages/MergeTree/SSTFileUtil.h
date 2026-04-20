@@ -96,6 +96,12 @@ public:
     /// After calling this, the index reader can still be used normally
     /// (bloom filter and index blocks remain pinned in the TableReader).
     void releaseBufferMemory() const;
+
+    /// Retrieve pre-sampled keys from SST table properties.
+    /// Sample keys are collected during SST write time via
+    /// SampleKeyCollector and stored as user-collected properties.
+    std::vector<std::string> getSampleKeys() const;
+
 private:
     /// Common initialization logic shared by both constructors.
     void init(const String & file_name);
