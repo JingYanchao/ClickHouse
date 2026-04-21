@@ -150,3 +150,38 @@ SELECT id, value1 FROM test_lazy_dedup ORDER BY id LIMIT 10 OFFSET 45;
 SELECT count() FROM test_lazy_dedup;
 
 DROP TABLE test_lazy_dedup;
+
+-- ===================================================================
+-- Scenario 3: Restart dedup with version column
+-- ===================================================================
+select '--- restart dedup: version ---';
+
+DROP TABLE IF EXISTS unique_version_restart;
+
+CREATE TABLE unique_version_restart
+(
+    id UInt32,
+    value UInt32,
+    version UInt64,
+    PROJECTION __unique_index INDEX id TYPE unique('version')
+)
+ENGINE = UniqueMergeTree()
+ORDER BY id;
+
+INSERT INTO unique_version_restart SELECT number, 500, 5 FROM numbers(10);
+INSERT INTO unique_version_restart SELECT number, 100, 1 FROM numbers(10);
+
+-- Before restart
+SELECT id, value FROM unique_version_restart ORDER BY id;
+
+DETACH TABLE unique_version_restart;
+ATTACH TABLE unique_version_restart;
+
+-- After restart: version 5 should still win
+SELECT id, value FROM unique_version_restart ORDER BY id;
+
+-- Insert with higher version after restart
+INSERT INTO unique_version_restart SELECT number, 999, 10 FROM numbers(3);
+SELECT id, value FROM unique_version_restart ORDER BY id;
+
+DROP TABLE unique_version_restart;

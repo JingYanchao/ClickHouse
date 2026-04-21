@@ -17,9 +17,9 @@
 -- ===================================================================
 SELECT '--- whole-part TTL drop ---';
 
-DROP TABLE IF EXISTS umt_ttl;
+DROP TABLE IF EXISTS unique_ttl;
 
-CREATE TABLE umt_ttl
+CREATE TABLE unique_ttl
 (
     id UInt32,
     value UInt32,
@@ -31,23 +31,23 @@ ORDER BY id
 TTL event_time + INTERVAL 1 DAY;
 
 -- Prevent background TTL merge from dropping expired parts before we observe them.
-SYSTEM STOP TTL MERGES umt_ttl;
+SYSTEM STOP TTL MERGES unique_ttl;
 
 -- Fully-expired part.
-INSERT INTO umt_ttl SELECT number, number, now() - INTERVAL 10 DAY FROM numbers(10);
+INSERT INTO unique_ttl SELECT number, number, now() - INTERVAL 10 DAY FROM numbers(10);
 -- Fully-fresh part.
-INSERT INTO umt_ttl SELECT number + 100, number + 100, now() + INTERVAL 10 DAY FROM numbers(5);
+INSERT INTO unique_ttl SELECT number + 100, number + 100, now() + INTERVAL 10 DAY FROM numbers(5);
 
-SELECT 'rows before TTL:', count() FROM umt_ttl;
+SELECT 'rows before TTL:', count() FROM unique_ttl;
 
-SYSTEM START TTL MERGES umt_ttl;
-ALTER TABLE umt_ttl MATERIALIZE TTL SETTINGS mutations_sync = 2;
+SYSTEM START TTL MERGES unique_ttl;
+ALTER TABLE unique_ttl MATERIALIZE TTL SETTINGS mutations_sync = 2;
 
 -- Expired part dropped wholesale; fresh part kept as-is.
-SELECT 'rows after TTL:', count() FROM umt_ttl;
-SELECT id, value FROM umt_ttl ORDER BY id;
+SELECT 'rows after TTL:', count() FROM unique_ttl;
+SELECT id, value FROM unique_ttl ORDER BY id;
 
-DROP TABLE umt_ttl;
+DROP TABLE unique_ttl;
 
 -- ===================================================================
 -- Key test: a part that mixes expired and fresh rows.
@@ -58,9 +58,9 @@ DROP TABLE umt_ttl;
 -- ===================================================================
 SELECT '--- mixed part: expired rows preserved ---';
 
-DROP TABLE IF EXISTS umt_ttl_mixed;
+DROP TABLE IF EXISTS unique_ttl_mixed;
 
-CREATE TABLE umt_ttl_mixed
+CREATE TABLE unique_ttl_mixed
 (
     id UInt32,
     value UInt32,
@@ -71,34 +71,34 @@ ENGINE = UniqueMergeTree()
 ORDER BY id
 TTL event_time + INTERVAL 1 DAY;
 
-SYSTEM STOP TTL MERGES umt_ttl_mixed;
+SYSTEM STOP TTL MERGES unique_ttl_mixed;
 
 -- Single part with a mix of expired (even ids) and fresh (odd ids) rows.
-INSERT INTO umt_ttl_mixed SELECT
+INSERT INTO unique_ttl_mixed SELECT
     number,
     number,
     if(number % 2 = 0, now() - INTERVAL 10 DAY, now() + INTERVAL 10 DAY)
 FROM numbers(10);
 
-SELECT 'rows before TTL:', count() FROM umt_ttl_mixed;
+SELECT 'rows before TTL:', count() FROM unique_ttl_mixed;
 
-SYSTEM START TTL MERGES umt_ttl_mixed;
-ALTER TABLE umt_ttl_mixed MATERIALIZE TTL SETTINGS mutations_sync = 2;
+SYSTEM START TTL MERGES unique_ttl_mixed;
+ALTER TABLE unique_ttl_mixed MATERIALIZE TTL SETTINGS mutations_sync = 2;
 
 -- All 10 rows are preserved because the part is not fully expired.
-SELECT 'rows after TTL:', count() FROM umt_ttl_mixed;
-SELECT id, value FROM umt_ttl_mixed ORDER BY id;
+SELECT 'rows after TTL:', count() FROM unique_ttl_mixed;
+SELECT id, value FROM unique_ttl_mixed ORDER BY id;
 
-DROP TABLE umt_ttl_mixed;
+DROP TABLE unique_ttl_mixed;
 
 -- ===================================================================
 -- Insert still works after TTL, and dedup still works afterwards
 -- ===================================================================
 SELECT '--- insert after TTL ---';
 
-DROP TABLE IF EXISTS umt_ttl_insert;
+DROP TABLE IF EXISTS unique_ttl_insert;
 
-CREATE TABLE umt_ttl_insert
+CREATE TABLE unique_ttl_insert
 (
     id UInt32,
     value UInt32,
@@ -109,28 +109,28 @@ ENGINE = UniqueMergeTree()
 ORDER BY id
 TTL event_time + INTERVAL 1 DAY;
 
-SYSTEM STOP TTL MERGES umt_ttl_insert;
+SYSTEM STOP TTL MERGES unique_ttl_insert;
 
-INSERT INTO umt_ttl_insert SELECT number, number, now() - INTERVAL 10 DAY FROM numbers(10);
+INSERT INTO unique_ttl_insert SELECT number, number, now() - INTERVAL 10 DAY FROM numbers(10);
 
-SYSTEM START TTL MERGES umt_ttl_insert;
-ALTER TABLE umt_ttl_insert MATERIALIZE TTL SETTINGS mutations_sync = 2;
+SYSTEM START TTL MERGES unique_ttl_insert;
+ALTER TABLE unique_ttl_insert MATERIALIZE TTL SETTINGS mutations_sync = 2;
 
-SELECT 'after TTL drop:', count() FROM umt_ttl_insert;
+SELECT 'after TTL drop:', count() FROM unique_ttl_insert;
 
 -- Fresh inserts after TTL.
-INSERT INTO umt_ttl_insert VALUES (1, 10, now() + INTERVAL 10 DAY);
-INSERT INTO umt_ttl_insert VALUES (2, 20, now() + INTERVAL 10 DAY);
-SELECT 'after fresh insert:', count() FROM umt_ttl_insert;
-SELECT id, value FROM umt_ttl_insert ORDER BY id;
+INSERT INTO unique_ttl_insert VALUES (1, 10, now() + INTERVAL 10 DAY);
+INSERT INTO unique_ttl_insert VALUES (2, 20, now() + INTERVAL 10 DAY);
+SELECT 'after fresh insert:', count() FROM unique_ttl_insert;
+SELECT id, value FROM unique_ttl_insert ORDER BY id;
 
 -- Upsert the same id: dedup must still work.
-INSERT INTO umt_ttl_insert VALUES (1, 999, now() + INTERVAL 10 DAY);
-OPTIMIZE TABLE umt_ttl_insert FINAL SETTINGS mutations_sync = 1;
-SELECT 'after upsert:', count() FROM umt_ttl_insert;
-SELECT id, value FROM umt_ttl_insert ORDER BY id;
+INSERT INTO unique_ttl_insert VALUES (1, 999, now() + INTERVAL 10 DAY);
+OPTIMIZE TABLE unique_ttl_insert FINAL SETTINGS mutations_sync = 1;
+SELECT 'after upsert:', count() FROM unique_ttl_insert;
+SELECT id, value FROM unique_ttl_insert ORDER BY id;
 
-DROP TABLE umt_ttl_insert;
+DROP TABLE unique_ttl_insert;
 
 -- ===================================================================
 -- Partitioned TTL: expired partitions dropped, non-expired kept;
@@ -138,9 +138,9 @@ DROP TABLE umt_ttl_insert;
 -- ===================================================================
 SELECT '--- partitioned TTL ---';
 
-DROP TABLE IF EXISTS umt_ttl_part;
+DROP TABLE IF EXISTS unique_ttl_part;
 
-CREATE TABLE umt_ttl_part
+CREATE TABLE unique_ttl_part
 (
     id UInt32,
     value UInt32,
@@ -152,26 +152,26 @@ PARTITION BY toYYYYMM(event_time)
 ORDER BY id
 TTL event_time + INTERVAL 1 DAY;
 
-SYSTEM STOP TTL MERGES umt_ttl_part;
+SYSTEM STOP TTL MERGES unique_ttl_part;
 
 -- Old partition entirely expired.
-INSERT INTO umt_ttl_part SELECT number, number, toDateTime('2000-01-15 00:00:00') FROM numbers(5);
+INSERT INTO unique_ttl_part SELECT number, number, toDateTime('2000-01-15 00:00:00') FROM numbers(5);
 -- Fresh partition far in the future.
-INSERT INTO umt_ttl_part SELECT number + 100, number + 100, now() + INTERVAL 10 DAY FROM numbers(5);
+INSERT INTO unique_ttl_part SELECT number + 100, number + 100, now() + INTERVAL 10 DAY FROM numbers(5);
 
-SELECT 'before TTL:', count() FROM umt_ttl_part;
+SELECT 'before TTL:', count() FROM unique_ttl_part;
 
-SYSTEM START TTL MERGES umt_ttl_part;
-ALTER TABLE umt_ttl_part MATERIALIZE TTL SETTINGS mutations_sync = 2;
+SYSTEM START TTL MERGES unique_ttl_part;
+ALTER TABLE unique_ttl_part MATERIALIZE TTL SETTINGS mutations_sync = 2;
 
-SELECT 'after TTL:', count() FROM umt_ttl_part;
-SELECT id, value FROM umt_ttl_part ORDER BY id;
+SELECT 'after TTL:', count() FROM unique_ttl_part;
+SELECT id, value FROM unique_ttl_part ORDER BY id;
 
 -- Upsert one of the surviving ids to verify dedup still holds.
-INSERT INTO umt_ttl_part VALUES (100, 9999, now() + INTERVAL 10 DAY);
-OPTIMIZE TABLE umt_ttl_part FINAL SETTINGS mutations_sync = 1;
+INSERT INTO unique_ttl_part VALUES (100, 9999, now() + INTERVAL 10 DAY);
+OPTIMIZE TABLE unique_ttl_part FINAL SETTINGS mutations_sync = 1;
 
-SELECT 'after upsert:', count() FROM umt_ttl_part;
-SELECT id, value FROM umt_ttl_part ORDER BY id;
+SELECT 'after upsert:', count() FROM unique_ttl_part;
+SELECT id, value FROM unique_ttl_part ORDER BY id;
 
-DROP TABLE umt_ttl_part;
+DROP TABLE unique_ttl_part;

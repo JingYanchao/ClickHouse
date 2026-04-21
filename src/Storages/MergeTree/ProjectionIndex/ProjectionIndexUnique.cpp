@@ -9,6 +9,8 @@
 #include <DataTypes/DataTypeFactory.h>
 #include <DataTypes/IDataType.h>
 #include <Interpreters/ExpressionActions.h>
+#include <Interpreters/ExpressionAnalyzer.h>
+#include <Interpreters/TreeRewriter.h>
 #include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
@@ -224,18 +226,39 @@ void ProjectionIndexUnique::fillProjectionDescription(
 {
     chassert(result.index.get() == this);
 
-    /// Compile the key expression list into a full `KeyDescription`.
-    /// Translate `UNKNOWN_IDENTIFIER` to `NO_SUCH_COLUMN_IN_TABLE` so that
-    /// `AlterCommands::apply` correctly rejects DROP/RENAME of referenced columns.
-    try
+    /// Compile the raw key expression list (stored during construction) into a
+    /// fully resolved KeyDescription, similar to how skip-index does it in
+    /// `IndexDescription::initExpressionInfo`: analyze with TreeRewriter, then
+    /// build ExpressionActions via ExpressionAnalyzer.
     {
-        unique_key_desc = KeyDescription::getKeyFromAST(unique_key_desc.expression_list_ast, columns, query_context);
-    }
-    catch (const Exception & e)
-    {
-        if (e.code() == ErrorCodes::UNKNOWN_IDENTIFIER)
-            throw Exception(ErrorCodes::NO_SUCH_COLUMN_IN_TABLE, "{}", e.message());
-        throw;
+        auto expr_list = unique_key_desc.expression_list_ast->clone();
+        auto all_columns = columns.get(GetColumnsOptions(GetColumnsOptions::Kind::AllPhysical).withSubcolumns());
+
+        /// Translate `UNKNOWN_IDENTIFIER` to `NO_SUCH_COLUMN_IN_TABLE` so that
+        /// `AlterCommands::apply` correctly rejects DROP/RENAME of referenced columns.
+        TreeRewriterResultPtr syntax;
+        try
+        {
+            syntax = TreeRewriter(query_context).analyze(expr_list, all_columns);
+        }
+        catch (const Exception & e)
+        {
+            if (e.code() == ErrorCodes::UNKNOWN_IDENTIFIER)
+                throw Exception(ErrorCodes::NO_SUCH_COLUMN_IN_TABLE, "{}", e.message());
+            throw;
+        }
+
+        unique_key_desc.expression = ExpressionAnalyzer(expr_list, syntax, query_context).getActions(false);
+        auto sample = ExpressionAnalyzer(expr_list, syntax, query_context).getActions(true)->getSampleBlock();
+
+        unique_key_desc.column_names.clear();
+        unique_key_desc.data_types.clear();
+        unique_key_desc.sample_block = sample;
+        for (size_t i = 0; i < sample.columns(); ++i)
+        {
+            unique_key_desc.column_names.push_back(sample.getByPosition(i).name);
+            unique_key_desc.data_types.push_back(sample.getByPosition(i).type);
+        }
     }
 
     Names unique_key_source_columns = unique_key_desc.expression->getRequiredColumns();
