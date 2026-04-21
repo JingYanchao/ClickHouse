@@ -213,6 +213,13 @@ public:
     std::string_view serializeValueIntoArena(size_t n, Arena & arena, char const *& begin, const IColumn::SerializationSettings * settings) const override;
     ALWAYS_INLINE char * serializeValueIntoMemory(size_t n, char * memory, const IColumn::SerializationSettings * settings) const override;
 
+    ALWAYS_INLINE char * serializeValueIntoMemoryAsComparableRowFormat(size_t n, char * memory) const override;
+    size_t computeComparableRowFormatSize() const override;
+    bool supportsSerializeValueIntoMemoryAsComparable() const override
+    {
+        return true;
+    }
+
     void batchSerializeValueIntoMemory(VectorWithMemoryTracking<char *> & memories, const IColumn::SerializationSettings * settings) const override;
 
     void deserializeAndInsertFromArena(ReadBuffer & in, const IColumn::SerializationSettings * settings) override;

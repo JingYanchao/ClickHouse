@@ -42,7 +42,6 @@
 #include <Processors/Merges/Algorithms/GraphiteRollupSortedAlgorithm.h>
 #include <Processors/Sources/SourceFromSingleChunk.h>
 #include <Processors/Transforms/DeduplicationTokenTransforms.h>
-#include <Storages/MergeTree/ProjectionIndex/ProjectionIndexUnique.h>
 
 #include <fmt/ranges.h>
 
@@ -493,59 +492,6 @@ BlocksWithPartition MergeTreeDataWriter::splitBlockIntoParts(
     return result;
 }
 
-/// For UniqueMergeTree: deduplicate the insert block by unique key columns
-/// using ReplacingSortedAlgorithm (via mergeBlock with Replacing mode).
-/// After dedup, the block is re-sorted by the original ORDER BY key.
-static void deduplicateBlockByUniqueKey(
-    Block & block,
-    const StorageMetadataPtr & metadata_snapshot,
-    const SortDescription & order_by_sort_desc,
-    const String & unique_projection_name,
-    IColumn::Permutation *& perm_ptr,
-    IColumn::Permutation & perm)
-{
-    const auto & projections = metadata_snapshot->getProjections();
-    if (!projections.has(unique_projection_name))
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "Unique projection '{}' not found in metadata for UniqueMergeTree", unique_projection_name);
-
-    const auto & proj = projections.get(unique_projection_name);
-    const auto * unique_idx = dynamic_cast<const ProjectionIndexUnique *>(proj.index.get());
-    if (!unique_idx)
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "Found projection '{}' is not of TYPE unique in UniqueMergeTree", unique_projection_name);
-
-    /// Build sort description from unique key columns.
-    SortDescription unique_sort_desc;
-    for (const auto & col : unique_idx->getUniqueKeyColumns())
-        unique_sort_desc.emplace_back(col, 1, 1);
-
-    /// Sort by unique key for ReplacingSortedAlgorithm.
-    IColumn::Permutation unique_perm;
-    IColumn::Permutation * unique_perm_ptr = nullptr;
-    if (!isAlreadySorted(block, unique_sort_desc))
-    {
-        stableGetPermutation(block, unique_sort_desc, unique_perm);
-        unique_perm_ptr = &unique_perm;
-    }
-
-    /// Use Replacing mode to deduplicate by unique key.
-    MergeTreeData::MergingParams replacing_params;
-    replacing_params.mode = MergeTreeData::MergingParams::Replacing;
-    replacing_params.version_column = unique_idx->getVersionColumnName();
-
-    block = MergeTreeDataWriter::mergeBlock(
-        std::move(block), metadata_snapshot, unique_sort_desc, unique_perm_ptr, replacing_params);
-
-    /// Re-sort by original ORDER BY key for disk layout.
-    perm_ptr = nullptr;
-    if (!order_by_sort_desc.empty() && !isAlreadySorted(block, order_by_sort_desc))
-    {
-        stableGetPermutation(block, order_by_sort_desc, perm);
-        perm_ptr = &perm;
-    }
-}
-
 Block MergeTreeDataWriter::mergeBlock(
     Block && block,
     const StorageMetadataPtr & metadata_snapshot,
@@ -800,11 +746,6 @@ MergeTreeTemporaryPartPtr MergeTreeDataWriter::writeTempPartImpl(
         ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::MergeTreeDataWriterMergingBlocksMicroseconds);
         block = mergeBlock(std::move(block), metadata_snapshot, sort_description, perm_ptr, data.merging_params);
     }
-
-    /// For UniqueMergeTree: deduplicate by unique key columns so that
-    /// the written part contains no duplicate rows for the same unique key.
-    if (data.supportsUpsert())
-        deduplicateBlockByUniqueKey(block, metadata_snapshot, sort_description, data.getUniqueProjectionName(), perm_ptr, perm);
 
     ColumnsStatistics statistics;
     if (context->getSettingsRef()[Setting::materialize_statistics_on_insert])

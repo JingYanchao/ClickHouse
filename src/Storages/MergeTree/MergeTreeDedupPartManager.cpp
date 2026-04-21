@@ -78,6 +78,7 @@ static void deduplicateKeyByBucket(
     const std::string & start_key,
     const std::string & end_key,
     PartDeleteBitmapMap & delta_bitmaps,
+    ProjectionIndexBitmapPtr & bucket_input_exists_rows,
     size_t bucket_id)
 {
     /// Cached entry from the input SST iterator, used for batching.
@@ -88,6 +89,10 @@ static void deduplicateKeyByBucket(
     };
 
     Stopwatch bucket_watch;
+
+    /// Track which row offsets exist in the input SST within this bucket's key range.
+    /// The caller will merge all buckets' bitmaps and flip to get intra-block losers.
+    bucket_input_exists_rows = ProjectionIndexBitmap::create(input.part->rows_count);
 
     rocksdb::ReadOptions opts;
     opts.fill_cache = false;
@@ -138,6 +143,7 @@ static void deduplicateKeyByBucket(
             if (input_delete_bitmap && input_delete_bitmap->contains(input_entry.part_offset))
                 continue;
 
+            bucket_input_exists_rows->add(input_entry.part_offset);
             batch.push_back({input_iter->key().ToString(), input_entry});
         }
 
@@ -272,8 +278,9 @@ static PartDeleteBitmapMap dedupKeysThroughNewCommitParts(
     for (size_t i = 0; i < actual_buckets; ++i)
         bucket_start_keys.push_back(std::move(all_sample_keys[i * all_sample_keys.size() / actual_buckets]));
 
-    /// Allocate per-bucket delta bitmaps.
+    /// Allocate per-bucket delta bitmaps and per-bucket input exists rows.
     std::vector<PartDeleteBitmapMap> delta_bitmaps(actual_buckets);
+    std::vector<ProjectionIndexBitmapPtr> bucket_exists_rows(actual_buckets);
     Stopwatch parallel_process_watch;
     {
         /// Unified parallel path: even for a single bucket the thread pool
@@ -297,16 +304,28 @@ static PartDeleteBitmapMap dedupKeysThroughNewCommitParts(
                  start_key = bucket_start_keys[bucket],
                  end_key = std::move(next_sample_key),
                  &delta_bitmap = delta_bitmaps[bucket],
+                 &exists_rows = bucket_exists_rows[bucket],
                  bucket]
                 {
                     deduplicateKeyByBucket(
-                        input, visible_parts, start_key, end_key, delta_bitmap, bucket);
+                        input, visible_parts, start_key, end_key, delta_bitmap, exists_rows, bucket);
                 });
         }
 
         runner.waitForAllToFinishAndRethrowFirstError();
     }
     ProfileEvents::increment(ProfileEvents::UniqueKeyDedupParallelProcessMicroseconds, parallel_process_watch.elapsedMicroseconds());
+
+    /// Merge per-bucket input_part_exists_rows into a single bitmap, then flip
+    /// to get intra-block loser offsets (rows whose offset never appeared in SST
+    /// across all buckets = block-level duplicates that lost during dedup).
+    auto all_input_exists_rows = ProjectionIndexBitmap::create(input.part->rows_count);
+    for (const auto & bw : bucket_exists_rows)
+    {
+        if (bw && !bw->empty())
+            all_input_exists_rows->unionWith(*bw);
+    }
+
 
     /// Merge all per-bucket delta bitmaps into the final output.
     /// Include the input part as well — it may have rows marked as deleted
@@ -321,6 +340,13 @@ static PartDeleteBitmapMap dedupKeysThroughNewCommitParts(
             if (it != shard_delta.end() && it->second && !it->second->empty())
                 bitmap->unionWith(*it->second);
         }
+
+        if (part.get() == input.part.get())
+        {
+            all_input_exists_rows->flipRange(0, input.part->rows_count);
+            bitmap->unionWith(*all_input_exists_rows);
+        }
+
         if (!bitmap->empty())
             result.emplace(part.get(), std::move(bitmap));
     }

@@ -344,6 +344,49 @@ void ColumnVector<T>::compareColumn(
 }
 
 template <typename T>
+char * ColumnVector<T>::serializeValueIntoMemoryAsComparableRowFormat(size_t n, char * memory) const
+{
+    if constexpr (std::is_integral_v<T>)
+    {
+        auto value = getData()[n];
+        if constexpr (std::endian::native == std::endian::little)
+            value = std::byteswap(value);
+        if constexpr (std::is_signed_v<T>)
+        {
+            /// Toggle top "sign" bit to ensure consistent sort order
+            /// Reference: https://github.com/apache/arrow-rs/blob/57.0.0/arrow-row/src/fixed.rs#L76-L77
+            char * bytes = reinterpret_cast<char *>(&value);
+            bytes[0] ^= 0x80;
+        }
+        memcpy(memory, &value, sizeof(T));
+        return memory + sizeof(T);
+    }
+    else if constexpr (is_big_int_v<T>)
+    {
+        auto value = getData()[n];
+        constexpr unsigned item_count = sizeof(T) / sizeof(uint64_t);
+        for (unsigned i = 0; i < item_count; ++i)
+        {
+            uint64_t item = value.items[T::_impl::big(i)];
+            if constexpr (std::endian::native == std::endian::little)
+                item = std::byteswap(item);
+            memcpy(memory + i * sizeof(uint64_t), &item, sizeof(uint64_t));
+        }
+        if constexpr (is_signed_v<T>)
+            memory[0] ^= 0x80;
+        return memory + sizeof(T);
+    }
+    else
+        return IColumn::serializeValueIntoMemoryAsComparableRowFormat(n, memory);
+}
+
+template <typename T>
+size_t ColumnVector<T>::computeComparableRowFormatSize() const
+{
+    return byteSize();
+}
+
+template <typename T>
 void ColumnVector<T>::getPermutation(IColumn::PermutationSortDirection direction, IColumn::PermutationSortStability stability,
                                     size_t limit, int nan_direction_hint, IColumn::Permutation & res) const
 {

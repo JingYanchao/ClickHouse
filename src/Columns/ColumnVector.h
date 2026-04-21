@@ -353,6 +353,13 @@ public:
         return data[n];
     }
 
+    char * serializeValueIntoMemoryAsComparableRowFormat(size_t n, char * memory) const override;
+    size_t computeComparableRowFormatSize() const override;
+    bool supportsSerializeValueIntoMemoryAsComparable() const override
+    {
+        return true;
+    }
+
 protected:
     Container data;
 };

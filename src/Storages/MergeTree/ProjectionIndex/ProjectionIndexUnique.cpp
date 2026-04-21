@@ -35,38 +35,71 @@ namespace ErrorCodes
 }
 
 /// Serialize all key columns for all rows directly into a ColumnString.
-/// Uses column-major batch serialization for better CPU cache locality.
+/// For columns that support comparable serialization, use serializeValueIntoMemoryAsComparableRowFormat;
+/// for the rest, use serializeValueIntoMemory.
+/// Returns {serialized_column, all_comparable} where all_comparable indicates whether
+/// all columns used the comparable serialization format.
 static ColumnString::MutablePtr serializeAllKeysIntoColumn(
     const std::vector<const IColumn *> & key_col_ptrs,
-    size_t num_rows)
+    size_t num_rows,
+    bool & all_comparable)
 {
+    /// Determine which columns support comparable serialization.
+    all_comparable = true;
+    std::vector<bool> col_comparable(key_col_ptrs.size());
+    for (size_t c = 0; c < key_col_ptrs.size(); ++c)
+    {
+        col_comparable[c] = key_col_ptrs[c]->supportsSerializeValueIntoMemoryAsComparable();
+        if (!col_comparable[c])
+            all_comparable = false;
+    }
+
+    /// Compute the total estimated serialized size.
+    /// For comparable columns, use computeComparableRowFormatSize which returns the exact
+    /// total size for the comparable serialization format (e.g. ColumnString uses group
+    /// encoding which is larger than the normal format).
+    /// For non-comparable columns, use collectSerializedValueSizes (normal format).
     PaddedPODArray<UInt64> key_sizes(num_rows, 0);
-    for (const auto * col : key_col_ptrs)
-        col->collectSerializedValueSizes(key_sizes, nullptr, nullptr);
+    UInt64 comparable_total = 0;
+    for (size_t c = 0; c < key_col_ptrs.size(); ++c)
+    {
+        if (col_comparable[c])
+            comparable_total += key_col_ptrs[c]->computeComparableRowFormatSize();
+        else
+            key_col_ptrs[c]->collectSerializedValueSizes(key_sizes, nullptr, nullptr);
+    }
 
     auto key_column = ColumnString::create();
     auto & chars = key_column->getChars();
     auto & offsets = key_column->getOffsets();
 
-    UInt64 total_chars = 0;
+    UInt64 total_estimated = comparable_total + std::reduce(key_sizes.begin(), key_sizes.end(), UInt64(0));
+    chars.resize(total_estimated);
+
     offsets.resize(num_rows);
+
+    /// Serialize row by row. Track actual write position.
+    UInt64 actual_total = 0;
     for (size_t i = 0; i < num_rows; ++i)
     {
-        total_chars += key_sizes[i];
-        offsets[i] = total_chars;
+        char * pos = reinterpret_cast<char *>(chars.data() + actual_total);
+
+        for (size_t c = 0; c < key_col_ptrs.size(); ++c)
+        {
+            if (col_comparable[c])
+                pos = key_col_ptrs[c]->serializeValueIntoMemoryAsComparableRowFormat(i, pos);
+            else
+                pos = key_col_ptrs[c]->serializeValueIntoMemory(i, pos, nullptr);
+        }
+
+        actual_total = pos - reinterpret_cast<char *>(chars.data());
+        offsets[i] = actual_total;
+
+        chassert(actual_total <= total_estimated);
     }
-    chars.resize(total_chars);
 
-    VectorWithMemoryTracking<char *> memories(num_rows);
-    memories[0] = reinterpret_cast<char *>(chars.data());
-    for (size_t i = 1; i < num_rows; ++i)
-        memories[i] = reinterpret_cast<char *>(chars.data() + offsets[i - 1]);
-
-    for (const auto * col : key_col_ptrs)
-        col->batchSerializeValueIntoMemory(memories, nullptr);
-
-    for (size_t i = 0; i < num_rows; ++i)
-        chassert(memories[i] == reinterpret_cast<char *>(chars.data() + offsets[i]));
+    /// Shrink chars to actual size.
+    chars.resize(actual_total);
 
     return key_column;
 }
@@ -286,6 +319,8 @@ Block ProjectionIndexUnique::calculate(
     if (num_rows == 0)
         return projection_desc.sample_block.cloneEmpty();
 
+    Stopwatch total_watch;
+
     const bool with_version = !version_column_name.empty();
 
     /// 1. Serialize unique key columns into a ColumnString.
@@ -294,8 +329,8 @@ Block ProjectionIndexUnique::calculate(
     for (const auto & col_name : unique_key_columns)
         key_col_ptrs.push_back(block.getByName(col_name).column.get());
 
-    auto all_keys = serializeAllKeysIntoColumn(key_col_ptrs, num_rows);
-
+    bool all_keys_comparable = false;
+    auto serialized_keys = serializeAllKeysIntoColumn(key_col_ptrs, num_rows, all_keys_comparable);
     /// 2. Build per-row metadata: version and part_offset.
     ///    We store these in parallel arrays indexed by original row index.
     const ColumnUInt64 * version_col = nullptr;
@@ -305,65 +340,43 @@ Block ProjectionIndexUnique::calculate(
         version_col = assert_cast<const ColumnUInt64 *>(ver_col_with_type.column.get());
     }
 
-    /// When perm_ptr is present (INSERT path), compute the inverse permutation:
-    /// perm_ptr maps sorted_pos -> original_pos, but we need original_pos -> sorted_pos
-    /// because part_offset must reflect the row's position in the sorted part on disk.
-    /// When perm_ptr is absent, part_offset is a simple linear function of row index,
-    /// so we avoid allocating the array entirely.
-    std::vector<UInt64> part_offsets;
-    auto get_part_offset = [&](size_t row_idx) -> UInt64
-    {
-        if (perm_ptr)
-            return part_offsets[row_idx];
-        return starting_offset + row_idx;
-    };
+    /// When perm_ptr is present (INSERT path), rows are sorted before being written
+    /// to disk, so a row's part_offset = starting_offset + its position in the sorted
+    /// order.  perm_ptr maps sorted_pos -> original_row_idx; we invert it here to build
+    /// map_part_offsets: original_row_idx -> part_offset.  When perm_ptr is absent,
+    /// part_offset is simply starting_offset + row_idx, so we skip the allocation.
+    std::vector<UInt64> map_part_offsets;
     if (perm_ptr)
     {
-        part_offsets.resize(num_rows);
+        map_part_offsets.resize(num_rows);
         for (size_t k = 0; k < num_rows; ++k)
-            part_offsets[(*perm_ptr)[k]] = starting_offset + k;
+            map_part_offsets[(*perm_ptr)[k]] = starting_offset + k;
     }
 
-    /// 3. Sort by key (lexicographic), then by (version, part_offset) descending
-    ///    so that the first occurrence of each key is the winner.
+    UInt64 pre_sort_us = total_watch.elapsedMicroseconds();
+    LOG_INFO(getLogger("ProjectionIndexUnique"), "calculate pre-sort (serialize+metadata): {}us, rows={}", pre_sort_us, num_rows);
+
+
+    /// 3a. Sort indices by key only (lexicographic) to group identical keys together.
+    ///     We intentionally do NOT add version/offset as secondary sort keys —
+    ///     the winner among duplicate keys is determined in the linear scan below,
+    ///     which saves significant comparison cost in pdqsort.
+    ///     If the unique key is a prefix of the parent sorting key, the block is
+    ///     already sorted by the unique key, so we skip the sort entirely.
     std::vector<size_t> indices(num_rows);
     std::iota(indices.begin(), indices.end(), 0);
 
-    std::vector<std::string_view> key_refs(num_rows);
-    for (size_t i = 0; i < num_rows; ++i)
-        key_refs[i] = all_keys->getDataAt(i);
+    UInt64 sort_us = 0;
 
-    const auto * ver_data = version_col ? version_col->getData().data() : nullptr;
-
-    /// Split sort comparator by version mode to eliminate per-comparison branch.
-    if (with_version)
-    {
-        ::pdqsort(indices.begin(), indices.end(), [&](size_t a, size_t b)
-        {
-            int cmp = key_refs[a].compare(key_refs[b]);
-            if (cmp != 0)
-                return cmp < 0;
-            /// Same key: larger (version, part_offset) comes first.
-            if (ver_data[a] != ver_data[b])
-                return ver_data[a] > ver_data[b];
-            return get_part_offset(a) > get_part_offset(b);
-        });
-    }
-    else
-    {
-        ::pdqsort(indices.begin(), indices.end(), [&](size_t a, size_t b)
-        {
-            int cmp = key_refs[a].compare(key_refs[b]);
-            if (cmp != 0)
-                return cmp < 0;
-            /// Same key: larger part_offset comes first.
-            return get_part_offset(a) > get_part_offset(b);
-        });
-    }
+    Stopwatch sort_watch;
+    ::pdqsort(
+        indices.begin(), indices.end(), [&](size_t a, size_t b) { return serialized_keys->getDataAt(a) < serialized_keys->getDataAt(b); });
+    sort_us = sort_watch.elapsedMicroseconds();
+    LOG_INFO(getLogger("ProjectionIndexUnique"), "calculate sort: {}us, rows={}", sort_us, num_rows);
 
     /// 4. Build the output block with a single SortedStringKV column.
-    ///    Deduplicate inline: keep only the first index for each unique key
-    ///    and write directly into the output columns, avoiding an intermediate vector.
+    ///    Deduplicate by linear scan: for each group of identical keys,
+    ///    pick the row with the largest version (or largest part_offset as tiebreaker).
     auto key_column = ColumnString::create();
     key_column->reserve(num_rows); /// upper bound; exact count unknown before dedup
 
@@ -372,23 +385,54 @@ Block ProjectionIndexUnique::calculate(
     const auto & sample_tuple = assert_cast<const ColumnTuple &>(*sample.getByPosition(0).column);
     auto value_column_mut = sample_tuple.getColumn(1).cloneEmpty();
 
+    const auto * ver_data = version_col ? version_col->getData().data() : nullptr;
+
+    auto get_part_offset = [&](size_t row_idx) -> UInt64
+    {
+        if (perm_ptr)
+            return map_part_offsets[row_idx];
+        return starting_offset + row_idx;
+    };
     /// Runtime-to-compile-time dispatch: deduplicate and write entries in a single pass.
+    /// For each group of rows sharing the same key, track the best candidate
+    /// (highest version, then highest part_offset) and emit it when the group ends.
     auto dedup_and_write = [&]<ValueType V>()
     {
         using Entry = typename ValueTraits<V>::Entry;
-        for (size_t i = 0; i < indices.size(); ++i)
+        size_t last_max_key_idx = indices[0];
+        for (size_t i = 1; i <= indices.size(); ++i)
         {
-            if (i > 0 && key_refs[indices[i]] == key_refs[indices[i - 1]])
-                continue;
+            /// Emit the best row when we reach a new key group or the end of the array.
+            if (i == indices.size() || serialized_keys->getDataAt(indices[i]) != serialized_keys->getDataAt(last_max_key_idx))
+            {
+                key_column->insertFrom(*serialized_keys, last_max_key_idx);
 
-            const size_t idx = indices[i];
-            key_column->insertFrom(*all_keys, idx);
+                Entry entry;
+                if constexpr (ValueTraits<V>::has_version)
+                    entry.version = ver_data[last_max_key_idx];
+                entry.part_offset = get_part_offset(last_max_key_idx);
+                ValueTraits<V>::writeEntry(*value_column_mut, entry);
 
-            Entry entry;
-            if constexpr (ValueTraits<V>::has_version)
-                entry.version = ver_data[idx];
-            entry.part_offset = get_part_offset(idx);
-            ValueTraits<V>::writeEntry(*value_column_mut, entry);
+                if (i < indices.size())
+                    last_max_key_idx = indices[i];
+            }
+            else
+            {
+                /// Same key group: check if current row beats the current best.
+                const size_t cur_idx = indices[i];
+                if constexpr (ValueTraits<V>::has_version)
+                {
+                    if (ver_data[cur_idx] > ver_data[last_max_key_idx]
+                        || (ver_data[cur_idx] == ver_data[last_max_key_idx]
+                            && get_part_offset(cur_idx) > get_part_offset(last_max_key_idx)))
+                        last_max_key_idx = cur_idx;
+                }
+                else
+                {
+                    if (get_part_offset(cur_idx) > get_part_offset(last_max_key_idx))
+                        last_max_key_idx = cur_idx;
+                }
+            }
         }
     };
 

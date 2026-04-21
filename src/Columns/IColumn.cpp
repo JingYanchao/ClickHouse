@@ -191,6 +191,16 @@ void IColumn::batchSerializeValueIntoMemory(VectorWithMemoryTracking<char *> & /
     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method batchSerializeValueIntoMemory is not supported for {}", getName());
 }
 
+char * IColumn::serializeValueIntoMemoryAsComparableRowFormat(size_t /* n */, char * /* memory */) const
+{
+    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method serializeValueIntoMemoryAsComparableRowFormat is not supported for {}", getName());
+}
+
+size_t IColumn::computeComparableRowFormatSize() const
+{
+    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method computeComparableRowFormatSize is not supported for {}", getName());
+}
+
 std::string_view IColumn::serializeValueIntoArenaWithNull(
     size_t /* n */,
     Arena & /* arena */,
