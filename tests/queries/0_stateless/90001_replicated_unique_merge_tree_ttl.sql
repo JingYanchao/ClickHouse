@@ -37,7 +37,11 @@ ENGINE = ReplicatedUniqueMergeTree('/clickhouse/tables/{database}/test_90001/r_t
 ORDER BY id
 TTL event_time + INTERVAL 1 DAY;
 
--- Expired part and fresh part on r1; replicate to r2.
+-- Prevent background TTL merge from dropping expired parts before we observe them.
+SYSTEM STOP TTL MERGES r1_ttl;
+SYSTEM STOP TTL MERGES r2_ttl;
+
+-- Fully-expired part and fully-fresh part on r1; replicate to r2.
 INSERT INTO r1_ttl SELECT number, number, now() - INTERVAL 10 DAY FROM numbers(10);
 INSERT INTO r1_ttl SELECT number + 100, number + 100, now() + INTERVAL 10 DAY FROM numbers(5);
 SYSTEM SYNC REPLICA r2_ttl;
@@ -45,9 +49,12 @@ SYSTEM SYNC REPLICA r2_ttl;
 SELECT 'r1 before TTL:', count() FROM r1_ttl;
 SELECT 'r2 before TTL:', count() FROM r2_ttl;
 
+SYSTEM START TTL MERGES r1_ttl;
+SYSTEM START TTL MERGES r2_ttl;
 ALTER TABLE r1_ttl MATERIALIZE TTL SETTINGS mutations_sync = 2;
 SYSTEM SYNC REPLICA r2_ttl;
 
+-- Expired part dropped wholesale; fresh part kept as-is.
 SELECT 'r1 after TTL:', count() FROM r1_ttl;
 SELECT 'r2 after TTL:', count() FROM r2_ttl;
 SELECT 'r1 rows:';
@@ -90,6 +97,10 @@ ENGINE = ReplicatedUniqueMergeTree('/clickhouse/tables/{database}/test_90001/r_t
 ORDER BY id
 TTL event_time + INTERVAL 1 DAY;
 
+-- Prevent background TTL merge from dropping parts before we observe them.
+SYSTEM STOP TTL MERGES r1_ttl_mixed;
+SYSTEM STOP TTL MERGES r2_ttl_mixed;
+
 -- Single part with a mix of expired and fresh rows.
 INSERT INTO r1_ttl_mixed SELECT
     number,
@@ -101,10 +112,12 @@ SYSTEM SYNC REPLICA r2_ttl_mixed;
 SELECT 'r1 before TTL:', count() FROM r1_ttl_mixed;
 SELECT 'r2 before TTL:', count() FROM r2_ttl_mixed;
 
+SYSTEM START TTL MERGES r1_ttl_mixed;
+SYSTEM START TTL MERGES r2_ttl_mixed;
 ALTER TABLE r1_ttl_mixed MATERIALIZE TTL SETTINGS mutations_sync = 2;
 SYSTEM SYNC REPLICA r2_ttl_mixed;
 
--- All rows remain on both replicas.
+-- All rows remain on both replicas because the part is not fully expired.
 SELECT 'r1 after TTL:', count() FROM r1_ttl_mixed;
 SELECT 'r2 after TTL:', count() FROM r2_ttl_mixed;
 SELECT id, value FROM r1_ttl_mixed ORDER BY id;
@@ -143,9 +156,15 @@ ENGINE = ReplicatedUniqueMergeTree('/clickhouse/tables/{database}/test_90001/r_t
 ORDER BY id
 TTL event_time + INTERVAL 1 DAY;
 
+-- Prevent background TTL merge from dropping expired parts before we observe them.
+SYSTEM STOP TTL MERGES r1_ttl_insert;
+SYSTEM STOP TTL MERGES r2_ttl_insert;
+
 INSERT INTO r1_ttl_insert SELECT number, number, now() - INTERVAL 10 DAY FROM numbers(10);
 SYSTEM SYNC REPLICA r2_ttl_insert;
 
+SYSTEM START TTL MERGES r1_ttl_insert;
+SYSTEM START TTL MERGES r2_ttl_insert;
 ALTER TABLE r1_ttl_insert MATERIALIZE TTL SETTINGS mutations_sync = 2;
 SYSTEM SYNC REPLICA r2_ttl_insert;
 
@@ -206,13 +225,21 @@ PARTITION BY toYYYYMM(event_time)
 ORDER BY id
 TTL event_time + INTERVAL 1 DAY;
 
+-- Prevent background TTL merge from dropping expired parts before we observe them.
+SYSTEM STOP TTL MERGES r1_ttl_part;
+SYSTEM STOP TTL MERGES r2_ttl_part;
+
+-- Old partition entirely expired.
 INSERT INTO r1_ttl_part SELECT number, number, toDateTime('2000-01-15 00:00:00') FROM numbers(5);
+-- Fresh partition far in the future.
 INSERT INTO r1_ttl_part SELECT number + 100, number + 100, now() + INTERVAL 10 DAY FROM numbers(5);
 SYSTEM SYNC REPLICA r2_ttl_part;
 
 SELECT 'r1 before TTL:', count() FROM r1_ttl_part;
 SELECT 'r2 before TTL:', count() FROM r2_ttl_part;
 
+SYSTEM START TTL MERGES r1_ttl_part;
+SYSTEM START TTL MERGES r2_ttl_part;
 ALTER TABLE r1_ttl_part MATERIALIZE TTL SETTINGS mutations_sync = 2;
 SYSTEM SYNC REPLICA r2_ttl_part;
 

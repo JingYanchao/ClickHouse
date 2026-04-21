@@ -8,6 +8,7 @@
 #include <Core/NamesAndTypes.h>
 #include <DataTypes/DataTypeFactory.h>
 #include <DataTypes/IDataType.h>
+#include <Interpreters/ExpressionActions.h>
 #include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
@@ -33,33 +34,20 @@ namespace ErrorCodes
     extern const int INCORRECT_QUERY;
     extern const int BAD_ARGUMENTS;
     extern const int LOGICAL_ERROR;
+    extern const int NO_SUCH_COLUMN_IN_TABLE;
+    extern const int UNKNOWN_IDENTIFIER;
 }
 
-/// Serialize all key columns for all rows directly into a ColumnString.
-/// For columns that support comparable serialization, use serializeValueIntoMemoryAsComparableRowFormat;
-/// for the rest, use serializeValueIntoMemory.
-/// Returns {serialized_column, all_comparable} where all_comparable indicates whether
-/// all columns used the comparable serialization format.
+/// Serialize all key columns for all rows into a single ColumnString.
+/// Uses comparable serialization when available, normal serialization otherwise.
 static ColumnString::MutablePtr serializeAllKeysIntoColumn(
     const std::vector<const IColumn *> & key_col_ptrs,
-    size_t num_rows,
-    bool & all_comparable)
+    size_t num_rows)
 {
-    /// Determine which columns support comparable serialization.
-    all_comparable = true;
     std::vector<bool> col_comparable(key_col_ptrs.size());
     for (size_t c = 0; c < key_col_ptrs.size(); ++c)
-    {
         col_comparable[c] = key_col_ptrs[c]->supportsSerializeValueIntoMemoryAsComparable();
-        if (!col_comparable[c])
-            all_comparable = false;
-    }
 
-    /// Compute the total estimated serialized size.
-    /// For comparable columns, use computeComparableRowFormatSize which returns the exact
-    /// total size for the comparable serialization format (e.g. ColumnString uses group
-    /// encoding which is larger than the normal format).
-    /// For non-comparable columns, use collectSerializedValueSizes (normal format).
     PaddedPODArray<UInt64> key_sizes(num_rows, 0);
     UInt64 comparable_total = 0;
     for (size_t c = 0; c < key_col_ptrs.size(); ++c)
@@ -79,7 +67,6 @@ static ColumnString::MutablePtr serializeAllKeysIntoColumn(
 
     offsets.resize(num_rows);
 
-    /// Serialize row by row. Track actual write position.
     UInt64 actual_total = 0;
     for (size_t i = 0; i < num_rows; ++i)
     {
@@ -99,7 +86,6 @@ static ColumnString::MutablePtr serializeAllKeysIntoColumn(
         chassert(actual_total <= total_estimated);
     }
 
-    /// Shrink chars to actual size.
     chars.resize(actual_total);
 
     return key_column;
@@ -167,40 +153,53 @@ UniqueValueEntryFull decodeUniqueValueEntry(const char * data, size_t size)
     return entry;
 }
 
-ProjectionIndexUnique::ProjectionIndexUnique(Names unique_key_columns_, String version_column_name_)
-    : unique_key_columns(std::move(unique_key_columns_))
-    , version_column_name(std::move(version_column_name_))
+ProjectionIndexUnique::ProjectionIndexUnique(ASTPtr key_expression_list_, String version_column_name_)
+    : version_column_name(std::move(version_column_name_))
 {
-    if (unique_key_columns.empty())
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unique projection index requires at least one key column");
+    if (!key_expression_list_)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unique projection index requires at least one key expression");
+
+    const auto * expr_list = key_expression_list_->as<ASTExpressionList>();
+    if (!expr_list || expr_list->children.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unique projection index requires at least one key expression");
+
+    /// Park the raw AST inside `unique_key_desc`. `fillProjectionDescription`
+    /// will later overwrite the whole struct with the compiled key (expression,
+    /// sample_block, column_names, ...) once it has access to the parent columns
+    /// and query context.
+    unique_key_desc.expression_list_ast = std::move(key_expression_list_);
+}
+
+Names ProjectionIndexUnique::getUniqueKeyColumns() const
+{
+    if (unique_key_desc.expression)
+        return unique_key_desc.expression->getRequiredColumns();
+    return {};
 }
 
 ProjectionIndexPtr ProjectionIndexUnique::create(const ASTProjectionDeclaration & proj)
 {
-    /// Extract unique key column names from the INDEX expression.
+    /// Keep the raw key expression list. We intentionally do NOT restrict keys to
+    /// simple identifiers here — arbitrary deterministic expressions are allowed
+    /// (e.g. `x + y`, `lower(name)`). The final validation (column existence,
+    /// result types, Nullable rejection, etc.) is performed later in
+    /// `fillProjectionDescription` where we have access to the columns of the
+    /// parent table.
     if (!proj.index)
         throw Exception(ErrorCodes::INCORRECT_QUERY, "Unique projection index requires INDEX expression with key columns");
 
-    /// Collect leaf identifiers from the INDEX expression.
-    ASTs leaves;
-    if (const auto * expr_list = proj.index->as<ASTExpressionList>())
-        leaves = expr_list->children;
-    else if (const auto * func = proj.index->as<ASTFunction>(); func && func->name == "tuple" && func->arguments)
-        leaves = func->arguments->children;
-    else
-        leaves.push_back(proj.index);
-
-    Names key_columns;
-    key_columns.reserve(leaves.size());
-    for (const auto & leaf : leaves)
+    ASTPtr key_expression_list;
+    if (proj.index->as<ASTExpressionList>())
     {
-        if (const auto * id = leaf->as<ASTIdentifier>())
-            key_columns.push_back(id->name());
-        else
-            throw Exception(
-                ErrorCodes::INCORRECT_QUERY,
-                "Unique projection index key columns must be simple identifiers, got: {}",
-                leaf->formatForErrorMessage());
+        key_expression_list = proj.index->clone();
+    }
+    else
+    {
+        /// Defensive branch: the parser for `PROJECTION ... INDEX ...` always produces
+        /// an ASTExpressionList, but wrap a single expression just in case.
+        auto wrapper = make_intrusive<ASTExpressionList>();
+        wrapper->children.push_back(proj.index->clone());
+        key_expression_list = wrapper;
     }
 
     /// Extract optional version column from TYPE unique('ver') arguments.
@@ -214,7 +213,7 @@ ProjectionIndexPtr ProjectionIndexUnique::create(const ASTProjectionDeclaration 
         }
     }
 
-    return std::make_shared<ProjectionIndexUnique>(std::move(key_columns), std::move(version_col));
+    return std::make_shared<ProjectionIndexUnique>(std::move(key_expression_list), std::move(version_col));
 }
 
 void ProjectionIndexUnique::fillProjectionDescription(
@@ -225,19 +224,27 @@ void ProjectionIndexUnique::fillProjectionDescription(
 {
     chassert(result.index.get() == this);
 
-    /// 0. Validate that all referenced user columns (unique keys + optional version)
-    ///    exist as physical columns. `getPhysical` throws NO_SUCH_COLUMN_IN_TABLE when
-    ///    a column is missing, which is exactly what we want when this is called from
-    ///    `AlterCommands::apply` after a DROP/RENAME — the surrounding try/catch there
-    ///    converts it into "Cannot apply ALTER because it breaks projection".
-    NamesAndTypesList key_name_and_types;
-    for (const auto & key_col : unique_key_columns)
-        key_name_and_types.push_back(columns.getPhysical(key_col));
+    /// Compile the key expression list into a full `KeyDescription`.
+    /// Translate `UNKNOWN_IDENTIFIER` to `NO_SUCH_COLUMN_IN_TABLE` so that
+    /// `AlterCommands::apply` correctly rejects DROP/RENAME of referenced columns.
+    try
+    {
+        unique_key_desc = KeyDescription::getKeyFromAST(unique_key_desc.expression_list_ast, columns, query_context);
+    }
+    catch (const Exception & e)
+    {
+        if (e.code() == ErrorCodes::UNKNOWN_IDENTIFIER)
+            throw Exception(ErrorCodes::NO_SUCH_COLUMN_IN_TABLE, "{}", e.message());
+        throw;
+    }
+
+    Names unique_key_source_columns = unique_key_desc.expression->getRequiredColumns();
 
     const bool has_version = !version_column_name.empty();
+    NameAndTypePair version_name_and_type;
     if (has_version)
     {
-        auto version_name_and_type = columns.getPhysical(version_column_name);
+        version_name_and_type = columns.getPhysical(version_column_name);
         /// The versioned SortedStringKV layout encodes version as a fixed-width 8-byte
         /// big-endian UInt64 (see `UniqueValueEntry<true>::encode`). Anything other
         /// than UInt64 would silently corrupt the encoding, so reject it up front.
@@ -247,7 +254,6 @@ void ProjectionIndexUnique::fillProjectionDescription(
                 "Unique projection version column {} must have type UInt64, got {}",
                 version_column_name,
                 version_name_and_type.type->getName());
-        key_name_and_types.push_back(std::move(version_name_and_type));
     }
 
     /// 1. Build the SortedStringKV data type.
@@ -271,10 +277,15 @@ void ProjectionIndexUnique::fillProjectionDescription(
     result.sample_block.clear();
     result.sample_block.insert(ColumnWithTypeAndName{sorted_kv_type->createColumn(), sorted_kv_type, kv_column_name});
 
-    /// 3. Record required columns: unique key columns (and version column if present)
-    result.required_columns = unique_key_columns;
-    if (has_version)
+    /// 3. Record required columns: physical columns referenced by the key
+    ///    expressions (and the version column if present).
+    result.required_columns = unique_key_source_columns;
+    if (has_version
+        && std::find(result.required_columns.begin(), result.required_columns.end(), version_column_name)
+            == result.required_columns.end())
+    {
         result.required_columns.push_back(version_column_name);
+    }
 
     /// 4. Mark that this projection uses _parent_part_offset.
     ///    During merge, if merge_may_reduce_rows, the projection is rebuilt
@@ -313,8 +324,18 @@ void ProjectionIndexUnique::fillProjectionDescription(
     metadata.primary_key = KeyDescription::buildEmptyKey();
     metadata.setColumns(projection_columns);
 
-    for (const auto & name_and_type : key_name_and_types)
-        result.sample_block_for_keys.insert({nullptr, name_and_type.type, name_and_type.name});
+    /// sample_block_for_keys exposes the (post-expression) key column types plus
+    /// the optional version column. AlterCommands compares this block across old
+    /// and new projections via blocksHaveEqualStructure, so any change in key
+    /// expression result types (e.g. caused by MODIFY COLUMN on a referenced
+    /// physical column) will correctly trigger ALTER_OF_COLUMN_IS_FORBIDDEN.
+    for (size_t i = 0; i < unique_key_desc.sample_block.columns(); ++i)
+    {
+        const auto & col = unique_key_desc.sample_block.getByPosition(i);
+        result.sample_block_for_keys.insert({nullptr, col.type, col.name});
+    }
+    if (has_version)
+        result.sample_block_for_keys.insert({nullptr, version_name_and_type.type, version_name_and_type.name});
 
     result.metadata = std::make_shared<StorageInMemoryMetadata>(metadata);
 }
@@ -332,16 +353,18 @@ Block ProjectionIndexUnique::calculate(
 
     const bool with_version = !version_column_name.empty();
 
-    /// 1. Serialize unique key columns into a ColumnString.
-    std::vector<const IColumn *> key_col_ptrs;
-    key_col_ptrs.reserve(unique_key_columns.size());
-    for (const auto & col_name : unique_key_columns)
-        key_col_ptrs.push_back(block.getByName(col_name).column.get());
+    /// Evaluate key expressions.
+    Block key_block = block;
+    if (unique_key_desc.expression)
+        unique_key_desc.expression->execute(key_block);
 
-    bool all_keys_comparable = false;
-    auto serialized_keys = serializeAllKeysIntoColumn(key_col_ptrs, num_rows, all_keys_comparable);
-    /// 2. Build per-row metadata: version and part_offset.
-    ///    We store these in parallel arrays indexed by original row index.
+    std::vector<const IColumn *> key_col_ptrs;
+    key_col_ptrs.reserve(unique_key_desc.column_names.size());
+    for (const auto & col_name : unique_key_desc.column_names)
+        key_col_ptrs.push_back(key_block.getByName(col_name).column.get());
+
+    auto serialized_keys = serializeAllKeysIntoColumn(key_col_ptrs, num_rows);
+
     const ColumnUInt64 * version_col = nullptr;
     if (with_version)
     {
@@ -349,11 +372,7 @@ Block ProjectionIndexUnique::calculate(
         version_col = assert_cast<const ColumnUInt64 *>(ver_col_with_type.column.get());
     }
 
-    /// When perm_ptr is present (INSERT path), rows are sorted before being written
-    /// to disk, so a row's part_offset = starting_offset + its position in the sorted
-    /// order.  perm_ptr maps sorted_pos -> original_row_idx; we invert it here to build
-    /// map_part_offsets: original_row_idx -> part_offset.  When perm_ptr is absent,
-    /// part_offset is simply starting_offset + row_idx, so we skip the allocation.
+    /// Invert perm_ptr (sorted_pos -> original_row_idx) to get original_row_idx -> part_offset.
     std::vector<UInt64> map_part_offsets;
     if (perm_ptr)
     {
@@ -362,23 +381,17 @@ Block ProjectionIndexUnique::calculate(
             map_part_offsets[(*perm_ptr)[k]] = starting_offset + k;
     }
 
-    /// 3a. Sort indices by key only (lexicographic) to group identical keys together.
-    ///     We intentionally do NOT add version/offset as secondary sort keys —
-    ///     the winner among duplicate keys is determined in the linear scan below,
-    ///     which saves significant comparison cost in pdqsort.
-    ///     If the unique key is a prefix of the parent sorting key, the block is
-    ///     already sorted by the unique key, so we skip the sort entirely.
+    /// Sort by serialized key to group identical keys together.
     std::vector<size_t> indices(num_rows);
     std::iota(indices.begin(), indices.end(), 0);
 
     ::pdqsort(
         indices.begin(), indices.end(), [&](size_t a, size_t b) { return serialized_keys->getDataAt(a) < serialized_keys->getDataAt(b); });
 
-    /// 4. Build the output block with a single SortedStringKV column.
-    ///    Deduplicate by linear scan: for each group of identical keys,
-    ///    pick the row with the largest version (or largest part_offset as tiebreaker).
+    /// Deduplicate: for each group of identical keys, keep the row with
+    /// the largest version (or largest part_offset as tiebreaker).
     auto key_column = ColumnString::create();
-    key_column->reserve(num_rows); /// upper bound; exact count unknown before dedup
+    key_column->reserve(num_rows);
 
     const auto & sample = projection_desc.sample_block;
     chassert(sample.columns() == 1);
@@ -393,16 +406,13 @@ Block ProjectionIndexUnique::calculate(
             return map_part_offsets[row_idx];
         return starting_offset + row_idx;
     };
-    /// Runtime-to-compile-time dispatch: deduplicate and write entries in a single pass.
-    /// For each group of rows sharing the same key, track the best candidate
-    /// (highest version, then highest part_offset) and emit it when the group ends.
+
     auto dedup_and_write = [&]<ValueType V>()
     {
         using Entry = typename ValueTraits<V>::Entry;
         size_t last_max_key_idx = indices[0];
         for (size_t i = 1; i <= indices.size(); ++i)
         {
-            /// Emit the best row when we reach a new key group or the end of the array.
             if (i == indices.size() || serialized_keys->getDataAt(indices[i]) != serialized_keys->getDataAt(last_max_key_idx))
             {
                 key_column->insertFrom(*serialized_keys, last_max_key_idx);
@@ -418,7 +428,6 @@ Block ProjectionIndexUnique::calculate(
             }
             else
             {
-                /// Same key group: check if current row beats the current best.
                 const size_t cur_idx = indices[i];
                 if constexpr (ValueTraits<V>::has_version)
                 {

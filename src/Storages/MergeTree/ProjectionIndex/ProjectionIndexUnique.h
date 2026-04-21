@@ -6,6 +6,8 @@
 #include <Core/Names.h>
 #include <Core/Types.h>
 #include <DataTypes/Serializations/SerializationSortedStringKV.h>
+#include <Parsers/IAST_fwd.h>
+#include <Storages/KeyDescription.h>
 #include <Storages/MergeTree/SSTFileUtil.h>
 #include <fmt/format.h>
 
@@ -69,7 +71,8 @@ inline UniqueValueEntryFull decodeUniqueValueEntry(std::string_view sv) { return
 /// DDL examples:
 ///   PROJECTION p INDEX id TYPE unique
 ///   PROJECTION p INDEX (id, name) TYPE unique
-///   PROJECTION p INDEX id TYPE unique('ver')   -- with version column
+///   PROJECTION p INDEX (x + y) TYPE unique           -- expression keys are allowed
+///   PROJECTION p INDEX id TYPE unique('ver')         -- with version column
 class ProjectionIndexUnique : public IProjectionIndex
 {
 public:
@@ -84,10 +87,12 @@ public:
         return fmt::format("{}{}", kv_column_name, SST_DATA_FILE_EXTENSION);
     }
 
-    /// Create from AST: extracts unique key column names from the INDEX expression.
+    /// Create from AST: keep the raw key expression list. Expression resolution and
+    /// validation are deferred to `fillProjectionDescription`, which has access to
+    /// the columns of the parent table.
     static ProjectionIndexPtr create(const ASTProjectionDeclaration & proj);
 
-    explicit ProjectionIndexUnique(Names unique_key_columns_, String version_column_name_ = {});
+    explicit ProjectionIndexUnique(ASTPtr key_expression_list_, String version_column_name_ = {});
 
     String getName() const override { return name; }
 
@@ -112,11 +117,20 @@ public:
     UInt64 getMaxRows() const override { return std::numeric_limits<UInt32>::max(); }
 
     const String & getVersionColumnName() const { return version_column_name; }
-    const Names & getUniqueKeyColumns() const { return unique_key_columns; }
+    /// Returns the physical source columns the unique key expressions depend on.
+    /// Valid only after `fillProjectionDescription` has compiled the key expression;
+    /// before that, the key description only holds the raw AST and this returns {}.
+    Names getUniqueKeyColumns() const;
+    const KeyDescription & getUniqueKeyDescription() const { return unique_key_desc; }
 
 private:
-    Names unique_key_columns;
     String version_column_name;
+
+    /// Holds the unique key expression list. Right after construction only
+    /// `expression_list_ast` is populated; `fillProjectionDescription` later
+    /// overwrites this with a fully-compiled `KeyDescription` (expression,
+    /// sample_block, column_names, ...), which `calculate` then uses.
+    mutable KeyDescription unique_key_desc;
 };
 
 }

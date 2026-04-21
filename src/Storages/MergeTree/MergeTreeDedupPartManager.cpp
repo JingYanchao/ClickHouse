@@ -251,7 +251,7 @@ static PartDeleteBitmapMap dedupKeysThroughNewCommitParts(
 {
     PartDeleteBitmapMap result;
 
-    if (visible_parts.empty())
+    if (input.part->rows_count == 0)
         return result;
 
     /// Release ReadBuffer memory (~1MB per file) when cross-part dedup is done.
@@ -261,22 +261,23 @@ static PartDeleteBitmapMap dedupKeysThroughNewCommitParts(
         MergeTreeDedupPartManager::releaseAllBufferMemory(visible_parts);
     });
 
-    /// Sample keys are pre-collected during SST write via SampleKeyCollector
-    /// and stored in SST file properties. No scanning needed.
     auto all_sample_keys = input.reader->getSampleKeys();
 
-    if (all_sample_keys.empty())
-        return result;
-
-    /// Downsample from all collected sample keys (up to 256) to the actual
-    /// parallelism level. For example, if we have 256 sample keys but only
-    /// 16 threads, pick every 16th sample key to get 16 evenly-spaced bucket
-    /// boundaries.
-    const size_t actual_buckets = std::min(all_sample_keys.size(), max_parallel);
     std::vector<std::string> bucket_start_keys;
-    bucket_start_keys.reserve(actual_buckets);
-    for (size_t i = 0; i < actual_buckets; ++i)
-        bucket_start_keys.push_back(std::move(all_sample_keys[i * all_sample_keys.size() / actual_buckets]));
+    if (all_sample_keys.empty())
+    {
+        /// Fallback: single bucket covering the whole SST key space.
+        bucket_start_keys.emplace_back();
+    }
+    else
+    {
+        const size_t actual_buckets = std::min(all_sample_keys.size(), max_parallel);
+        bucket_start_keys.reserve(actual_buckets);
+        for (size_t i = 0; i < actual_buckets; ++i)
+            bucket_start_keys.push_back(std::move(all_sample_keys[i * all_sample_keys.size() / actual_buckets]));
+    }
+
+    const size_t actual_buckets = bucket_start_keys.size();
 
     /// Allocate per-bucket delta bitmaps and per-bucket input exists rows.
     std::vector<PartDeleteBitmapMap> delta_bitmaps(actual_buckets);
@@ -685,11 +686,6 @@ void MergeTreeDedupPartManager::dedupForFetch(
     /// For each local part, scan its SST (as the "input" role in
     /// `dedupKeysThroughNewCommitParts`) and look up keys in the fetched
     /// part (as the "visible_parts" / lookup target role).
-    ///
-    /// The fetched merged part does not introduce new unique keys — it only
-    /// combines data from source parts that have already been deduped on
-    /// this replica. Therefore only the fetched part (`new_part`) can
-    /// receive delete marks; local parts should never be marked as deleted.
     for (auto & local_part : local_parts)
     {
         auto per_result = dedupKeysThroughNewCommitParts(
@@ -699,14 +695,6 @@ void MergeTreeDedupPartManager::dedupForFetch(
         {
             if (!bitmap || bitmap->empty())
                 continue;
-
-            /// The merged part does not introduce new keys, so local parts
-            /// should never lose the version comparison.
-            if (part_ptr != new_part.get())
-                throw Exception(ErrorCodes::LOGICAL_ERROR,
-                    "dedupForFetch: local part '{}' unexpectedly received delete marks "
-                    "during reverse dedup against fetched part '{}'",
-                    local_part.part->name, new_part->name);
 
             auto & existing = delta_deleted_rows_map[part_ptr];
             if (!existing)

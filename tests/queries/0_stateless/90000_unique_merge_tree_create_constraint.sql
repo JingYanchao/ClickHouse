@@ -26,7 +26,9 @@ CREATE TABLE test_version_param
 )
 ENGINE = UniqueMergeTree(123) ORDER BY x; -- { serverError BAD_ARGUMENTS }
 
--- Test 4: Unique projection index keys must be simple identifiers.
+-- Test 4: Unique projection keys may be arbitrary expressions, not just simple identifiers.
+-- The key is a deterministic expression over existing physical columns; the projection
+-- is built successfully and dedup happens on the expression value.
 DROP TABLE IF EXISTS test_expr_key;
 CREATE TABLE test_expr_key
 (
@@ -34,7 +36,9 @@ CREATE TABLE test_expr_key
     y UInt64,
     PROJECTION __unique_index INDEX x + y TYPE unique
 )
-ENGINE = UniqueMergeTree() ORDER BY x; -- { serverError INCORRECT_QUERY }
+ENGINE = UniqueMergeTree() ORDER BY x;
+SELECT engine FROM system.tables WHERE name = 'test_expr_key' AND database = currentDatabase();
+DROP TABLE test_expr_key;
 
 -- Test 5: Successful creation with a single-column unique projection.
 DROP TABLE IF EXISTS test_ok_single;
@@ -126,12 +130,13 @@ ALTER TABLE test_alter DROP COLUMN k; -- { serverError NO_SUCH_COLUMN_IN_TABLE }
 -- DROP COLUMN on the version column is rejected for the same reason.
 ALTER TABLE test_alter DROP COLUMN ver; -- { serverError NO_SUCH_COLUMN_IN_TABLE }
 
--- RENAME COLUMN on a unique-key column is rejected by the pre-existing
--- `columns_in_projections` check in MergeTreeData.
-ALTER TABLE test_alter RENAME COLUMN k TO k2; -- { serverError ALTER_OF_COLUMN_IS_FORBIDDEN }
+-- RENAME COLUMN on a unique-key column is rejected because
+-- `fillProjectionDescription` calls `getPhysical` on the old name,
+-- which no longer exists after the rename is applied.
+ALTER TABLE test_alter RENAME COLUMN k TO k2; -- { serverError NO_SUCH_COLUMN_IN_TABLE }
 
 -- RENAME COLUMN on the version column is likewise rejected.
-ALTER TABLE test_alter RENAME COLUMN ver TO ver2; -- { serverError ALTER_OF_COLUMN_IS_FORBIDDEN }
+ALTER TABLE test_alter RENAME COLUMN ver TO ver2; -- { serverError NO_SUCH_COLUMN_IN_TABLE }
 
 -- MODIFY COLUMN that changes the type of a unique-key column is rejected:
 -- sample_block_for_keys now carries the real user-column types, so
