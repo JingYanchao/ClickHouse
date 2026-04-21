@@ -5,7 +5,9 @@
 #include <Columns/ColumnTuple.h>
 #include <Columns/ColumnsNumber.h>
 #include <Core/Block.h>
+#include <Core/NamesAndTypes.h>
 #include <DataTypes/DataTypeFactory.h>
+#include <DataTypes/IDataType.h>
 #include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
@@ -17,9 +19,8 @@
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <DataTypes/Serializations/SerializationSortedStringKV.h>
 
-#include <Common/logger_useful.h>
+#include <base/unaligned.h>
 #include <algorithm>
-#include <bit>
 #include <numeric>
 #include <pdqsort.h>
 
@@ -104,82 +105,66 @@ static ColumnString::MutablePtr serializeAllKeysIntoColumn(
     return key_column;
 }
 
-/// UniqueValueEntry<false> (non-versioned): 8-byte layout.
+/// UniqueValueEntry<false> (non-versioned): 8-byte big-endian layout [part_offset].
 template <>
 String UniqueValueEntry<false>::encode() const
 {
-    String result(8, '\0');
-    UInt64 offset_be = std::byteswap(part_offset);
-    memcpy(result.data(), &offset_be, 8);
+    String result(sizeof(UInt64), '\0');
+    unalignedStoreBigEndian<UInt64>(result.data(), part_offset);
     return result;
 }
 
 template <>
 UniqueValueEntry<false> UniqueValueEntry<false>::decode(const char * data, size_t size)
 {
-    if (size != 8)
+    if (size != sizeof(UInt64))
         throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "Non-versioned UniqueValueEntry expects 8 bytes, got {}", size);
-    UInt64 offset_be;
-    memcpy(&offset_be, data, 8);
-    return UniqueValueEntry<false>{{}, std::byteswap(offset_be)};
+            "Non-versioned UniqueValueEntry expects {} bytes, got {}", sizeof(UInt64), size);
+    return UniqueValueEntry<false>{{}, unalignedLoadBigEndian<UInt64>(data)};
 }
 
-/// UniqueValueEntry<true> (versioned): 16-byte layout.
+/// UniqueValueEntry<true> (versioned): 16-byte big-endian layout [version | part_offset].
 template <>
 String UniqueValueEntry<true>::encode() const
 {
-    String result(16, '\0');
-    UInt64 version_be = std::byteswap(version);
-    UInt64 offset_be = std::byteswap(part_offset);
-    memcpy(result.data(), &version_be, 8);
-    memcpy(result.data() + 8, &offset_be, 8);
+    String result(2 * sizeof(UInt64), '\0');
+    unalignedStoreBigEndian<UInt64>(result.data(), version);
+    unalignedStoreBigEndian<UInt64>(result.data() + sizeof(UInt64), part_offset);
     return result;
 }
 
 template <>
 UniqueValueEntry<true> UniqueValueEntry<true>::decode(const char * data, size_t size)
 {
-    if (size != 16)
+    if (size != 2 * sizeof(UInt64))
         throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "Versioned UniqueValueEntry expects 16 bytes, got {}", size);
-    UInt64 version_be;
-    UInt64 offset_be;
-    memcpy(&version_be, data, 8);
-    memcpy(&offset_be, data + 8, 8);
+            "Versioned UniqueValueEntry expects {} bytes, got {}", 2 * sizeof(UInt64), size);
     UniqueValueEntry<true> entry;
-    entry.version = std::byteswap(version_be);
-    entry.part_offset = std::byteswap(offset_be);
+    entry.version = unalignedLoadBigEndian<UInt64>(data);
+    entry.part_offset = unalignedLoadBigEndian<UInt64>(data + sizeof(UInt64));
     return entry;
 }
 
-/// Runtime decode: auto-detects format by size (8 or 16 bytes).
+/// Runtime decode: auto-detects format by buffer size.
 UniqueValueEntryFull decodeUniqueValueEntry(const char * data, size_t size)
 {
-    if (size == 16)
+    UniqueValueEntryFull entry;
+    if (size == 2 * sizeof(UInt64))
     {
-        UInt64 version_be;
-        UInt64 offset_be;
-        memcpy(&version_be, data, 8);
-        memcpy(&offset_be, data + 8, 8);
-        UniqueValueEntryFull entry;
-        entry.version = std::byteswap(version_be);
-        entry.part_offset = std::byteswap(offset_be);
-        return entry;
+        entry.version = unalignedLoadBigEndian<UInt64>(data);
+        entry.part_offset = unalignedLoadBigEndian<UInt64>(data + sizeof(UInt64));
     }
-    else if (size == 8)
+    else if (size == sizeof(UInt64))
     {
-        UInt64 offset_be;
-        memcpy(&offset_be, data, 8);
-        UniqueValueEntryFull entry;
-        entry.part_offset = std::byteswap(offset_be);
-        return entry;
+        entry.part_offset = unalignedLoadBigEndian<UInt64>(data);
     }
     else
     {
         throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "Unique projection SST value has unexpected size: expected 8 or 16 bytes, got {}", size);
+            "Unique projection SST value has unexpected size: expected {} or {} bytes, got {}",
+            sizeof(UInt64), 2 * sizeof(UInt64), size);
     }
+    return entry;
 }
 
 ProjectionIndexUnique::ProjectionIndexUnique(Names unique_key_columns_, String version_column_name_)
@@ -235,12 +220,37 @@ ProjectionIndexPtr ProjectionIndexUnique::create(const ASTProjectionDeclaration 
 void ProjectionIndexUnique::fillProjectionDescription(
     ProjectionDescription & result,
     const IAST * /*index_expr*/,
-    const ColumnsDescription & /*columns*/,
+    const ColumnsDescription & columns,
     ContextPtr query_context) const
 {
     chassert(result.index.get() == this);
-    /// 1. Build the SortedStringKV data type.
+
+    /// 0. Validate that all referenced user columns (unique keys + optional version)
+    ///    exist as physical columns. `getPhysical` throws NO_SUCH_COLUMN_IN_TABLE when
+    ///    a column is missing, which is exactly what we want when this is called from
+    ///    `AlterCommands::apply` after a DROP/RENAME — the surrounding try/catch there
+    ///    converts it into "Cannot apply ALTER because it breaks projection".
+    NamesAndTypesList key_name_and_types;
+    for (const auto & key_col : unique_key_columns)
+        key_name_and_types.push_back(columns.getPhysical(key_col));
+
     const bool has_version = !version_column_name.empty();
+    if (has_version)
+    {
+        auto version_name_and_type = columns.getPhysical(version_column_name);
+        /// The versioned SortedStringKV layout encodes version as a fixed-width 8-byte
+        /// big-endian UInt64 (see `UniqueValueEntry<true>::encode`). Anything other
+        /// than UInt64 would silently corrupt the encoding, so reject it up front.
+        if (!WhichDataType(version_name_and_type.type).isUInt64())
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "Unique projection version column {} must have type UInt64, got {}",
+                version_column_name,
+                version_name_and_type.type->getName());
+        key_name_and_types.push_back(std::move(version_name_and_type));
+    }
+
+    /// 1. Build the SortedStringKV data type.
     const auto kv_value_type = has_version
         ? ValueType::VersionedPartOffset
         : ValueType::PartOffset;
@@ -301,10 +311,11 @@ void ProjectionIndexUnique::fillProjectionDescription(
 
     /// Primary key: empty — we don't need primary key index for unique projection
     metadata.primary_key = KeyDescription::buildEmptyKey();
-
     metadata.setColumns(projection_columns);
-    /// Also fill sample_block_for_keys (used by Aggregate projections for GROUP BY keys)
-    result.sample_block_for_keys.insert({nullptr, sorted_kv_type, kv_column_name});
+
+    for (const auto & name_and_type : key_name_and_types)
+        result.sample_block_for_keys.insert({nullptr, name_and_type.type, name_and_type.name});
+
     result.metadata = std::make_shared<StorageInMemoryMetadata>(metadata);
 }
 
@@ -318,8 +329,6 @@ Block ProjectionIndexUnique::calculate(
     const size_t num_rows = block.rows();
     if (num_rows == 0)
         return projection_desc.sample_block.cloneEmpty();
-
-    Stopwatch total_watch;
 
     const bool with_version = !version_column_name.empty();
 
@@ -353,10 +362,6 @@ Block ProjectionIndexUnique::calculate(
             map_part_offsets[(*perm_ptr)[k]] = starting_offset + k;
     }
 
-    UInt64 pre_sort_us = total_watch.elapsedMicroseconds();
-    LOG_INFO(getLogger("ProjectionIndexUnique"), "calculate pre-sort (serialize+metadata): {}us, rows={}", pre_sort_us, num_rows);
-
-
     /// 3a. Sort indices by key only (lexicographic) to group identical keys together.
     ///     We intentionally do NOT add version/offset as secondary sort keys —
     ///     the winner among duplicate keys is determined in the linear scan below,
@@ -366,13 +371,8 @@ Block ProjectionIndexUnique::calculate(
     std::vector<size_t> indices(num_rows);
     std::iota(indices.begin(), indices.end(), 0);
 
-    UInt64 sort_us = 0;
-
-    Stopwatch sort_watch;
     ::pdqsort(
         indices.begin(), indices.end(), [&](size_t a, size_t b) { return serialized_keys->getDataAt(a) < serialized_keys->getDataAt(b); });
-    sort_us = sort_watch.elapsedMicroseconds();
-    LOG_INFO(getLogger("ProjectionIndexUnique"), "calculate sort: {}us, rows={}", sort_us, num_rows);
 
     /// 4. Build the output block with a single SortedStringKV column.
     ///    Deduplicate by linear scan: for each group of identical keys,

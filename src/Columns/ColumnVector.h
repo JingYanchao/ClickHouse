@@ -357,7 +357,11 @@ public:
     size_t computeComparableRowFormatSize() const override;
     bool supportsSerializeValueIntoMemoryAsComparable() const override
     {
-        return true;
+        return std::is_integral_v<T>
+            || is_big_int_v<T>
+            || std::is_same_v<T, IPv4>
+            || std::is_same_v<T, IPv6>
+            || std::is_same_v<T, UUID>;
     }
 
 protected:

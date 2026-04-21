@@ -361,7 +361,6 @@ static constexpr char DEFAULT_SERIALIZE_MARK = 0xff;
 ///   [1, 2, 3, 4, 5, 6, 7, 8, 9] -> [1, 2, 3, 4, 5, 6, 7, 8, 255, 9, 0, 0, 0, 0, 0, 0, 0, 248]
 char * ColumnString::serializeValueIntoMemoryAsComparableRowFormat(size_t n, char * memory) const
 {
-    /// Assume that the allocated memory is filled with 0.
     auto string_size = sizeAt(n) - 1; /// Remove the terminating 0.
     auto offset = offsetAt(n);
 
@@ -370,6 +369,10 @@ char * ColumnString::serializeValueIntoMemoryAsComparableRowFormat(size_t n, cha
         auto copy_count = std::min(string_size - pos, SERIALIZE_GROUP_SIZE);
         auto padding_count = SERIALIZE_GROUP_SIZE - copy_count;
         memcpy(memory, &chars[offset + pos], copy_count);
+        /// Explicitly zero-fill padding bytes so the encoded key is deterministic
+        /// regardless of the buffer's prior contents.
+        if (padding_count > 0)
+            memset(memory + copy_count, 0, padding_count);
         memory += SERIALIZE_GROUP_SIZE;
         *memory = DEFAULT_SERIALIZE_MARK - static_cast<char>(padding_count);
         ++memory;

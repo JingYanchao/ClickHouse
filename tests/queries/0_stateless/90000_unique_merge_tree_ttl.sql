@@ -30,6 +30,9 @@ ENGINE = UniqueMergeTree()
 ORDER BY id
 TTL event_time + INTERVAL 1 DAY;
 
+-- Prevent background TTL merge from dropping expired parts before we observe them.
+SYSTEM STOP TTL MERGES umt_ttl;
+
 -- Fully-expired part.
 INSERT INTO umt_ttl SELECT number, number, now() - INTERVAL 10 DAY FROM numbers(10);
 -- Fully-fresh part.
@@ -37,6 +40,7 @@ INSERT INTO umt_ttl SELECT number + 100, number + 100, now() + INTERVAL 10 DAY F
 
 SELECT 'rows before TTL:', count() FROM umt_ttl;
 
+SYSTEM START TTL MERGES umt_ttl;
 ALTER TABLE umt_ttl MATERIALIZE TTL SETTINGS mutations_sync = 2;
 
 -- Expired part dropped wholesale; fresh part kept as-is.
@@ -67,6 +71,8 @@ ENGINE = UniqueMergeTree()
 ORDER BY id
 TTL event_time + INTERVAL 1 DAY;
 
+SYSTEM STOP TTL MERGES umt_ttl_mixed;
+
 -- Single part with a mix of expired (even ids) and fresh (odd ids) rows.
 INSERT INTO umt_ttl_mixed SELECT
     number,
@@ -76,6 +82,7 @@ FROM numbers(10);
 
 SELECT 'rows before TTL:', count() FROM umt_ttl_mixed;
 
+SYSTEM START TTL MERGES umt_ttl_mixed;
 ALTER TABLE umt_ttl_mixed MATERIALIZE TTL SETTINGS mutations_sync = 2;
 
 -- All 10 rows are preserved because the part is not fully expired.
@@ -102,7 +109,11 @@ ENGINE = UniqueMergeTree()
 ORDER BY id
 TTL event_time + INTERVAL 1 DAY;
 
+SYSTEM STOP TTL MERGES umt_ttl_insert;
+
 INSERT INTO umt_ttl_insert SELECT number, number, now() - INTERVAL 10 DAY FROM numbers(10);
+
+SYSTEM START TTL MERGES umt_ttl_insert;
 ALTER TABLE umt_ttl_insert MATERIALIZE TTL SETTINGS mutations_sync = 2;
 
 SELECT 'after TTL drop:', count() FROM umt_ttl_insert;
@@ -141,6 +152,8 @@ PARTITION BY toYYYYMM(event_time)
 ORDER BY id
 TTL event_time + INTERVAL 1 DAY;
 
+SYSTEM STOP TTL MERGES umt_ttl_part;
+
 -- Old partition entirely expired.
 INSERT INTO umt_ttl_part SELECT number, number, toDateTime('2000-01-15 00:00:00') FROM numbers(5);
 -- Fresh partition far in the future.
@@ -148,6 +161,7 @@ INSERT INTO umt_ttl_part SELECT number + 100, number + 100, now() + INTERVAL 10 
 
 SELECT 'before TTL:', count() FROM umt_ttl_part;
 
+SYSTEM START TTL MERGES umt_ttl_part;
 ALTER TABLE umt_ttl_part MATERIALIZE TTL SETTINGS mutations_sync = 2;
 
 SELECT 'after TTL:', count() FROM umt_ttl_part;

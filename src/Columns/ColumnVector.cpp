@@ -376,6 +376,27 @@ char * ColumnVector<T>::serializeValueIntoMemoryAsComparableRowFormat(size_t n, 
             memory[0] ^= 0x80;
         return memory + sizeof(T);
     }
+    else if constexpr (std::is_same_v<T, IPv4>)
+    {
+        UInt32 value = getData()[n].toUnderType();
+        if constexpr (std::endian::native == std::endian::little)
+            value = std::byteswap(value);
+        memcpy(memory, &value, sizeof(UInt32));
+        return memory + sizeof(UInt32);
+    }
+    else if constexpr (std::is_same_v<T, IPv6> || std::is_same_v<T, UUID>)
+    {
+        const auto & under = getData()[n].toUnderType();
+        constexpr unsigned item_count = sizeof(UInt128) / sizeof(uint64_t);
+        for (unsigned i = 0; i < item_count; ++i)
+        {
+            uint64_t item = under.items[UInt128::_impl::big(i)];
+            if constexpr (std::endian::native == std::endian::little)
+                item = std::byteswap(item);
+            memcpy(memory + i * sizeof(uint64_t), &item, sizeof(uint64_t));
+        }
+        return memory + sizeof(UInt128);
+    }
     else
         return IColumn::serializeValueIntoMemoryAsComparableRowFormat(n, memory);
 }
