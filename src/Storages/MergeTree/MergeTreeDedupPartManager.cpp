@@ -1179,8 +1179,10 @@ DedupMetadataForFetch DedupMetadataForFetch::deserialize(ReadBuffer & in)
 }
 
 
-UniqueProcessLock::UniqueProcessLock(std::mutex & unique_process_lock_)
-    : wait_watch(Stopwatch(CLOCK_MONOTONIC)), lock(unique_process_lock_), lock_watch(Stopwatch(CLOCK_MONOTONIC))
+UniqueProcessLock::UniqueProcessLock(const RWLock & unique_process_lock_)
+    : wait_watch(Stopwatch(CLOCK_MONOTONIC))
+    , lock_holder(unique_process_lock_->getLock(RWLockImpl::Write, RWLockImpl::NO_QUERY))
+    , lock_watch(Stopwatch(CLOCK_MONOTONIC))
 {
     ProfileEvents::increment(ProfileEvents::UniqueProcessLockWaitMicroseconds, wait_watch->elapsedMicroseconds());
 }

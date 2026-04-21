@@ -993,6 +993,12 @@ static StoragePtr create(const StorageFactory::Arguments & args)
         /// BeforeTransactionCommitHook.
         if (name_part == "Unique")
         {
+            /// `UniqueMergeTree` only supports whole-part TTL drops. Row-level TTL
+            /// delete merges would rewrite rows at new positions and invalidate the
+            /// per-part delete bitmap used for dedup. Force `ttl_only_drop_parts = true`
+            /// unconditionally, ignoring DDL and server-level configuration.
+            storage_settings->set("ttl_only_drop_parts", Field(true));
+
             return std::make_shared<StorageReplicatedUniqueMergeTree>(
                 zookeeper_info,
                 args.mode,
@@ -1026,6 +1032,12 @@ static StoragePtr create(const StorageFactory::Arguments & args)
     /// and injects dedup logic via BeforeTransactionCommitHook.
     if (name_part == "Unique")
     {
+        /// `UniqueMergeTree` only supports whole-part TTL drops. Row-level TTL
+        /// delete merges would rewrite rows at new positions and invalidate the
+        /// per-part delete bitmap used for dedup. Force `ttl_only_drop_parts = true`
+        /// unconditionally, ignoring DDL and server-level configuration.
+        storage_settings->set("ttl_only_drop_parts", Field(true));
+
         return std::make_shared<StorageUniqueMergeTree>(
             args.table_id,
             args.relative_data_path,

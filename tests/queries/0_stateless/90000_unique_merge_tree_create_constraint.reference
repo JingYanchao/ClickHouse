@@ -1,7 +1,6 @@
-1
-1
-1
-1
 UniqueMergeTree
 UniqueMergeTree
 UniqueMergeTree
+UniqueMergeTree
+FixedString(8)
+extra

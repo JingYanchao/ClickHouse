@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <Common/RWLock.h>
 #include <Common/Stopwatch.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/SSTFileUtil.h>
@@ -41,7 +42,7 @@ struct DedupMetadataForFetch
 
 struct UniqueProcessLock
 {
-    explicit UniqueProcessLock(std::mutex & unique_process_lock_);
+    explicit UniqueProcessLock(const RWLock & unique_process_lock_);
     ~UniqueProcessLock();
 
     UniqueProcessLock(const UniqueProcessLock &) = delete;
@@ -49,11 +50,11 @@ struct UniqueProcessLock
     UniqueProcessLock(UniqueProcessLock &&) = default;
     UniqueProcessLock & operator=(UniqueProcessLock &&) = default;
 
-    void unlock() { lock.unlock(); }
+    void unlock() { lock_holder.reset(); }
 
 private:
     std::optional<Stopwatch> wait_watch;
-    std::unique_lock<std::mutex> lock;
+    RWLockImpl::LockHolder lock_holder;
     std::optional<Stopwatch> lock_watch;
 };
 
@@ -170,7 +171,12 @@ private:
         const MergeTreeData::DeleteBitmapSnapshotMap & source_delete_bitmap_snapshots = {});
 
     MergeTreeData & storage;
-    std::mutex unique_process_mutex;
+    /// FIFO-fair lock serializing the dedup commit phase across all write paths
+    /// (INSERT / FETCH / MERGE / MUTATION). Using RWLockImpl in Write mode because
+    /// `std::mutex` allows barging: under heavy contention, newly-arriving threads
+    /// may acquire the lock ahead of long-waiting ones, causing some merges to be
+    /// starved for minutes. See RWLock.h ("Phase Fair RWLock") for guarantees.
+    RWLock unique_process_mutex = RWLockImpl::create();
     PartDeleteBitmapMap delta_deleted_rows_map; /// protected by unique_process_mutex
 
     /// rocksdb to persistent delete bitmaps

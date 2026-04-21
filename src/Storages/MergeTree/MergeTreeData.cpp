@@ -62,6 +62,7 @@
 #include <Interpreters/MutationsInterpreter.h>
 #include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTIndexDeclaration.h>
+#include <Parsers/ASTProjectionDeclaration.h>
 #include <Parsers/ASTHelpers.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTLiteral.h>
@@ -4287,6 +4288,26 @@ void MergeTreeData::checkAlterIsPossible(const AlterCommands & commands, Context
     /// Block the case of alter table add projection for special merge trees.
     if (std::any_of(commands.begin(), commands.end(), [](const AlterCommand & c) { return c.type == AlterCommand::ADD_PROJECTION; }))
     {
+        /// UniqueMergeTree only allows projection indexes (with TYPE clause),
+        /// regular projections are not supported because they cannot maintain
+        /// consistency with the dedup delete bitmap.
+        if (supportsUpsert())
+        {
+            for (const auto & command : commands)
+            {
+                if (command.type != AlterCommand::ADD_PROJECTION)
+                    continue;
+
+                const auto * projection_decl = command.projection_decl->as<ASTProjectionDeclaration>();
+                if (projection_decl && !projection_decl->type)
+                    throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+                        "Regular projections are not supported for UniqueMergeTree. "
+                        "Only projection indexes (with TYPE clause) are allowed. "
+                        "Projection '{}' does not have a TYPE clause",
+                        command.projection_name);
+            }
+        }
+
         if (merging_params.mode != MergingParams::Mode::Ordinary
             && (*settings_from_storage)[MergeTreeSetting::deduplicate_merge_projection_mode] == DeduplicateMergeProjectionMode::THROW)
             throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
