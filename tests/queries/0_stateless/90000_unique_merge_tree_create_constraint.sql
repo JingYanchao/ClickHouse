@@ -158,4 +158,59 @@ SELECT name FROM system.columns WHERE table = 'test_alter' AND database = curren
 -- And dropping that unrelated column must still succeed.
 ALTER TABLE test_alter DROP COLUMN extra;
 
+-- ALTER ADD PROJECTION: regular projection (no TYPE clause) is rejected.
+ALTER TABLE test_alter ADD PROJECTION agg_proj (SELECT sum(v) GROUP BY k); -- { serverError SUPPORT_IS_DISABLED }
+
+-- ALTER ADD PROJECTION with TYPE clause is allowed.
+ALTER TABLE test_alter ADD PROJECTION __extra INDEX k TYPE unique;
+
+-- ALTER DROP PROJECTION of the unique index is rejected.
+ALTER TABLE test_alter DROP PROJECTION __unique_index; -- { serverError SUPPORT_IS_DISABLED }
+
+-- ALTER DROP PROJECTION of the extra unique index is also rejected.
+ALTER TABLE test_alter DROP PROJECTION __extra; -- { serverError SUPPORT_IS_DISABLED }
+
+-- Dropping a non-existent projection should still give the normal error (not the unique guard).
+ALTER TABLE test_alter DROP PROJECTION nonexistent; -- { serverError NO_SUCH_PROJECTION_IN_TABLE }
+
 DROP TABLE test_alter;
+
+-- ==========================================================
+-- CREATE TABLE with regular (non-index) projection is rejected.
+-- UniqueMergeTree only allows projection indexes (with TYPE clause).
+-- ==========================================================
+
+-- Test: A table with both a unique projection index and a regular projection must fail.
+DROP TABLE IF EXISTS test_regular_proj;
+CREATE TABLE test_regular_proj
+(
+    x Int32,
+    y UInt64,
+    PROJECTION __unique_index INDEX x TYPE unique,
+    PROJECTION agg_proj (SELECT sum(y) GROUP BY x)
+)
+ENGINE = UniqueMergeTree() ORDER BY x; -- { serverError BAD_ARGUMENTS }
+
+-- Test: A table with only a regular projection (no unique index) also fails,
+-- both because the unique projection is missing and because regular projections
+-- are not allowed.
+DROP TABLE IF EXISTS test_only_regular;
+CREATE TABLE test_only_regular
+(
+    x Int32,
+    y UInt64,
+    PROJECTION agg_proj (SELECT sum(y) GROUP BY x)
+)
+ENGINE = UniqueMergeTree() ORDER BY x; -- { serverError BAD_ARGUMENTS }
+
+-- Test: A table with only the unique projection index (no regular projections) succeeds.
+DROP TABLE IF EXISTS test_unique_only;
+CREATE TABLE test_unique_only
+(
+    x Int32,
+    y UInt64,
+    PROJECTION __unique_index INDEX x TYPE unique
+)
+ENGINE = UniqueMergeTree() ORDER BY x;
+SELECT engine FROM system.tables WHERE name = 'test_unique_only' AND database = currentDatabase();
+DROP TABLE test_unique_only;

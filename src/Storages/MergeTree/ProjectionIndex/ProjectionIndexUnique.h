@@ -87,12 +87,9 @@ public:
         return fmt::format("{}{}", kv_column_name, SST_DATA_FILE_EXTENSION);
     }
 
-    /// Create from AST: keep the raw key expression list. Expression resolution and
-    /// validation are deferred to `fillProjectionDescription`, which has access to
-    /// the columns of the parent table.
     static ProjectionIndexPtr create(const ASTProjectionDeclaration & proj);
 
-    explicit ProjectionIndexUnique(ASTPtr key_expression_list_, String version_column_name_ = {});
+    explicit ProjectionIndexUnique(String version_column_name_ = {});
 
     String getName() const override { return name; }
 
@@ -126,10 +123,8 @@ public:
 private:
     String version_column_name;
 
-    /// Holds the unique key expression list. Right after construction only
-    /// `expression_list_ast` is populated; `fillProjectionDescription` later
-    /// overwrites this with a fully-compiled `KeyDescription` (expression,
-    /// sample_block, column_names, ...), which `calculate` then uses.
+    /// Populated by `fillProjectionDescription` with the compiled key
+    /// (expression, sample_block, column_names, ...) from `index_expr`.
     mutable KeyDescription unique_key_desc;
 };
 

@@ -74,6 +74,9 @@ StorageUniqueMergeTree::StorageUniqueMergeTree(
     validateUniqueProjection(
         unique_projection_name, metadata_.getProjections(), getStorageID().getFullTableName());
 
+    validateNoRegularProjections(
+        metadata_.getProjections(), getStorageID().getFullTableName());
+
     dedup_manager = std::make_shared<MergeTreeDedupPartManager>(*this);
 
     setBeforeTransactionCommitHook(

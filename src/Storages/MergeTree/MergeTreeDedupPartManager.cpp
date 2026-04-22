@@ -1,5 +1,6 @@
 #include <Storages/MergeTree/MergeTreeDedupPartManager.h>
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
+#include <Storages/ProjectionsDescription.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreeIndexReadResultPool.h>
 #include <Storages/MergeTree/ProjectionIndex/ProjectionIndexUnique.h>
@@ -46,6 +47,21 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
     extern const int INCORRECT_DATA;
     extern const int LOGICAL_ERROR;
+}
+
+void validateNoRegularProjections(
+    const ProjectionsDescription & projections,
+    const String & full_table_name)
+{
+    for (const auto & projection : projections)
+    {
+        if (!projection.index)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "Regular projections are not supported for UniqueMergeTree. "
+                "Only projection indexes (with TYPE clause) are allowed. "
+                "Projection '{}' in table '{}' does not have a TYPE clause",
+                projection.name, full_table_name);
+    }
 }
 
 /// Maximum number of keys to batch in a single MultiGet call.

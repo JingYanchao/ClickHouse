@@ -4316,6 +4316,19 @@ void MergeTreeData::checkAlterIsPossible(const AlterCommands & commands, Context
                 getName());
     }
 
+    /// Block dropping the unique projection index for UniqueMergeTree.
+    /// Dropping it would break dedup because the delete bitmap relies on the index.
+    if (supportsUpsert())
+    {
+        for (const auto & command : commands)
+        {
+            if (command.type == AlterCommand::DROP_PROJECTION && command.projection_name == getUniqueProjectionName())
+                throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+                    "Cannot drop projection '{}' because it is the unique index used for dedup in {}",
+                    command.projection_name, getName());
+        }
+    }
+
     removeImplicitStatistics(new_metadata.columns);
     commands.apply(new_metadata, local_context);
 

@@ -35,7 +35,6 @@ namespace ErrorCodes
     extern const int CORRUPTED_DATA;
     extern const int INCORRECT_QUERY;
     extern const int BAD_ARGUMENTS;
-    extern const int LOGICAL_ERROR;
     extern const int NO_SUCH_COLUMN_IN_TABLE;
     extern const int UNKNOWN_IDENTIFIER;
 }
@@ -155,21 +154,9 @@ UniqueValueEntryFull decodeUniqueValueEntry(const char * data, size_t size)
     return entry;
 }
 
-ProjectionIndexUnique::ProjectionIndexUnique(ASTPtr key_expression_list_, String version_column_name_)
+ProjectionIndexUnique::ProjectionIndexUnique(String version_column_name_)
     : version_column_name(std::move(version_column_name_))
 {
-    if (!key_expression_list_)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unique projection index requires at least one key expression");
-
-    const auto * expr_list = key_expression_list_->as<ASTExpressionList>();
-    if (!expr_list || expr_list->children.empty())
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unique projection index requires at least one key expression");
-
-    /// Park the raw AST inside `unique_key_desc`. `fillProjectionDescription`
-    /// will later overwrite the whole struct with the compiled key (expression,
-    /// sample_block, column_names, ...) once it has access to the parent columns
-    /// and query context.
-    unique_key_desc.expression_list_ast = std::move(key_expression_list_);
 }
 
 Names ProjectionIndexUnique::getUniqueKeyColumns() const
@@ -181,28 +168,8 @@ Names ProjectionIndexUnique::getUniqueKeyColumns() const
 
 ProjectionIndexPtr ProjectionIndexUnique::create(const ASTProjectionDeclaration & proj)
 {
-    /// Keep the raw key expression list. We intentionally do NOT restrict keys to
-    /// simple identifiers here — arbitrary deterministic expressions are allowed
-    /// (e.g. `x + y`, `lower(name)`). The final validation (column existence,
-    /// result types, Nullable rejection, etc.) is performed later in
-    /// `fillProjectionDescription` where we have access to the columns of the
-    /// parent table.
     if (!proj.index)
         throw Exception(ErrorCodes::INCORRECT_QUERY, "Unique projection index requires INDEX expression with key columns");
-
-    ASTPtr key_expression_list;
-    if (proj.index->as<ASTExpressionList>())
-    {
-        key_expression_list = proj.index->clone();
-    }
-    else
-    {
-        /// Defensive branch: the parser for `PROJECTION ... INDEX ...` always produces
-        /// an ASTExpressionList, but wrap a single expression just in case.
-        auto wrapper = make_intrusive<ASTExpressionList>();
-        wrapper->children.push_back(proj.index->clone());
-        key_expression_list = wrapper;
-    }
 
     /// Extract optional version column from TYPE unique('ver') arguments.
     String version_col;
@@ -215,23 +182,22 @@ ProjectionIndexPtr ProjectionIndexUnique::create(const ASTProjectionDeclaration 
         }
     }
 
-    return std::make_shared<ProjectionIndexUnique>(std::move(key_expression_list), std::move(version_col));
+    return std::make_shared<ProjectionIndexUnique>(std::move(version_col));
 }
 
 void ProjectionIndexUnique::fillProjectionDescription(
     ProjectionDescription & result,
-    const IAST * /*index_expr*/,
+    const IAST * index_expr,
     const ColumnsDescription & columns,
     ContextPtr query_context) const
 {
     chassert(result.index.get() == this);
 
-    /// Compile the raw key expression list (stored during construction) into a
-    /// fully resolved KeyDescription, similar to how skip-index does it in
-    /// `IndexDescription::initExpressionInfo`: analyze with TreeRewriter, then
-    /// build ExpressionActions via ExpressionAnalyzer.
+    /// Compile the key expression list into a fully resolved KeyDescription,
+    /// similar to how skip-index does it in `IndexDescription::initExpressionInfo`:
+    /// analyze with TreeRewriter, then build ExpressionActions via ExpressionAnalyzer.
     {
-        auto expr_list = unique_key_desc.expression_list_ast->clone();
+        auto expr_list = index_expr->clone();
         auto all_columns = columns.get(GetColumnsOptions(GetColumnsOptions::Kind::AllPhysical).withSubcolumns());
 
         /// Translate `UNKNOWN_IDENTIFIER` to `NO_SUCH_COLUMN_IN_TABLE` so that
@@ -381,10 +347,18 @@ Block ProjectionIndexUnique::calculate(
     if (unique_key_desc.expression)
         unique_key_desc.expression->execute(key_block);
 
-    std::vector<const IColumn *> key_col_ptrs;
-    key_col_ptrs.reserve(unique_key_desc.column_names.size());
+    /// Convert sparse columns to full to ensure consistent serialization
+    /// format in the unique index SST keys regardless of
+    /// ratio_of_defaults_for_sparse_serialization setting.
+    Columns key_columns_holder;
+    key_columns_holder.reserve(unique_key_desc.column_names.size());
     for (const auto & col_name : unique_key_desc.column_names)
-        key_col_ptrs.push_back(key_block.getByName(col_name).column.get());
+        key_columns_holder.push_back(key_block.getByName(col_name).column->convertToFullColumnIfSparse());
+
+    std::vector<const IColumn *> key_col_ptrs;
+    key_col_ptrs.reserve(key_columns_holder.size());
+    for (const auto & col : key_columns_holder)
+        key_col_ptrs.push_back(col.get());
 
     auto serialized_keys = serializeAllKeysIntoColumn(key_col_ptrs, num_rows);
 

@@ -11,6 +11,7 @@
 #include <Common/Stopwatch.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/SSTFileUtil.h>
+#include <Storages/ProjectionsDescription.h>
 #include <boost/icl/interval_set.hpp>
 
 namespace DB
@@ -57,6 +58,13 @@ private:
     RWLockImpl::LockHolder lock_holder;
     std::optional<Stopwatch> lock_watch;
 };
+
+/// Reject regular (non-index) projections for UniqueMergeTree engines.
+/// Only projection indexes (with TYPE clause) are allowed because regular
+/// projections cannot maintain consistency with the dedup delete bitmap.
+void validateNoRegularProjections(
+    const ProjectionsDescription & projections,
+    const String & full_table_name);
 
 class MergeTreeDedupPartManager
 {
