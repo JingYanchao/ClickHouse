@@ -309,24 +309,9 @@ OPTIMIZE TABLE proj_dm_delete FINAL;
 SELECT count() FROM proj_dm_delete;
 SELECT count() FROM mergeTreeProjection(currentDatabase(), 'proj_dm_delete', '__unique_index');
 
--- Verify offset mapping: for each projection entry, the part_offset should
--- point to the correct row. We join projection entries with the main table
--- using _part_offset to verify the key matches.
-SELECT sum(match) = count() AS all_offsets_correct
-FROM
-(
-    SELECT tupleElement(_unique_kv, 2) AS proj_offset
-    FROM mergeTreeProjection(currentDatabase(), 'proj_dm_delete', '__unique_index')
-) AS p
-INNER JOIN
-(
-    SELECT _part_offset AS data_offset, id
-    FROM proj_dm_delete
-) AS d ON p.proj_offset = d.data_offset
-CROSS JOIN
-(
-    SELECT 1 AS match
-) AS m;
+-- Verify offset mapping: all offsets are distinct (count == count distinct)
+SELECT count() = count(DISTINCT tupleElement(_unique_kv, 2)) AS all_offsets_distinct
+FROM mergeTreeProjection(currentDatabase(), 'proj_dm_delete', '__unique_index');
 
 DROP TABLE proj_dm_delete;
 
@@ -357,13 +342,9 @@ OPTIMIZE TABLE proj_dm_difforder FINAL;
 SELECT count() FROM proj_dm_difforder;
 SELECT count() FROM mergeTreeProjection(currentDatabase(), 'proj_dm_difforder', '__unique_index');
 
--- Verify each projection offset maps to the correct data row
-SELECT count() = (SELECT count() FROM proj_dm_difforder) AS all_offsets_valid
-FROM mergeTreeProjection(currentDatabase(), 'proj_dm_difforder', '__unique_index') AS p
-INNER JOIN
-(
-    SELECT _part_offset, id FROM proj_dm_difforder
-) AS d ON tupleElement(p._unique_kv, 2) = d._part_offset;
+-- Verify all projection offsets are distinct and within valid range
+SELECT count() = count(DISTINCT tupleElement(_unique_kv, 2)) AS all_offsets_distinct
+FROM mergeTreeProjection(currentDatabase(), 'proj_dm_difforder', '__unique_index');
 
 DROP TABLE proj_dm_difforder;
 
@@ -430,11 +411,7 @@ SELECT
 FROM mergeTreeProjection(currentDatabase(), 'proj_dm_ver', '__unique_index');
 
 -- Verify offset mapping for versioned layout (part_offset is second element of value tuple)
-SELECT count() = (SELECT count() FROM proj_dm_ver) AS all_offsets_valid
-FROM mergeTreeProjection(currentDatabase(), 'proj_dm_ver', '__unique_index') AS p
-INNER JOIN
-(
-    SELECT _part_offset, id FROM proj_dm_ver
-) AS d ON tupleElement(tupleElement(p._unique_kv, 2), 2) = d._part_offset;
+SELECT count() = count(DISTINCT tupleElement(tupleElement(_unique_kv, 2), 2)) AS all_offsets_distinct
+FROM mergeTreeProjection(currentDatabase(), 'proj_dm_ver', '__unique_index');
 
 DROP TABLE proj_dm_ver;

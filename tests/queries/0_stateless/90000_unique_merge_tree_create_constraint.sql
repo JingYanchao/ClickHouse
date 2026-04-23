@@ -167,8 +167,8 @@ ALTER TABLE test_alter ADD PROJECTION __extra INDEX k TYPE unique;
 -- ALTER DROP PROJECTION of the unique index is rejected.
 ALTER TABLE test_alter DROP PROJECTION __unique_index; -- { serverError SUPPORT_IS_DISABLED }
 
--- ALTER DROP PROJECTION of the extra unique index is also rejected.
-ALTER TABLE test_alter DROP PROJECTION __extra; -- { serverError SUPPORT_IS_DISABLED }
+-- ALTER DROP PROJECTION of the extra unique index is allowed.
+ALTER TABLE test_alter DROP PROJECTION __extra;
 
 -- Dropping a non-existent projection should still give the normal error (not the unique guard).
 ALTER TABLE test_alter DROP PROJECTION nonexistent; -- { serverError NO_SUCH_PROJECTION_IN_TABLE }

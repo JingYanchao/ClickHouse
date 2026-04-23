@@ -72,9 +72,9 @@ SELECT id, value1, ver FROM rep_unique_mutation_update_ver WHERE id = 3;
 DROP TABLE rep_unique_mutation_update_ver;
 
 -- ===================================================================
--- ALTER DELETE: basic
+-- ALTER DELETE: not supported for ReplicatedUniqueMergeTree
 -- ===================================================================
-SELECT '--- alter delete: basic ---';
+SELECT '--- alter delete: not supported ---';
 
 DROP TABLE IF EXISTS rep_unique_mutation_delete;
 
@@ -89,19 +89,15 @@ ORDER BY id;
 
 INSERT INTO rep_unique_mutation_delete SELECT number, number FROM numbers(10);
 
-ALTER TABLE rep_unique_mutation_delete DELETE WHERE id >= 8 SETTINGS mutations_sync = 2;
-SELECT * FROM rep_unique_mutation_delete ORDER BY id;
-
--- Re-insert deleted keys — dedup state should allow them back
-INSERT INTO rep_unique_mutation_delete VALUES (8, 888), (9, 999);
+ALTER TABLE rep_unique_mutation_delete DELETE WHERE id >= 8 SETTINGS mutations_sync = 2; -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM rep_unique_mutation_delete ORDER BY id;
 
 DROP TABLE rep_unique_mutation_delete;
 
 -- ===================================================================
--- ALTER DELETE: with partition
+-- ALTER DELETE: with partition also not supported
 -- ===================================================================
-SELECT '--- alter delete: with partition ---';
+SELECT '--- alter delete: partition not supported ---';
 
 DROP TABLE IF EXISTS rep_unique_mutation_delete_part;
 
@@ -119,11 +115,7 @@ ORDER BY id;
 INSERT INTO rep_unique_mutation_delete_part VALUES ('2024-01-01', 1, 10), ('2024-01-01', 2, 20);
 INSERT INTO rep_unique_mutation_delete_part VALUES ('2024-01-02', 3, 30), ('2024-01-02', 4, 40);
 
-ALTER TABLE rep_unique_mutation_delete_part DELETE WHERE dt = '2024-01-01' SETTINGS mutations_sync = 2;
-SELECT * FROM rep_unique_mutation_delete_part ORDER BY dt, id;
-
--- Re-insert into deleted partition
-INSERT INTO rep_unique_mutation_delete_part VALUES ('2024-01-01', 1, 999), ('2024-01-01', 5, 50);
+ALTER TABLE rep_unique_mutation_delete_part DELETE WHERE dt = '2024-01-01' SETTINGS mutations_sync = 2; -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM rep_unique_mutation_delete_part ORDER BY dt, id;
 
 DROP TABLE rep_unique_mutation_delete_part;
@@ -328,7 +320,7 @@ ORDER BY id;
 INSERT INTO rep_unique_mutation_seq SELECT number, number FROM numbers(10);
 
 ALTER TABLE rep_unique_mutation_seq UPDATE value = 100 WHERE id % 2 = 0 SETTINGS mutations_sync = 2;
-ALTER TABLE rep_unique_mutation_seq DELETE WHERE id >= 7 SETTINGS mutations_sync = 2;
+ALTER TABLE rep_unique_mutation_seq DELETE WHERE id >= 7 SETTINGS mutations_sync = 2; -- { serverError NOT_IMPLEMENTED }
 ALTER TABLE rep_unique_mutation_seq ADD COLUMN extra UInt32 DEFAULT 0 SETTINGS mutations_sync = 2;
 
 SELECT * FROM rep_unique_mutation_seq ORDER BY id;

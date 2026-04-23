@@ -1,7 +1,11 @@
 -- Test: UniqueMergeTree mutation operations
 --
--- Covers ALTER UPDATE, ALTER DELETE, MODIFY COLUMN, ADD COLUMN,
+-- Covers ALTER UPDATE, MODIFY COLUMN, ADD COLUMN,
 -- ADD/MATERIALIZE/CLEAR INDEX and their interaction with dedup state.
+-- NOTE: ALTER DELETE is intentionally unsupported for UniqueMergeTree
+-- because row-level deletion bypasses the unique projection SST and
+-- would corrupt dedup. All ALTER DELETE statements in this test expect
+-- the NOT_IMPLEMENTED error.
 
 -- ===================================================================
 -- ALTER UPDATE: basic
@@ -69,9 +73,9 @@ SELECT id, value1, ver FROM unique_mutation_update_ver WHERE id = 3;
 DROP TABLE unique_mutation_update_ver;
 
 -- ===================================================================
--- ALTER DELETE: basic
+-- ALTER DELETE: not supported for UniqueMergeTree
 -- ===================================================================
-SELECT '--- alter delete: basic ---';
+SELECT '--- alter delete: not supported ---';
 
 DROP TABLE IF EXISTS unique_mutation_delete;
 
@@ -86,19 +90,15 @@ ORDER BY id;
 
 INSERT INTO unique_mutation_delete SELECT number, number FROM numbers(10);
 
-ALTER TABLE unique_mutation_delete DELETE WHERE id >= 8 SETTINGS mutations_sync = 2;
-SELECT * FROM unique_mutation_delete ORDER BY id;
-
--- Re-insert deleted keys — dedup state should allow them back
-INSERT INTO unique_mutation_delete VALUES (8, 888), (9, 999);
+ALTER TABLE unique_mutation_delete DELETE WHERE id >= 8 SETTINGS mutations_sync = 2; -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM unique_mutation_delete ORDER BY id;
 
 DROP TABLE unique_mutation_delete;
 
 -- ===================================================================
--- ALTER DELETE: with partition
+-- ALTER DELETE: with partition also not supported
 -- ===================================================================
-SELECT '--- alter delete: with partition ---';
+SELECT '--- alter delete: partition not supported ---';
 
 DROP TABLE IF EXISTS unique_mutation_delete_part;
 
@@ -116,11 +116,7 @@ ORDER BY id;
 INSERT INTO unique_mutation_delete_part VALUES ('2024-01-01', 1, 10), ('2024-01-01', 2, 20);
 INSERT INTO unique_mutation_delete_part VALUES ('2024-01-02', 3, 30), ('2024-01-02', 4, 40);
 
-ALTER TABLE unique_mutation_delete_part DELETE WHERE dt = '2024-01-01' SETTINGS mutations_sync = 2;
-SELECT * FROM unique_mutation_delete_part ORDER BY dt, id;
-
--- Re-insert into deleted partition
-INSERT INTO unique_mutation_delete_part VALUES ('2024-01-01', 1, 999), ('2024-01-01', 5, 50);
+ALTER TABLE unique_mutation_delete_part DELETE WHERE dt = '2024-01-01' SETTINGS mutations_sync = 2; -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM unique_mutation_delete_part ORDER BY dt, id;
 
 DROP TABLE unique_mutation_delete_part;
@@ -307,7 +303,7 @@ SELECT * FROM unique_mutation_index WHERE id = 0;
 DROP TABLE unique_mutation_index;
 
 -- ===================================================================
--- Multiple mutations in sequence
+-- Multiple mutations in sequence (DELETE is not supported)
 -- ===================================================================
 SELECT '--- multiple sequential mutations ---';
 
@@ -325,13 +321,9 @@ ORDER BY id;
 INSERT INTO unique_mutation_seq SELECT number, number FROM numbers(10);
 
 ALTER TABLE unique_mutation_seq UPDATE value = 100 WHERE id % 2 = 0 SETTINGS mutations_sync = 2;
-ALTER TABLE unique_mutation_seq DELETE WHERE id >= 7 SETTINGS mutations_sync = 2;
+ALTER TABLE unique_mutation_seq DELETE WHERE id >= 7 SETTINGS mutations_sync = 2; -- { serverError NOT_IMPLEMENTED }
 ALTER TABLE unique_mutation_seq ADD COLUMN extra UInt32 DEFAULT 0 SETTINGS mutations_sync = 2;
 
-SELECT * FROM unique_mutation_seq ORDER BY id;
-
--- Upsert after multiple mutations
-INSERT INTO unique_mutation_seq VALUES (8, 888, 1);
 SELECT * FROM unique_mutation_seq ORDER BY id;
 
 DROP TABLE unique_mutation_seq;

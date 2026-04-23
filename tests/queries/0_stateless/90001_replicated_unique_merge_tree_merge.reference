@@ -65,3 +65,29 @@
 7	7
 8	8
 9	9
+--- projection direct merge: delete bitmap ---
+--- r1 counts ---
+15
+15
+--- r2 counts ---
+15
+15
+--- r1 offset check ---
+1
+--- projection direct merge: different order ---
+--- r1 ---
+10
+10
+1
+--- r2 ---
+10
+10
+--- projection direct merge: versioned ---
+--- r1 ---
+10
+10
+5	5
+1
+--- r2 ---
+10
+10
