@@ -25,6 +25,9 @@ UniqueKVOffsetTranslateTransform::UniqueKVOffsetTranslateTransform(
 void UniqueKVOffsetTranslateTransform::transform(Chunk & chunk)
 {
     size_t num_rows = chunk.getNumRows();
+    if (num_rows == 0)
+        return;
+
     auto columns = chunk.detachColumns();
     columns[kv_pos] = columns[kv_pos]->convertToFullColumnIfSparse();
 

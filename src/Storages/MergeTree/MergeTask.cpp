@@ -1149,9 +1149,11 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::prepareProjectionsToMergeAndRe
         const bool is_special_projection = projection.with_parent_part_offset || projection.with_block_number || projection.with_block_offset;
         if (global_ctx->merge_may_reduce_rows && (mode != DeduplicateMergeProjectionMode::IGNORE || is_special_projection))
         {
-            /// For UniqueMergeTree, unique projection indexes use Direct Merge
-            /// with dedicated filtering/translation (UniqueKVOffsetTranslateTransform).
+            /// For UniqueMergeTree, unique projection indexes can use Direct Merge
+            /// with dedicated filtering/translation (UniqueKVOffsetTranslateTransform),
+            /// unless rows are being removed by TTL expiration.
             if (global_ctx->data->supportsUpsert()
+                && !ctx->need_remove_expired_values
                 && projection.index && projection.index->getName() == "unique")
             {
                 /// Fall through to collect projection parts and enter Direct Merge path.
