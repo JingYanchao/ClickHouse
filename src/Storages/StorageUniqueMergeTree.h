@@ -41,6 +41,10 @@ public:
 
     bool supportsTrivialCountOptimization(const StorageSnapshotPtr &, ContextPtr) const override { return false; }
 
+    bool supportsLightweightDelete() const override { return false; }
+
+    void checkMutationIsPossible(const MutationCommands & commands, const Settings & settings) const override;
+
     /// Override startup to rebuild delete marks BEFORE background tasks start.
     /// This ensures no merge/mutate can run until dedup state is fully restored.
     void startup() override;

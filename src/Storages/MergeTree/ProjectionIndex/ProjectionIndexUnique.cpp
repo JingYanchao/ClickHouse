@@ -276,10 +276,9 @@ void ProjectionIndexUnique::fillProjectionDescription(
         result.required_columns.push_back(version_column_name);
     }
 
-    /// 4. Mark that this projection uses _parent_part_offset.
-    ///    During merge, if merge_may_reduce_rows, the projection is rebuilt
-    ///    via `calculate`; otherwise it is merged via AggregatingSortedAlgorithm
-    ///    with max() aggregation, and offsets are translated via MergedPartOffsets.
+    /// 4. Mark that this projection embeds part_offset in SST values.
+    ///    During merge, MergedPartOffsets is used to translate these offsets
+    ///    to their positions in the merged data part.
     result.with_parent_part_offset = true;
 
     /// 5. Aggregate type: SortedStringKV uses SimpleAggregateFunction(max, ...)
@@ -287,7 +286,7 @@ void ProjectionIndexUnique::fillProjectionDescription(
     result.type = ProjectionDescription::Type::Aggregate;
     result.key_size = 1;
 
-    /// 6. Build metadata: columns, sorting key, primary key
+    /// 5. Build metadata: columns, sorting key, primary key
     StorageInMemoryMetadata metadata;
     metadata.partition_key = KeyDescription::buildEmptyKey();
 

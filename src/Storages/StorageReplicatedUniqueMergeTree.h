@@ -47,6 +47,16 @@ public:
 
     bool supportsTrivialCountOptimization(const StorageSnapshotPtr &, ContextPtr) const override { return false; }
 
+    /// Lightweight delete (DELETE FROM) and ALTER DELETE are not supported
+    /// for ReplicatedUniqueMergeTree. Row-level deletion must go through
+    /// UPSERT to keep the unique projection SST consistent — a lightweight
+    /// delete would only mask rows without updating the SST, so dedup would
+    /// still consider them present and incorrectly suppress newer versions
+    /// of those keys.
+    bool supportsLightweightDelete() const override { return false; }
+
+    void checkMutationIsPossible(const MutationCommands & commands, const Settings & settings) const override;
+
     /// DROP PART is not supported for ReplicatedUniqueMergeTree because
     /// dropping a single part would leave stale delete marks on other parts
     /// that reference the dropped part's keys, leading to incorrect query

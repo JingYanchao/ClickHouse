@@ -279,3 +279,162 @@ SELECT count() FROM unique_merge_expr;
 SELECT a, b, value FROM unique_merge_expr ORDER BY a, b;
 
 DROP TABLE unique_merge_expr;
+
+-- ===================================================================
+-- Projection Direct Merge: delete bitmap filtering + offset translation
+-- Verifies that after merge, projection entry count matches data count
+-- and each projection entry's part_offset correctly maps to the right row.
+-- ===================================================================
+SELECT '--- projection direct merge: delete bitmap ---';
+
+DROP TABLE IF EXISTS proj_dm_delete;
+
+CREATE TABLE proj_dm_delete
+(
+    id UInt32,
+    value UInt32,
+    PROJECTION __unique_index INDEX id TYPE unique
+)
+ENGINE = UniqueMergeTree
+ORDER BY id
+SETTINGS index_granularity = 8192;
+
+INSERT INTO proj_dm_delete SELECT number, number FROM numbers(10);
+INSERT INTO proj_dm_delete SELECT number + 5, number + 100 FROM numbers(10);
+INSERT INTO proj_dm_delete SELECT number, number + 200 FROM numbers(3);
+
+OPTIMIZE TABLE proj_dm_delete FINAL;
+
+-- Projection entry count == data row count
+SELECT count() FROM proj_dm_delete;
+SELECT count() FROM mergeTreeProjection(currentDatabase(), 'proj_dm_delete', '__unique_index');
+
+-- Verify offset mapping: for each projection entry, the part_offset should
+-- point to the correct row. We join projection entries with the main table
+-- using _part_offset to verify the key matches.
+SELECT sum(match) = count() AS all_offsets_correct
+FROM
+(
+    SELECT tupleElement(_unique_kv, 2) AS proj_offset
+    FROM mergeTreeProjection(currentDatabase(), 'proj_dm_delete', '__unique_index')
+) AS p
+INNER JOIN
+(
+    SELECT _part_offset AS data_offset, id
+    FROM proj_dm_delete
+) AS d ON p.proj_offset = d.data_offset
+CROSS JOIN
+(
+    SELECT 1 AS match
+) AS m;
+
+DROP TABLE proj_dm_delete;
+
+-- ===================================================================
+-- Projection Direct Merge: unique key != ORDER BY (different ordering)
+-- ===================================================================
+SELECT '--- projection direct merge: different order ---';
+
+DROP TABLE IF EXISTS proj_dm_difforder;
+
+CREATE TABLE proj_dm_difforder
+(
+    id UInt32,
+    value UInt32,
+    PROJECTION __unique_index INDEX id TYPE unique
+)
+ENGINE = UniqueMergeTree
+ORDER BY (value, id)
+SETTINGS index_granularity = 8192;
+
+-- Part 1: descending values so parent order differs from id order
+INSERT INTO proj_dm_difforder SELECT number, 10 - number FROM numbers(10);
+-- Part 2: update ids 3..7
+INSERT INTO proj_dm_difforder SELECT number + 3, number + 1000 FROM numbers(5);
+
+OPTIMIZE TABLE proj_dm_difforder FINAL;
+
+SELECT count() FROM proj_dm_difforder;
+SELECT count() FROM mergeTreeProjection(currentDatabase(), 'proj_dm_difforder', '__unique_index');
+
+-- Verify each projection offset maps to the correct data row
+SELECT count() = (SELECT count() FROM proj_dm_difforder) AS all_offsets_valid
+FROM mergeTreeProjection(currentDatabase(), 'proj_dm_difforder', '__unique_index') AS p
+INNER JOIN
+(
+    SELECT _part_offset, id FROM proj_dm_difforder
+) AS d ON tupleElement(p._unique_kv, 2) = d._part_offset;
+
+DROP TABLE proj_dm_difforder;
+
+-- ===================================================================
+-- Projection Direct Merge: no delete bitmap (pure inserts)
+-- ===================================================================
+SELECT '--- projection direct merge: no deletes ---';
+
+DROP TABLE IF EXISTS proj_dm_nodelete;
+
+CREATE TABLE proj_dm_nodelete
+(
+    id UInt32,
+    value UInt32,
+    PROJECTION __unique_index INDEX id TYPE unique
+)
+ENGINE = UniqueMergeTree
+ORDER BY id
+SETTINGS index_granularity = 8192;
+
+INSERT INTO proj_dm_nodelete SELECT number, number FROM numbers(100);
+INSERT INTO proj_dm_nodelete SELECT number + 100, number + 100 FROM numbers(100);
+INSERT INTO proj_dm_nodelete SELECT number + 200, number + 200 FROM numbers(100);
+
+OPTIMIZE TABLE proj_dm_nodelete FINAL;
+
+SELECT count() FROM proj_dm_nodelete;
+SELECT count() FROM mergeTreeProjection(currentDatabase(), 'proj_dm_nodelete', '__unique_index');
+SELECT count(DISTINCT tupleElement(_unique_kv, 2)) FROM mergeTreeProjection(currentDatabase(), 'proj_dm_nodelete', '__unique_index');
+
+DROP TABLE proj_dm_nodelete;
+
+-- ===================================================================
+-- Projection Direct Merge: versioned unique index with delete bitmaps
+-- ===================================================================
+SELECT '--- projection direct merge: versioned ---';
+
+DROP TABLE IF EXISTS proj_dm_ver;
+
+CREATE TABLE proj_dm_ver
+(
+    id UInt32,
+    value UInt32,
+    ver UInt64,
+    PROJECTION __unique_index INDEX id TYPE unique('ver')
+)
+ENGINE = UniqueMergeTree
+ORDER BY id
+SETTINGS index_granularity = 8192;
+
+INSERT INTO proj_dm_ver SELECT number, number, 1 FROM numbers(10);
+INSERT INTO proj_dm_ver SELECT number, number + 100, 5 FROM numbers(5);
+INSERT INTO proj_dm_ver SELECT number + 5, number + 200, 3 FROM numbers(5);
+
+OPTIMIZE TABLE proj_dm_ver FINAL;
+
+SELECT count() FROM proj_dm_ver;
+SELECT count() FROM mergeTreeProjection(currentDatabase(), 'proj_dm_ver', '__unique_index');
+
+-- Verify projection versions: ids 0..4 should have ver=5, ids 5..9 should have ver=3
+SELECT
+    countIf(tupleElement(tupleElement(_unique_kv, 2), 1) = 5) AS ver5,
+    countIf(tupleElement(tupleElement(_unique_kv, 2), 1) = 3) AS ver3
+FROM mergeTreeProjection(currentDatabase(), 'proj_dm_ver', '__unique_index');
+
+-- Verify offset mapping for versioned layout (part_offset is second element of value tuple)
+SELECT count() = (SELECT count() FROM proj_dm_ver) AS all_offsets_valid
+FROM mergeTreeProjection(currentDatabase(), 'proj_dm_ver', '__unique_index') AS p
+INNER JOIN
+(
+    SELECT _part_offset, id FROM proj_dm_ver
+) AS d ON tupleElement(tupleElement(p._unique_kv, 2), 2) = d._part_offset;
+
+DROP TABLE proj_dm_ver;

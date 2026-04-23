@@ -4,6 +4,7 @@
 #include <Storages/MergeTree/MergeTreeDedupPartManager.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/MergeTree/ProjectionIndex/ProjectionIndexUnique.h>
+#include <Storages/MutationCommands.h>
 #include <Storages/ProjectionsDescription.h>
 #include <Common/logger_useful.h>
 
@@ -119,5 +120,18 @@ void StorageReplicatedUniqueMergeTree::movePartitionToTable(
     throw Exception(ErrorCodes::NOT_IMPLEMENTED,
         "MOVE PARTITION TO TABLE is not supported for ReplicatedUniqueMergeTree. "
         "The operation bypasses the dedup commit hook and would produce incorrect results");
+}
+
+void StorageReplicatedUniqueMergeTree::checkMutationIsPossible(const MutationCommands & commands, const Settings & settings) const
+{
+    StorageReplicatedMergeTree::checkMutationIsPossible(commands, settings);
+
+    for (const auto & command : commands)
+    {
+        if (command.type == MutationCommand::DELETE)
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                "ALTER DELETE is not supported for ReplicatedUniqueMergeTree. "
+                "Row-level deletion bypasses the unique projection SST and would corrupt dedup");
+    }
 }
 }

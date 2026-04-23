@@ -4,6 +4,7 @@
 #include <Storages/MergeTree/MergeTreeDedupPartManager.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/MergeTree/ProjectionIndex/ProjectionIndexUnique.h>
+#include <Storages/MutationCommands.h>
 #include <Storages/ProjectionsDescription.h>
 #include <Common/logger_useful.h>
 
@@ -13,6 +14,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
+    extern const int NOT_IMPLEMENTED;
 }
 
 /// Validate that the named unique projection exists in metadata and has the correct type.
@@ -97,6 +99,19 @@ void StorageUniqueMergeTree::startup()
     LOG_INFO(log, "Delete bitmaps checked/rebuilt for all active parts, starting background tasks");
 
     StorageMergeTree::startup();
+}
+
+void StorageUniqueMergeTree::checkMutationIsPossible(const MutationCommands & commands, const Settings & settings) const
+{
+    StorageMergeTree::checkMutationIsPossible(commands, settings);
+
+    for (const auto & command : commands)
+    {
+        if (command.type == MutationCommand::DELETE)
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                "ALTER DELETE is not supported for UniqueMergeTree. "
+                "Row-level deletion bypasses the unique projection SST and would corrupt dedup");
+    }
 }
 
 }

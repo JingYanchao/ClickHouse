@@ -1149,8 +1149,18 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::prepareProjectionsToMergeAndRe
         const bool is_special_projection = projection.with_parent_part_offset || projection.with_block_number || projection.with_block_offset;
         if (global_ctx->merge_may_reduce_rows && (mode != DeduplicateMergeProjectionMode::IGNORE || is_special_projection))
         {
-            global_ctx->projections_to_rebuild.push_back(&projection);
-            continue;
+            /// For UniqueMergeTree, unique projection indexes use Direct Merge
+            /// with dedicated filtering/translation (UniqueKVOffsetTranslateTransform).
+            if (global_ctx->data->supportsUpsert()
+                && projection.index && projection.index->getName() == "unique")
+            {
+                /// Fall through to collect projection parts and enter Direct Merge path.
+            }
+            else
+            {
+                global_ctx->projections_to_rebuild.push_back(&projection);
+                continue;
+            }
         }
         else if (some_source_column_expired && mode != DeduplicateMergeProjectionMode::IGNORE)
         {
@@ -1850,6 +1860,12 @@ bool MergeTask::MergeProjectionsStage::prepareProjections() const
             global_ctx->mutator,
             global_ctx->merges_blocker,
             global_ctx->ttl_merges_blocker));
+
+        /// Pass parent parts' delete bitmap snapshots to the projection merge sub-task.
+        /// The bitmaps are keyed by parent part name. UniqueKVOffsetTranslateTransform
+        /// looks up the bitmap using the projection part's parent part name.
+        if (!global_ctx->delete_bitmap_snapshots.empty())
+            ctx->tasks_for_projections.back()->setDeleteBitmapSnapshots(global_ctx->delete_bitmap_snapshots);
     }
 
     /// merge projections with _part_offset first so that we can release offset mapping earlier.
@@ -2753,8 +2769,7 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::createMergedStream() const
         }
     }
 
-    if (!global_ctx->merge_may_reduce_rows
-        && !global_ctx->text_indexes_to_merge.empty()
+    if ((!global_ctx->merge_may_reduce_rows || global_ctx->data->supportsUpsert()) && !global_ctx->text_indexes_to_merge.empty()
         && (!global_ctx->merged_part_offsets || !global_ctx->merged_part_offsets->isMappingEnabled()))
     {
         global_ctx->merged_part_offsets = std::make_shared<MergedPartOffsets>(global_ctx->future_part->parts.size(), MergedPartOffsets::MappingMode::Enabled);

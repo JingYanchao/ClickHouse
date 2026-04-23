@@ -5,6 +5,7 @@
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/MergeTree/MergeTreeVirtualColumns.h>
 #include <Processors/Transforms/FilterTransform.h>
+#include <Processors/Transforms/UniqueKVOffsetTranslateTransform.h>
 #include <Processors/QueryPlan/ISourceStep.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include <QueryPipeline/Pipe.h>
@@ -23,6 +24,7 @@
 #include <Storages/MergeTree/MergedPartOffsets.h>
 #include <Storages/MergeTree/checkDataPart.h>
 #include <Storages/MergeTree/ProjectionIndex/ProjectionIndexUnique.h>
+#include <Storages/MergeTree/MergeTreeIndexReadResultPool.h>
 #include <Columns/ColumnTuple.h>
 #include <Common/ThrottlerArray.h>
 
@@ -249,40 +251,12 @@ try
 
         /// When `merged_part_offsets` is set we need to adjust parent-part offsets
         /// in projection columns because merge may reorder rows.
-        /// `_parent_part_offset` is a plain UInt64; `_unique_kv` stores part_offset in its
-        /// value sub-column (either UInt64 for non-versioned, or Tuple(version, part_offset)
-        /// for versioned mode — only the part_offset element needs translation).
-        static const std::unordered_set<String> offset_columns = {"_parent_part_offset", ProjectionIndexUnique::kv_column_name};
         if (read_task_info->merged_part_offsets && read_task_info->data_part->isProjectionPart()
-            && offset_columns.contains(name))
+            && name == "_parent_part_offset")
         {
             chassert(read_task_info->merged_part_offsets->isFinalized());
             result_column = result_column->convertToFullColumnIfSparse();
-            std::span<UInt64> offset_data;
-            if (name == "_parent_part_offset")
-            {
-                offset_data = assert_cast<ColumnUInt64 &>(result_column->assumeMutableRef()).getData();
-            }
-            else if (name == ProjectionIndexUnique::kv_column_name)
-            {
-                /// The outer Tuple is (key: String, value: ...).
-                /// `value` is either:
-                ///   - ColumnUInt64                       (non-versioned: part_offset)
-                ///   - ColumnTuple(UInt64, UInt64)        (versioned:    (version, part_offset))
-                /// Only the part_offset sub-column needs offset translation.
-                auto & outer_tuple = assert_cast<ColumnTuple &>(result_column->assumeMutableRef());
-                auto & value_col = outer_tuple.getColumn(1).assumeMutableRef();
-                if (const auto * inner_tuple = typeid_cast<ColumnTuple *>(&value_col))
-                {
-                    /// Versioned layout: Tuple(version, part_offset) — translate part_offset only (index 1).
-                    offset_data = assert_cast<ColumnUInt64 &>(inner_tuple->getColumn(1).assumeMutableRef()).getData();
-                }
-                else
-                {
-                    /// Non-versioned layout: plain UInt64 part_offset.
-                    offset_data = assert_cast<ColumnUInt64 &>(value_col).getData();
-                }
-            }
+            auto & offset_data = assert_cast<ColumnUInt64 &>(result_column->assumeMutableRef()).getData();
 
             if (read_task_info->merged_part_offsets->isMappingEnabled())
             {
@@ -351,9 +325,20 @@ Pipe createMergeTreeSequentialSource(
     info->const_virtual_fields.emplace("_part_index", info->part_index_in_query);
     info->const_virtual_fields.emplace("_part_starting_offset", info->part_starting_offset_in_query);
 
-    /// The part might have some rows masked by lightweight deletes
+    /// Check if this is a unique projection part that needs custom filtering/translation
+    /// instead of the normal _row_exists path.
+    const bool is_unique_projection_merge =
+        info->data_part->isProjectionPart()
+        && info->merged_part_offsets
+        && std::ranges::find(columns_to_read, String(ProjectionIndexUnique::kv_column_name)) != columns_to_read.end();
+
+    /// The part might have some rows masked by lightweight deletes.
+    /// For unique projection parts, we skip the _row_exists filter entirely —
+    /// filtering is done by UniqueKVOffsetTranslateTransform based on the
+    /// parent part's delete bitmap and the SST value's embedded part_offset.
     bool has_lightweight_delete = info->data_part->hasLightweightDelete() || info->alter_conversions->hasLightweightDelete();
-    const bool need_to_filter_deleted_rows = apply_deleted_mask && has_lightweight_delete && !info->data_part->info.isPatch();
+    const bool need_to_filter_deleted_rows = apply_deleted_mask && has_lightweight_delete
+        && !info->data_part->info.isPatch() && !is_unique_projection_merge;
     const bool has_filter_column = std::ranges::find(columns_to_read, RowExistsColumn::name) != columns_to_read.end();
 
     if (need_to_filter_deleted_rows)
@@ -363,6 +348,8 @@ Pipe createMergeTreeSequentialSource(
 
         info->mutation_steps.push_back(createLightweightDeleteStep(!has_filter_column));
     }
+
+    auto saved_info_for_unique_projection_transform = is_unique_projection_merge ? info : nullptr;
 
     auto result_header = std::make_shared<const Block>(storage_snapshot->getSampleBlockForColumns(columns_to_read));
     LoadedMergeTreeDataPartInfoForReader info_for_reader(info->data_part, info->alter_conversions);
@@ -406,6 +393,29 @@ Pipe createMergeTreeSequentialSource(
             return std::make_shared<FilterTransform>(
                 header, nullptr, RowExistsColumn::name, !has_filter_column, false, filtered_rows_count);
         });
+    }
+
+    /// For unique projection parts: filter stale entries by checking the embedded
+    /// part_offset against the parent part's delete bitmap, and translate surviving
+    /// offsets via MergedPartOffsets.
+    if (is_unique_projection_merge)
+    {
+        DeleteBitmapPtr part_delete_bitmap;
+        if (storage_snapshot->data)
+        {
+            const auto & snapshot_data = assert_cast<const MergeTreeData::SnapshotData &>(*storage_snapshot->data);
+            auto it = snapshot_data.delete_bitmap_buffer_map.find(saved_info_for_unique_projection_transform->data_part->getParentPartName());
+            if (it != snapshot_data.delete_bitmap_buffer_map.end())
+                part_delete_bitmap = it->second;
+        }
+
+        pipe.addSimpleTransform(
+            [task_info = std::move(saved_info_for_unique_projection_transform), bitmap = std::move(part_delete_bitmap)](const SharedHeader & header)
+            {
+                return std::make_shared<UniqueKVOffsetTranslateTransform>(
+                    *header, task_info->merged_part_offsets, task_info->part_index_in_query,
+                    task_info->part_starting_offset_in_query, bitmap);
+            });
     }
 
     return pipe;
