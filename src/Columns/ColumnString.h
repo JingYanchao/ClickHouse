@@ -214,7 +214,7 @@ public:
     ALWAYS_INLINE char * serializeValueIntoMemory(size_t n, char * memory, const IColumn::SerializationSettings * settings) const override;
 
     ALWAYS_INLINE char * serializeValueIntoMemoryAsComparableRowFormat(size_t n, char * memory) const override;
-    size_t computeComparableRowFormatSize() const override;
+    size_t collectComparableSerializedValueSize() const override;
     bool supportsSerializeValueIntoMemoryAsComparable() const override
     {
         return true;

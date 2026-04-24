@@ -354,7 +354,7 @@ public:
     }
 
     char * serializeValueIntoMemoryAsComparableRowFormat(size_t n, char * memory) const override;
-    size_t computeComparableRowFormatSize() const override;
+    size_t collectComparableSerializedValueSize() const override;
     bool supportsSerializeValueIntoMemoryAsComparable() const override
     {
         return std::is_integral_v<T>

@@ -196,9 +196,9 @@ char * IColumn::serializeValueIntoMemoryAsComparableRowFormat(size_t /* n */, ch
     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method serializeValueIntoMemoryAsComparableRowFormat is not supported for {}", getName());
 }
 
-size_t IColumn::computeComparableRowFormatSize() const
+size_t IColumn::collectComparableSerializedValueSize() const
 {
-    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method computeComparableRowFormatSize is not supported for {}", getName());
+    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method collectComparableSerializedValueSize is not supported for {}", getName());
 }
 
 std::string_view IColumn::serializeValueIntoArenaWithNull(

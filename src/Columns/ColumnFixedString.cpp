@@ -572,7 +572,7 @@ char * ColumnFixedString::serializeValueIntoMemoryAsComparableRowFormat(size_t r
     return memory + n;
 }
 
-size_t ColumnFixedString::computeComparableRowFormatSize() const
+size_t ColumnFixedString::collectComparableSerializedValueSize() const
 {
     return n * size();
 }

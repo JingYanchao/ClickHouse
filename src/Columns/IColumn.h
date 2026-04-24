@@ -367,7 +367,7 @@ public:
     /// Serialize the value of n-th element into memory, in a format that is comparable in byte-wise.
     virtual char * serializeValueIntoMemoryAsComparableRowFormat(size_t /* n */, char * /* memory */) const;
 
-    virtual size_t computeComparableRowFormatSize() const;
+    virtual size_t collectComparableSerializedValueSize() const;
 
     virtual bool supportsSerializeValueIntoMemoryAsComparable() const
     {

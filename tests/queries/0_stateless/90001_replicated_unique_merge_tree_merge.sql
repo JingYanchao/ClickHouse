@@ -259,3 +259,70 @@ SELECT count() FROM mergeTreeProjection(currentDatabase(), 'repl_proj_dm_ver_r2'
 
 DROP TABLE repl_proj_dm_ver_r1;
 DROP TABLE repl_proj_dm_ver_r2;
+
+-- ===================================================================
+-- Projection Direct Merge: versioned + different ordering + delete bitmap
+-- unique key = id, ORDER BY = (value, id), version column = ver
+-- ===================================================================
+SELECT '--- projection direct merge: versioned different order ---';
+
+DROP TABLE IF EXISTS repl_proj_dm_verdiff_r1;
+DROP TABLE IF EXISTS repl_proj_dm_verdiff_r2;
+
+CREATE TABLE repl_proj_dm_verdiff_r1
+(
+    id UInt32,
+    value UInt32,
+    ver UInt64,
+    PROJECTION __unique_index INDEX id TYPE unique('ver')
+)
+ENGINE = ReplicatedUniqueMergeTree('/clickhouse/tables/{database}/test_90001/repl_proj_dm_verdiff', '1')
+ORDER BY (value, id);
+
+CREATE TABLE repl_proj_dm_verdiff_r2
+(
+    id UInt32,
+    value UInt32,
+    ver UInt64,
+    PROJECTION __unique_index INDEX id TYPE unique('ver')
+)
+ENGINE = ReplicatedUniqueMergeTree('/clickhouse/tables/{database}/test_90001/repl_proj_dm_verdiff', '2')
+ORDER BY (value, id);
+
+-- Part 1: ids 0..9 with descending values, ver=1
+INSERT INTO repl_proj_dm_verdiff_r1 SELECT number, 100 - number, 1 FROM numbers(10);
+-- Part 2: update ids 0..4 with ver=5 (higher version, should win)
+INSERT INTO repl_proj_dm_verdiff_r1 SELECT number, number + 500, 5 FROM numbers(5);
+-- Part 3: update ids 5..9 with ver=3
+INSERT INTO repl_proj_dm_verdiff_r1 SELECT number + 5, number + 600, 3 FROM numbers(5);
+-- Part 4: update ids 2..6 with ver=2 (lower than part 2/3, should NOT win)
+INSERT INTO repl_proj_dm_verdiff_r1 SELECT number + 2, number + 700, 2 FROM numbers(5);
+
+OPTIMIZE TABLE repl_proj_dm_verdiff_r1 FINAL;
+SYSTEM SYNC REPLICA repl_proj_dm_verdiff_r2;
+
+-- Data check on r1
+SELECT '--- r1 data ---';
+SELECT count() FROM repl_proj_dm_verdiff_r1;
+SELECT id, value, ver FROM repl_proj_dm_verdiff_r1 ORDER BY id;
+
+-- Projection count and version check on r1
+SELECT '--- r1 projection ---';
+SELECT count() FROM mergeTreeProjection(currentDatabase(), 'repl_proj_dm_verdiff_r1', '__unique_index');
+
+SELECT
+    countIf(tupleElement(tupleElement(_unique_kv, 2), 1) = 5) AS ver5,
+    countIf(tupleElement(tupleElement(_unique_kv, 2), 1) = 3) AS ver3,
+    countIf(tupleElement(tupleElement(_unique_kv, 2), 1) NOT IN (3, 5)) AS ver_other
+FROM mergeTreeProjection(currentDatabase(), 'repl_proj_dm_verdiff_r1', '__unique_index');
+
+SELECT count() = count(DISTINCT tupleElement(tupleElement(_unique_kv, 2), 2)) AS all_offsets_distinct
+FROM mergeTreeProjection(currentDatabase(), 'repl_proj_dm_verdiff_r1', '__unique_index');
+
+-- r2 should have the same counts
+SELECT '--- r2 ---';
+SELECT count() FROM repl_proj_dm_verdiff_r2;
+SELECT count() FROM mergeTreeProjection(currentDatabase(), 'repl_proj_dm_verdiff_r2', '__unique_index');
+
+DROP TABLE repl_proj_dm_verdiff_r1;
+DROP TABLE repl_proj_dm_verdiff_r2;

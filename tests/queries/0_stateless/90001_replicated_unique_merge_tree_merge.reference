@@ -91,3 +91,23 @@
 --- r2 ---
 10
 10
+--- projection direct merge: versioned different order ---
+--- r1 data ---
+10
+0	500	5
+1	501	5
+2	502	5
+3	503	5
+4	504	5
+5	600	3
+6	601	3
+7	602	3
+8	603	3
+9	604	3
+--- r1 projection ---
+10
+5	5	0
+1
+--- r2 ---
+10
+10

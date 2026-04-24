@@ -390,7 +390,7 @@ char * ColumnString::serializeValueIntoMemoryAsComparableRowFormat(size_t n, cha
     return memory;
 }
 
-size_t ColumnString::computeComparableRowFormatSize() const
+size_t ColumnString::collectComparableSerializedValueSize() const
 {
     if (size() == 0)
         return 0;

@@ -415,3 +415,58 @@ SELECT count() = count(DISTINCT tupleElement(tupleElement(_unique_kv, 2), 2)) AS
 FROM mergeTreeProjection(currentDatabase(), 'proj_dm_ver', '__unique_index');
 
 DROP TABLE proj_dm_ver;
+
+-- ===================================================================
+-- Projection Direct Merge: versioned + different ordering + delete bitmap
+-- unique key = id, ORDER BY = (value, id), version column = ver
+-- Verifies that after merge with delete bitmaps, the SST retains entries
+-- with the highest version, and offsets correctly map to the merged part.
+-- ===================================================================
+SELECT '--- projection direct merge: versioned different order ---';
+
+DROP TABLE IF EXISTS proj_dm_ver_difforder;
+
+CREATE TABLE proj_dm_ver_difforder
+(
+    id UInt32,
+    value UInt32,
+    ver UInt64,
+    PROJECTION __unique_index INDEX id TYPE unique('ver')
+)
+ENGINE = UniqueMergeTree
+ORDER BY (value, id)
+SETTINGS index_granularity = 8192;
+
+-- Part 1: ids 0..9 with descending values, ver=1
+INSERT INTO proj_dm_ver_difforder SELECT number, 100 - number, 1 FROM numbers(10);
+
+-- Part 2: update ids 0..4 with ver=5 (higher version, should win)
+INSERT INTO proj_dm_ver_difforder SELECT number, number + 500, 5 FROM numbers(5);
+
+-- Part 3: update ids 5..9 with ver=3
+INSERT INTO proj_dm_ver_difforder SELECT number + 5, number + 600, 3 FROM numbers(5);
+
+-- Part 4: update ids 2..6 with ver=2 (lower than part 2/3, should NOT win)
+INSERT INTO proj_dm_ver_difforder SELECT number + 2, number + 700, 2 FROM numbers(5);
+
+OPTIMIZE TABLE proj_dm_ver_difforder FINAL;
+
+-- Data check: ids 0..4 should have ver=5, ids 5..9 should have ver=3
+SELECT count() FROM proj_dm_ver_difforder;
+SELECT id, value, ver FROM proj_dm_ver_difforder ORDER BY id;
+
+-- Projection count must match data count
+SELECT count() FROM mergeTreeProjection(currentDatabase(), 'proj_dm_ver_difforder', '__unique_index');
+
+-- Verify versions in projection: ids 0..4 ver=5, ids 5..9 ver=3
+SELECT
+    countIf(tupleElement(tupleElement(_unique_kv, 2), 1) = 5) AS ver5,
+    countIf(tupleElement(tupleElement(_unique_kv, 2), 1) = 3) AS ver3,
+    countIf(tupleElement(tupleElement(_unique_kv, 2), 1) NOT IN (3, 5)) AS ver_other
+FROM mergeTreeProjection(currentDatabase(), 'proj_dm_ver_difforder', '__unique_index');
+
+-- Verify all offsets are distinct
+SELECT count() = count(DISTINCT tupleElement(tupleElement(_unique_kv, 2), 2)) AS all_offsets_distinct
+FROM mergeTreeProjection(currentDatabase(), 'proj_dm_ver_difforder', '__unique_index');
+
+DROP TABLE proj_dm_ver_difforder;

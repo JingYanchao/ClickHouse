@@ -230,7 +230,7 @@ public:
     std::span<char> insertRawUninitialized(size_t count) override;
 
     ALWAYS_INLINE char * serializeValueIntoMemoryAsComparableRowFormat(size_t row, char * memory) const override;
-    size_t computeComparableRowFormatSize() const override;
+    size_t collectComparableSerializedValueSize() const override;
     bool supportsSerializeValueIntoMemoryAsComparable() const override
     {
         return true;

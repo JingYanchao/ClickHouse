@@ -9,7 +9,6 @@
 #include <DataTypes/DataTypeFactory.h>
 #include <DataTypes/IDataType.h>
 #include <Interpreters/ExpressionActions.h>
-#include <Interpreters/ExpressionAnalyzer.h>
 #include <Interpreters/TreeRewriter.h>
 #include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTFunction.h>
@@ -54,7 +53,7 @@ static ColumnString::MutablePtr serializeAllKeysIntoColumn(
     for (size_t c = 0; c < key_col_ptrs.size(); ++c)
     {
         if (col_comparable[c])
-            comparable_total += key_col_ptrs[c]->computeComparableRowFormatSize();
+            comparable_total += key_col_ptrs[c]->collectComparableSerializedValueSize();
         else
             key_col_ptrs[c]->collectSerializedValueSizes(key_sizes, nullptr, nullptr);
     }
@@ -193,38 +192,35 @@ void ProjectionIndexUnique::fillProjectionDescription(
 {
     chassert(result.index.get() == this);
 
-    /// Compile the key expression list into a fully resolved KeyDescription,
-    /// similar to how skip-index does it in `IndexDescription::initExpressionInfo`:
-    /// analyze with TreeRewriter, then build ExpressionActions via ExpressionAnalyzer.
+    /// Convert the INDEX expression list AST into a format compatible with
+    /// KeyDescription::getKeyFromAST. The parser produces ASTExpressionList
+    /// (comma-separated: INDEX a, b, c), while getKeyFromAST expects either
+    /// a single expression or a tuple(...) function (like ORDER BY (a, b, c)).
+    ASTPtr key_ast;
+    if (index_expr->children.size() == 1)
+        key_ast = index_expr->children[0]->clone();
+    else
     {
-        auto expr_list = index_expr->clone();
-        auto all_columns = columns.get(GetColumnsOptions(GetColumnsOptions::Kind::AllPhysical).withSubcolumns());
+        auto tuple_func = make_intrusive<ASTFunction>();
+        tuple_func->name = "tuple";
+        tuple_func->arguments = make_intrusive<ASTExpressionList>();
+        tuple_func->children.push_back(tuple_func->arguments);
+        for (const auto & child : index_expr->children)
+            tuple_func->arguments->children.push_back(child->clone());
+        key_ast = std::move(tuple_func);
+    }
 
-        /// Translate `UNKNOWN_IDENTIFIER` to `NO_SUCH_COLUMN_IN_TABLE` so that
-        /// `AlterCommands::apply` correctly rejects DROP/RENAME of referenced columns.
-        TreeRewriterResultPtr syntax;
-        try
-        {
-            syntax = TreeRewriter(query_context).analyze(expr_list, all_columns);
-        }
-        catch (const Exception & e)
-        {
-            if (e.code() == ErrorCodes::UNKNOWN_IDENTIFIER)
-                throw Exception(ErrorCodes::NO_SUCH_COLUMN_IN_TABLE, "{}", e.message());
-            throw;
-        }
-
-        unique_key_desc.expression = ExpressionAnalyzer(expr_list, syntax, query_context).getActions(false);
-        auto sample = ExpressionAnalyzer(expr_list, syntax, query_context).getActions(true)->getSampleBlock();
-
-        unique_key_desc.column_names.clear();
-        unique_key_desc.data_types.clear();
-        unique_key_desc.sample_block = sample;
-        for (size_t i = 0; i < sample.columns(); ++i)
-        {
-            unique_key_desc.column_names.push_back(sample.getByPosition(i).name);
-            unique_key_desc.data_types.push_back(sample.getByPosition(i).type);
-        }
+    try
+    {
+        unique_key_desc = KeyDescription::getKeyFromAST(key_ast, columns, query_context);
+    }
+    catch (const Exception & e)
+    {
+        /// Translate UNKNOWN_IDENTIFIER to NO_SUCH_COLUMN_IN_TABLE so that
+        /// AlterCommands::apply correctly rejects DROP/RENAME of referenced columns.
+        if (e.code() == ErrorCodes::UNKNOWN_IDENTIFIER)
+            throw Exception(ErrorCodes::NO_SUCH_COLUMN_IN_TABLE, "{}", e.message());
+        throw;
     }
 
     Names unique_key_source_columns = unique_key_desc.expression->getRequiredColumns();
@@ -350,16 +346,16 @@ Block ProjectionIndexUnique::calculate(
     /// format in the unique index SST keys regardless of
     /// ratio_of_defaults_for_sparse_serialization setting.
     Columns key_columns_holder;
-    key_columns_holder.reserve(unique_key_desc.column_names.size());
-    for (const auto & col_name : unique_key_desc.column_names)
-        key_columns_holder.push_back(key_block.getByName(col_name).column->convertToFullColumnIfSparse());
-
     std::vector<const IColumn *> key_col_ptrs;
-    key_col_ptrs.reserve(key_columns_holder.size());
-    for (const auto & col : key_columns_holder)
-        key_col_ptrs.push_back(col.get());
+    key_columns_holder.reserve(unique_key_desc.column_names.size());
+    key_col_ptrs.reserve(unique_key_desc.column_names.size());
+    for (const auto & col_name : unique_key_desc.column_names)
+    {
+        key_columns_holder.push_back(key_block.getByName(col_name).column->convertToFullColumnIfSparse());
+        key_col_ptrs.push_back(key_columns_holder.back().get());
+    }
 
-    auto serialized_keys = serializeAllKeysIntoColumn(key_col_ptrs, num_rows);
+    ColumnPtr serialized_keys = serializeAllKeysIntoColumn(key_col_ptrs, num_rows);
 
     const ColumnUInt64 * version_col = nullptr;
     if (with_version)
@@ -378,17 +374,17 @@ Block ProjectionIndexUnique::calculate(
     }
 
     /// Sort by serialized key to group identical keys together.
-    std::vector<size_t> indices(num_rows);
+    IColumn::Permutation indices(num_rows);
     std::iota(indices.begin(), indices.end(), 0);
 
     ::pdqsort(
         indices.begin(), indices.end(), [&](size_t a, size_t b) { return serialized_keys->getDataAt(a) < serialized_keys->getDataAt(b); });
+    serialized_keys = serialized_keys->permute(indices, 0);
 
     /// Deduplicate: for each group of identical keys, keep the row with
     /// the largest version (or largest part_offset as tiebreaker).
-    auto key_column = ColumnString::create();
-    key_column->reserve(num_rows);
-
+    /// Build a filter bitmap on the sorted column and collect winner row
+    /// indices for writing values.
     const auto & sample = projection_desc.sample_block;
     chassert(sample.columns() == 1);
     const auto & sample_tuple = assert_cast<const ColumnTuple &>(*sample.getByPosition(0).column);
@@ -403,39 +399,53 @@ Block ProjectionIndexUnique::calculate(
         return starting_offset + row_idx;
     };
 
+    IColumn::Filter keep_filter(num_rows, 0);
+    size_t unique_key_count = 0;
+
     auto dedup_and_write = [&]<ValueType V>()
     {
         using Entry = typename ValueTraits<V>::Entry;
-        size_t last_max_key_idx = indices[0];
+        size_t last_max_key_block_offset = indices[0];
+        size_t last_max_key_idx = 0;
         for (size_t i = 1; i <= indices.size(); ++i)
         {
-            if (i == indices.size() || serialized_keys->getDataAt(indices[i]) != serialized_keys->getDataAt(last_max_key_idx))
+            if (i == indices.size() || serialized_keys->getDataAt(i) != serialized_keys->getDataAt(last_max_key_idx))
             {
-                key_column->insertFrom(*serialized_keys, last_max_key_idx);
+                keep_filter[last_max_key_idx] = 1;
+                ++unique_key_count;
 
                 Entry entry;
                 if constexpr (ValueTraits<V>::has_version)
-                    entry.version = ver_data[last_max_key_idx];
-                entry.part_offset = get_part_offset(last_max_key_idx);
+                    entry.version = ver_data[last_max_key_block_offset];
+                entry.part_offset = get_part_offset(last_max_key_block_offset);
                 ValueTraits<V>::writeEntry(*value_column_mut, entry);
 
                 if (i < indices.size())
-                    last_max_key_idx = indices[i];
+                {
+                    last_max_key_block_offset = indices[i];
+                    last_max_key_idx = i;
+                }
             }
             else
             {
-                const size_t cur_idx = indices[i];
+                const size_t cur_block_offset = indices[i];
                 if constexpr (ValueTraits<V>::has_version)
                 {
-                    if (ver_data[cur_idx] > ver_data[last_max_key_idx]
-                        || (ver_data[cur_idx] == ver_data[last_max_key_idx]
-                            && get_part_offset(cur_idx) > get_part_offset(last_max_key_idx)))
-                        last_max_key_idx = cur_idx;
+                    if (ver_data[cur_block_offset] > ver_data[last_max_key_block_offset]
+                        || (ver_data[cur_block_offset] == ver_data[last_max_key_block_offset]
+                            && get_part_offset(cur_block_offset) > get_part_offset(last_max_key_block_offset)))
+                    {
+                        last_max_key_block_offset = cur_block_offset;
+                        last_max_key_idx = i;
+                    }
                 }
                 else
                 {
-                    if (get_part_offset(cur_idx) > get_part_offset(last_max_key_idx))
-                        last_max_key_idx = cur_idx;
+                    if (get_part_offset(cur_block_offset) > get_part_offset(last_max_key_block_offset))
+                    {
+                        last_max_key_block_offset = cur_block_offset;
+                        last_max_key_idx = i;
+                    }
                 }
             }
         }
@@ -446,6 +456,7 @@ Block ProjectionIndexUnique::calculate(
     else
         dedup_and_write.template operator()<ValueType::PartOffset>();
 
+    auto key_column = serialized_keys->filter(keep_filter, unique_key_count);
     auto tuple_column = ColumnTuple::create(Columns{std::move(key_column), std::move(value_column_mut)});
 
     Block result;
@@ -460,7 +471,6 @@ std::shared_ptr<MergeTreeSettings> ProjectionIndexUnique::getDefaultSettings() c
     settings->set("allow_tuple_element_aggregation", true);
 
     /// TODO: compact part deserialization performance is poor.
-    /// Set `min_bytes_for_wide_part` to 0 to force compact parts.
     settings->set("min_bytes_for_wide_part", Field(UInt64(0)));
     return settings;
 }

@@ -402,7 +402,7 @@ char * ColumnVector<T>::serializeValueIntoMemoryAsComparableRowFormat(size_t n, 
 }
 
 template <typename T>
-size_t ColumnVector<T>::computeComparableRowFormatSize() const
+size_t ColumnVector<T>::collectComparableSerializedValueSize() const
 {
     return byteSize();
 }
