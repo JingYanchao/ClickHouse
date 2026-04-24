@@ -31,7 +31,7 @@ using ProjectionIndexBitmapPtr = std::shared_ptr<ProjectionIndexBitmap>;
 
 using PartDeleteBitmapMap = std::unordered_map<const IMergeTreeDataPart *, ProjectionIndexBitmapPtr>;
 
-/// Dedup metadata collected by the source replica for a fetched part.
+/// Dedup metadata sent from the source replica for a fetched part.
 struct DedupMetadataForFetch
 {
     ProjectionIndexBitmapPtr delete_bitmap;
@@ -59,13 +59,6 @@ private:
     std::optional<Stopwatch> lock_watch;
 };
 
-/// Reject regular (non-index) projections for UniqueMergeTree engines.
-/// Only projection indexes (with TYPE clause) are allowed because regular
-/// projections cannot maintain consistency with the dedup delete bitmap.
-void validateNoRegularProjections(
-    const ProjectionsDescription & projections,
-    const String & full_table_name);
-
 class MergeTreeDedupPartManager
 {
 public:
@@ -76,45 +69,36 @@ explicit MergeTreeDedupPartManager(MergeTreeData & storage_);
         const DataPartPtr & new_part,
         const std::optional<MergeTreeData::DeleteBitmapSnapshotMap> & source_part_delete_bitmap_snapshots = std::nullopt);
 
-    /// Apply accumulated delta delete bitmaps. Must be called under DataPartsLock.
+    /// Apply delta delete bitmaps. Must be called under DataPartsLock.
     void commitDeleteBitmapBuffers(const DataPartsLock & lock);
 
-    /// Batch-write delete mark bitmaps to RocksDB for persistence.
-    /// Key: part name, Value: serialized delete bitmap.
+    /// Persist delete bitmaps to RocksDB (key: part name, value: serialized bitmap).
     void storeDeleteMarkBuffers(const std::unordered_map<std::string, DeleteBitmapPtr> & buffers);
 
-    /// Load a persisted delete bitmap for the given part name from RocksDB.
-    /// Returns nullptr if no bitmap is stored for this part.
+    /// Load a persisted delete bitmap for a part from RocksDB (nullptr if not found).
     ProjectionIndexBitmapPtr loadDeleteBitmapFromRocksDB(const std::string & part_name);
 
-    /// Remove the persisted delete bitmap for the given part name from RocksDB.
+    /// Remove the persisted delete bitmap for a part from RocksDB.
     void removeDeleteBitmap(const std::string & part_name) const;
 
-    /// Check for parts whose delete bitmaps were not persisted to RocksDB
-    /// (e.g. due to unexpected server restart). Re-dedup and persist them.
-    void checkAndDedupPartsOnStartup();
+    /// Re-dedup and persist parts whose delete bitmaps are missing in RocksDB.
+    void checkAndDedupPartsOnStartup(const DataPartsVector & all_active_parts);
 
     /// Load persisted delete bitmaps from RocksDB for all active parts,
-    /// then check and re-dedup any parts that have no persisted bitmap.
-    /// This is the single entry point called during startup — it replaces
-    /// the per-part `loadDeleteBitmaps` that was previously in
-    /// `loadColumnsChecksumsIndexes`, avoiding the virtual-dispatch issue
-    /// where `supportsUpsert` returns false during parent-class construction.
+    /// then re-dedup any parts that have no persisted bitmap.
     void loadDeleteBitmapsAndCheckOnStartup();
 
     UniqueProcessLock lockUniqueProcess() { return UniqueProcessLock(unique_process_mutex); }
 
-    /// Run dedup for all committing parts under UniqueProcessLock.
-    /// Shared by both StorageUniqueMergeTree and StorageReplicatedUniqueMergeTree
-    /// as the BeforeTransactionCommitHook implementation.
+    /// Dedup committing parts under UniqueProcessLock (BeforeTransactionCommit hook).
     std::any dedupPartsBeforeTransactionCommit(
         const MergeTreeData::MutableDataParts & parts,
         const MergeTreeData::BeforeCommitHookContext & before_commit_context);
 
-    /// Collect dedup metadata for the fetching replica.
+    /// Collect dedup metadata for a fetched part.
     DedupMetadataForFetch collectDedupMetadataForFetch(const DataPartPtr & part) const;
 
-    /// A data part paired with its SST reader.
+    /// A data part with its SST reader.
     struct PartWithSSTReader
     {
         DataPartPtr part;
@@ -134,65 +118,51 @@ explicit MergeTreeDedupPartManager(MergeTreeData & storage_);
     }
 
 private:
-    /// Open SST readers for a list of parts, skipping parts without SST.
-    static std::vector<PartWithSSTReader> openSSTReadersForParts(
-        const DataPartsVector & parts,
-        const StorageMetadataPtr & metadata_snapshot);
-
-    /// Open SST readers for the input part and other parts.
+    /// Open SST readers for the input part and all visible parts.
     std::pair<PartWithSSTReader, std::vector<PartWithSSTReader>> prepareSSTReadersForDedup(
         const DataPartPtr & input_part,
         const StorageMetadataPtr & metadata_snapshot,
-        const DataPartsVector & other_parts);
-
-    /// Dedup for INSERT-produced parts.
-    void dedupForInsert(
-        const DataPartPtr & new_part,
-        const StorageMetadataPtr & metadata_snapshot,
         const DataPartsVector & visible_parts);
 
-    /// Dedup for FETCH-produced parts.
+    void dedupForInsert(
+        const PartWithSSTReader & input,
+        std::vector<PartWithSSTReader> & parts_to_search);
+
     void dedupForFetch(
         const DataPartPtr & new_part,
         const StorageMetadataPtr & metadata_snapshot,
         const DataPartsVector & source_parts,
-        const DataPartsVector & all_visible_parts);
+        const PartWithSSTReader & input,
+        std::vector<PartWithSSTReader> & parts_to_search);
 
-    /// Dedup for MERGE-produced parts: propagate delete bitmaps from source parts.
+    /// Propagate delete bitmaps from source parts into the merged part.
     void dedupForMerge(
         const DataPartPtr & new_part,
-        const StorageMetadataPtr & metadata_snapshot,
-        const DataPartsVector & source_parts,
-        const MergeTreeData::DeleteBitmapSnapshotMap & delete_bitmap_snapshots,
-        const DataPartsVector & all_visible_parts);
+        const PartWithSSTReader & input,
+        const std::vector<PartWithSSTReader> & source_parts_with_readers,
+        const MergeTreeData::DeleteBitmapSnapshotMap & delete_bitmap_snapshots);
 
-    /// Dedup for MUTATION-produced parts: clone source part's delete bitmap.
+    /// Clone source part's delete bitmap for mutation.
     void dedupForMutation(
         const DataPartPtr & new_part,
-        const DataPartPtr & source_part);
+        const DataPartsVector & source_parts);
 
-    /// Propagate newly deleted keys from source parts into the merged part.
     void dedupDeletedKeysFromSourceParts(
         const DataPartPtr & new_part,
-        const DataPartsVector & source_parts,
-        const StorageMetadataPtr & metadata_snapshot,
+        const SSTFileReaderPtr & input_reader,
+        const std::vector<PartWithSSTReader> & source_part_readers,
         const MergeTreeData::DeleteBitmapSnapshotMap & source_delete_bitmap_snapshots = {});
 
     MergeTreeData & storage;
-    /// FIFO-fair lock serializing the dedup commit phase across all write paths
-    /// (INSERT / FETCH / MERGE / MUTATION). Using RWLockImpl in Write mode because
-    /// `std::mutex` allows barging: under heavy contention, newly-arriving threads
-    /// may acquire the lock ahead of long-waiting ones, causing some merges to be
-    /// starved for minutes. See RWLock.h ("Phase Fair RWLock") for guarantees.
+    /// FIFO-fair lock that serializes the dedup commit phase across all write paths.
     RWLock unique_process_mutex = RWLockImpl::create();
     PartDeleteBitmapMap delta_deleted_rows_map; /// protected by unique_process_mutex
 
-    /// rocksdb to persistent delete bitmaps
+    /// RocksDB for persistent delete bitmaps.
     using RocksDBPtr = std::unique_ptr<rocksdb::DB>;
     RocksDBPtr rocksdb_ptr;
     String rocksdb_dir;
 
-    /// Set to true after `checkAndDedupPartsOnStartup` completes.
     std::atomic<bool> startup_completed{false};
 
     LoggerPtr log;

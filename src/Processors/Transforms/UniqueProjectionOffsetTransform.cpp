@@ -1,4 +1,4 @@
-#include <Processors/Transforms/UniqueKVOffsetTranslateTransform.h>
+#include <Processors/Transforms/UniqueProjectionOffsetTransform.h>
 
 #include <Columns/ColumnTuple.h>
 #include <Columns/ColumnVector.h>
@@ -7,7 +7,7 @@
 namespace DB
 {
 
-UniqueKVOffsetTranslateTransform::UniqueKVOffsetTranslateTransform(
+UniqueProjectionOffsetTransform::UniqueProjectionOffsetTransform(
     const Block & header,
     MergedPartOffsetsPtr offsets_,
     size_t part_index_,
@@ -22,7 +22,7 @@ UniqueKVOffsetTranslateTransform::UniqueKVOffsetTranslateTransform(
 {
 }
 
-void UniqueKVOffsetTranslateTransform::transform(Chunk & chunk)
+void UniqueProjectionOffsetTransform::transform(Chunk & chunk)
 {
     size_t num_rows = chunk.getNumRows();
     if (num_rows == 0)

@@ -584,6 +584,7 @@ The server successfully detected this situation and will download merged part fr
     M(UniqueProcessLockWaitMicroseconds, "Total time spent waiting for unique process lock in UniqueMergeTree dedup", ValueType::Microseconds) \
     M(UniqueProcessLockHoldMicroseconds, "Total time spent holding unique process lock in UniqueMergeTree dedup", ValueType::Microseconds) \
     M(UniqueKeyDedupParallelProcessMicroseconds, "Time spent in parallel dedup key range processing (all shards)", ValueType::Microseconds) \
+    M(UniqueKeyDedupSkipPartsByKeyRange, "Number of visible parts skipped by key range intersection check during dedup", ValueType::Number) \
     \
     M(RealTimeMicroseconds, "Total (wall clock) time spent in processing (queries and other tasks) threads (note that this is a sum).", ValueType::Microseconds) \
     M(UserTimeMicroseconds, "Total time spent in processing (queries and other tasks) threads executing CPU instructions in user mode. This includes time CPU pipeline was stalled due to main memory access, cache misses, branch mispredictions, hyper-threading, etc.", ValueType::Microseconds) \

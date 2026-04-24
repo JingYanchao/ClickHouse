@@ -5,7 +5,7 @@
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/MergeTree/MergeTreeVirtualColumns.h>
 #include <Processors/Transforms/FilterTransform.h>
-#include <Processors/Transforms/UniqueKVOffsetTranslateTransform.h>
+#include <Processors/Transforms/UniqueProjectionOffsetTransform.h>
 #include <Processors/QueryPlan/ISourceStep.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include <QueryPipeline/Pipe.h>
@@ -334,7 +334,7 @@ Pipe createMergeTreeSequentialSource(
 
     /// The part might have some rows masked by lightweight deletes.
     /// For unique projection parts, we skip the _row_exists filter entirely —
-    /// filtering is done by UniqueKVOffsetTranslateTransform based on the
+    /// filtering is done by UniqueProjectionOffsetTransform based on the
     /// parent part's delete bitmap and the SST value's embedded part_offset.
     bool has_lightweight_delete = info->data_part->hasLightweightDelete() || info->alter_conversions->hasLightweightDelete();
     const bool need_to_filter_deleted_rows = apply_deleted_mask && has_lightweight_delete
@@ -412,7 +412,7 @@ Pipe createMergeTreeSequentialSource(
         pipe.addSimpleTransform(
             [task_info = std::move(saved_info_for_unique_projection_transform), bitmap = std::move(part_delete_bitmap)](const SharedHeader & header)
             {
-                return std::make_shared<UniqueKVOffsetTranslateTransform>(
+                return std::make_shared<UniqueProjectionOffsetTransform>(
                     *header, task_info->merged_part_offsets, task_info->part_index_in_query,
                     task_info->part_starting_offset_in_query, bitmap);
             });

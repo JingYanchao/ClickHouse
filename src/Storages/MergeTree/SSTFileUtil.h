@@ -76,6 +76,7 @@ std::unique_ptr<rocksdb::Env> createReadBufferFileSystemEnv(const DataPartStorag
 class SSTFileReader
 {
 public:
+    using MinMax = std::pair<std::string, std::string>;
     using IndexPropertiesPtr = std::shared_ptr<const rocksdb::TableProperties>;
 
     SSTFileReader(SeekableReadBuffer * read_buffer, uint64_t file_offset, uint64_t file_size);
@@ -102,12 +103,17 @@ public:
     /// SampleKeyCollector and stored as user-collected properties.
     std::vector<std::string> getSampleKeys() const;
 
+    /// Check whether this SST file's key range intersects with the other's.
+    bool keyRangeIntersects(const MinMax & other) const;
+
+    const MinMax & getKeyRange() const { return key_range; }
+
 private:
-    /// Common initialization logic shared by both constructors.
     void init(const String & file_name);
 
     std::unique_ptr<rocksdb::Env> sst_env;
     std::unique_ptr<rocksdb::SstFileReader> index_reader;
+    MinMax key_range;
 };
 
 using SSTFileReaderPtr = std::shared_ptr<const SSTFileReader>;

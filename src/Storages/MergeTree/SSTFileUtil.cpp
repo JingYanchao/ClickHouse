@@ -801,12 +801,6 @@ void SSTFileReader::init(const String & file_name)
 
     rocksdb::BlockBasedTableOptions table_options;
     table_options.filter_policy.reset(rocksdb::NewBloomFilterPolicy(12));
-    /// Disable block cache for SST readers used in dedup.
-    /// All dedup read patterns (sequential scan, ordered MultiGet) are
-    /// single-pass — each data block is visited at most once and never
-    /// re-accessed, so caching it wastes memory without any hit-rate
-    /// benefit.  Bloom filter and index blocks are pinned inside the
-    /// TableReader at Open time and are NOT affected by this flag.
     table_options.no_block_cache = true;
     options.table_factory.reset(NewBlockBasedTableFactory(table_options));
 
@@ -816,6 +810,18 @@ void SSTFileReader::init(const String & file_name)
         throw Exception(ErrorCodes::INCORRECT_DATA, "Failed to open SST reader for {}: {}", file_name, status.ToString());
 
     index_reader = std::move(local_reader);
+
+    /// Retrieve min/max key from the SST file.
+    rocksdb::ReadOptions read_opts;
+    read_opts.fill_cache = false;
+    auto iter = index_reader->NewIterator(read_opts);
+    iter->SeekToFirst();
+    if (iter->Valid())
+        key_range.first = iter->key().ToString();
+    iter->SeekToLast();
+    if (iter->Valid())
+        key_range.second = iter->key().ToString();
+    delete iter;
 }
 
 SSTFileReader::SSTFileReader(SeekableReadBuffer * read_buffer, uint64_t file_offset, uint64_t file_size)
@@ -952,6 +958,20 @@ std::vector<std::string> SSTFileReader::getSampleKeys() const
     }
 
     return sample_keys;
+}
+
+bool SSTFileReader::keyRangeIntersects(const MinMax & other) const
+{
+    if (key_range.first.empty() || key_range.second.empty())
+        return true;
+
+    /// No intersection: this.max < other.min OR this.min > other.max.
+    if (key_range.second < other.first)
+        return false;
+    if (!other.second.empty() && key_range.first > other.second)
+        return false;
+
+    return true;
 }
 
 SSTFileWriter::SSTFileWriter(WriteBuffer * write_buffer)

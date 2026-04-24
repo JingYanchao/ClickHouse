@@ -45,6 +45,20 @@ public:
 
     void checkMutationIsPossible(const MutationCommands & commands, const Settings & settings) const override;
 
+    /// DROP PART is not supported because dropping a single part would leave
+    /// stale delete marks on other parts that reference the dropped part's keys.
+    /// Use DROP PARTITION instead to remove an entire partition atomically.
+    void dropPart(const String & part_name, bool detach, ContextPtr query_context) override;
+
+    /// REPLACE PARTITION and MOVE PARTITION TO TABLE bypass the
+    /// BeforeTransactionCommitHook (they call `Transaction::commit` with
+    /// DataPartsLock directly), which would silently skip cross-part dedup.
+    void replacePartitionFrom(const StoragePtr & source_table, const ASTPtr & partition, bool replace, ContextPtr query_context) override;
+    void movePartitionToTable(const StoragePtr & dest_table, const ASTPtr & partition, ContextPtr query_context) override;
+
+    /// RESTORE bypasses the dedup hook; not yet supported.
+    void attachRestoredParts(MutableDataPartsVector && parts) override;
+
     /// Override startup to rebuild delete marks BEFORE background tasks start.
     /// This ensures no merge/mutate can run until dedup state is fully restored.
     void startup() override;

@@ -49,6 +49,24 @@ static void validateUniqueProjection(
         projection_name, full_table_name, projections.size());
 }
 
+/// Reject regular (non-index) projections for UniqueMergeTree engines.
+/// Only projection indexes (with TYPE clause) are allowed because regular
+/// projections cannot maintain consistency with the dedup delete bitmap.
+static void validateNoRegularProjections(
+    const ProjectionsDescription & projections,
+    const String & full_table_name)
+{
+    for (const auto & projection : projections)
+    {
+        if (!projection.index)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "Regular projections are not supported for UniqueMergeTree. "
+                "Only projection indexes (with TYPE clause) are allowed. "
+                "Projection '{}' in table '{}' does not have a TYPE clause",
+                projection.name, full_table_name);
+    }
+}
+
 StorageUniqueMergeTree::StorageUniqueMergeTree(
     const StorageID & table_id_,
     const String & relative_data_path_,
@@ -112,6 +130,39 @@ void StorageUniqueMergeTree::checkMutationIsPossible(const MutationCommands & co
                 "ALTER DELETE is not supported for UniqueMergeTree. "
                 "Row-level deletion bypasses the unique projection SST and would corrupt dedup");
     }
+}
+
+void StorageUniqueMergeTree::dropPart(
+    const String & part_name, bool /*detach*/, ContextPtr /*query_context*/)
+{
+    throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+        "DROP PART is not supported for UniqueMergeTree (part: {}). "
+        "Dropping a single part would leave stale delete marks on other parts. "
+        "Use DROP PARTITION instead to remove an entire partition atomically",
+        part_name);
+}
+
+void StorageUniqueMergeTree::replacePartitionFrom(
+    const StoragePtr & /*source_table*/, const ASTPtr & /*partition*/, bool /*replace*/, ContextPtr /*query_context*/)
+{
+    throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+        "REPLACE PARTITION is not supported for UniqueMergeTree. "
+        "The operation bypasses the dedup commit hook and would produce incorrect results");
+}
+
+void StorageUniqueMergeTree::movePartitionToTable(
+    const StoragePtr & /*dest_table*/, const ASTPtr & /*partition*/, ContextPtr /*query_context*/)
+{
+    throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+        "MOVE PARTITION TO TABLE is not supported for UniqueMergeTree. "
+        "The operation bypasses the dedup commit hook and would produce incorrect results");
+}
+
+void StorageUniqueMergeTree::attachRestoredParts(MutableDataPartsVector && /*parts*/)
+{
+    throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+        "RESTORE is not supported for UniqueMergeTree. "
+        "The operation bypasses the dedup commit hook and would produce incorrect results");
 }
 
 }

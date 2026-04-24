@@ -32,6 +32,7 @@ namespace ProfileEvents
     extern const Event UniqueProcessLockWaitMicroseconds;
     extern const Event UniqueProcessLockHoldMicroseconds;
     extern const Event UniqueKeyDedupParallelProcessMicroseconds;
+    extern const Event UniqueKeyDedupSkipPartsByKeyRange;
 }
 
 namespace DB
@@ -47,21 +48,6 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
     extern const int INCORRECT_DATA;
     extern const int LOGICAL_ERROR;
-}
-
-void validateNoRegularProjections(
-    const ProjectionsDescription & projections,
-    const String & full_table_name)
-{
-    for (const auto & projection : projections)
-    {
-        if (!projection.index)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                "Regular projections are not supported for UniqueMergeTree. "
-                "Only projection indexes (with TYPE clause) are allowed. "
-                "Projection '{}' in table '{}' does not have a TYPE clause",
-                projection.name, full_table_name);
-    }
 }
 
 /// Maximum number of keys to batch in a single MultiGet call.
@@ -270,13 +256,6 @@ static PartDeleteBitmapMap dedupKeysThroughNewCommitParts(
     if (input.part->rows_count == 0)
         return result;
 
-    /// Release ReadBuffer memory (~1MB per file) when cross-part dedup is done.
-    /// Bloom filter and index blocks remain pinned in the cached SSTFileReader.
-    SCOPE_EXIT({
-        input.releaseBufferMemory();
-        MergeTreeDedupPartManager::releaseAllBufferMemory(visible_parts);
-    });
-
     auto all_sample_keys = input.reader->getSampleKeys();
 
     std::vector<std::string> bucket_start_keys;
@@ -426,7 +405,7 @@ MergeTreeDedupPartManager::MergeTreeDedupPartManager(MergeTreeData & storage_)
     rocksdb_ptr.reset(db);
 }
 
-std::vector<MergeTreeDedupPartManager::PartWithSSTReader> MergeTreeDedupPartManager::openSSTReadersForParts(
+static std::vector<PartWithSSTReader> openSSTReadersForParts(
     const DataPartsVector & parts,
     const StorageMetadataPtr & metadata_snapshot)
 {
@@ -451,7 +430,6 @@ MergeTreeDedupPartManager::prepareSSTReadersForDedup(
     if (input_part->rows_count == 0)
         return {};
 
-    /// Get cached SST reader for input part.
     auto input_reader = input_part->getOrOpenSSTReader(metadata_snapshot);
     if (!input_reader)
     {
@@ -542,20 +520,16 @@ void MergeTreeDedupPartManager::loadDeleteBitmapsAndCheckOnStartup()
 
     /// Now check for parts that still have no bitmap (RocksDB had no record)
     /// and re-dedup them.
-    checkAndDedupPartsOnStartup();
+    checkAndDedupPartsOnStartup(all_active_parts);
 }
 
-void MergeTreeDedupPartManager::checkAndDedupPartsOnStartup()
+void MergeTreeDedupPartManager::checkAndDedupPartsOnStartup(const DataPartsVector & all_active_parts)
 {
     Stopwatch watch;
 
     /// Mark startup as completed early so that `dedupPart` (which asserts
     /// `startup_completed`) can be called from within this function.
     startup_completed.store(true, std::memory_order_release);
-
-    /// Get all active parts with non-zero rows.
-    auto all_active_parts = storage.getDataPartsVectorForInternalUsage(
-        {MergeTreeData::DataPartState::Active});
 
     /// Phase 1: Collect parts whose delete bitmaps were not persisted to
     /// RocksDB. This can happen when the server restarted unexpectedly
@@ -579,10 +553,34 @@ void MergeTreeDedupPartManager::checkAndDedupPartsOnStartup()
         }
     }
 
-    /// Phase 2: Re-dedup and commit each collected part.
+    /// Phase 2: Re-dedup each collected part using full insert dedup,
+    /// since operation-type context is unavailable after a restart.
+    auto metadata_snapshot = storage.getInMemoryMetadataPtr();
     for (const auto & part : parts_to_dedup)
     {
-        dedupPart(part);
+        MergeTreeData::DataPartsVector all_visible_parts;
+        {
+            auto shared_lock = storage.readLockParts();
+            all_visible_parts = storage.getDataPartsVectorInPartitionForInternalUsage(
+                {MergeTreeData::DataPartState::Active}, part->info.getPartitionId(), shared_lock);
+        }
+        std::erase_if(all_visible_parts, [&](const auto & p)
+        {
+            return p->rows_count == 0 || p->name == part->name;
+        });
+
+        auto [input, parts_to_search] = prepareSSTReadersForDedup(part, metadata_snapshot, all_visible_parts);
+        SCOPE_EXIT({
+            input.releaseBufferMemory();
+            releaseAllBufferMemory(parts_to_search);
+        });
+
+        delta_deleted_rows_map.clear();
+        dedupForInsert(input, parts_to_search);
+
+        if (delta_deleted_rows_map.find(part.get()) == delta_deleted_rows_map.end())
+            delta_deleted_rows_map[part.get()] = nullptr;
+
         auto parts_lock = storage.lockParts();
         commitDeleteBitmapBuffers(parts_lock);
     }
@@ -592,32 +590,22 @@ void MergeTreeDedupPartManager::checkAndDedupPartsOnStartup()
 }
 
 void MergeTreeDedupPartManager::dedupForInsert(
-    const DataPartPtr & new_part,
-    const StorageMetadataPtr & metadata_snapshot,
-    const DataPartsVector & visible_parts)
+    const PartWithSSTReader & input,
+    std::vector<PartWithSSTReader> & parts_to_search)
 {
-    /// Open the input part's SST reader (from cache) for cross-part dedup.
-    auto [input, other] = prepareSSTReadersForDedup(new_part, metadata_snapshot, visible_parts);
-    if (!input.reader)
-        return;
-
-    /// Cross-part dedup against all visible parts.
     const size_t max_parallel = storage.getContext()->getServerSettings()[ServerSetting::unique_key_dedup_max_parallel_threads];
-    delta_deleted_rows_map = dedupKeysThroughNewCommitParts(input, other, max_parallel);
+    delta_deleted_rows_map = dedupKeysThroughNewCommitParts(input, parts_to_search, max_parallel);
 }
 
 void MergeTreeDedupPartManager::dedupForFetch(
     const DataPartPtr & new_part,
-    const StorageMetadataPtr & metadata_snapshot,
+    const StorageMetadataPtr & /*metadata_snapshot*/,
     const DataPartsVector & source_parts,
-    const DataPartsVector & all_visible_parts)
+    const PartWithSSTReader & input,
+    std::vector<PartWithSSTReader> & parts_to_search)
 {
     Stopwatch watch;
 
-    /// If source parts on this replica do not fully cover the fetched part's
-    /// block range, some level-0 INSERT parts have not arrived yet. The fetched
-    /// (merged) part contains keys originating from those missing parts, so the
-    /// snapshot_max_block optimisation is unsafe — fall back to full cross-part dedup.
     std::vector<MergeTreePartInfo> source_infos;
     source_infos.reserve(source_parts.size());
     for (const auto & part : source_parts)
@@ -625,84 +613,48 @@ void MergeTreeDedupPartManager::dedupForFetch(
 
     if (!MergeTreePartInfo::areAllBlockNumbersCovered(new_part->info, std::move(source_infos)))
     {
-        /// Filter out parts covered by the fetched part's block range —
-        /// the fetched part already contains their data, so dedup against
-        /// them is unnecessary and would produce incorrect delete marks.
-        DataPartsVector non_covered_visible_parts;
-        non_covered_visible_parts.reserve(all_visible_parts.size());
-        for (const auto & part : all_visible_parts)
+        /// Source parts have block gaps — fall back to full cross-part dedup.
+        /// Filter out parts covered by the fetched part's block range.
+        std::vector<PartWithSSTReader> non_covered;
+        non_covered.reserve(parts_to_search.size());
+        for (auto & pw : parts_to_search)
         {
-            if (part->info.min_block >= new_part->info.min_block
-                && part->info.max_block <= new_part->info.max_block)
+            if (pw.part->info.min_block >= new_part->info.min_block
+                && pw.part->info.max_block <= new_part->info.max_block)
                 continue;
-            non_covered_visible_parts.push_back(part);
+            non_covered.push_back(std::move(pw));
         }
-
-        LOG_DEBUG(log,
-            "dedupForFetch: part '{}' has source-part block gaps, "
-            "falling back to dedupForInsert for full cross-part dedup, "
-            "visible_parts={}, non_covered_visible_parts={}",
-            new_part->name,
-            all_visible_parts.size(),
-            non_covered_visible_parts.size());
-
-        /// Discard the delete mark fetched from the source replica — it was
-        /// computed under a different set of visible parts and is unreliable
-        /// when source-part block gaps exist. dedupForInsert will recompute
-        /// delete marks from scratch against the local visible parts.
         new_part->replaceDeleteBitmap(nullptr);
-        dedupForInsert(new_part, metadata_snapshot, non_covered_visible_parts);
+        dedupForInsert(input, non_covered);
         return;
     }
 
-    /// Filter visible parts:
-    /// 1. Skip parts covered by the fetched part's block range (source parts).
-    /// 2. Use fetch-time block ranges from source replica to skip parts that
-    ///    were already visible on the source replica at fetch/merge time.
-    DataPartsVector filtered_visible_parts;
-    filtered_visible_parts.reserve(all_visible_parts.size());
-
-    /// Fetch-time block ranges from source replica (obtained atomically
-    /// with the delete mark at fetch time).
+    /// Filter visible parts by fetch-time block ranges from source replica.
     const auto & block_ranges = new_part->fetch_dedup_block_ranges;
     bool has_block_ranges = !boost::icl::is_empty(block_ranges);
 
-    for (const auto & part : all_visible_parts)
+    std::vector<PartWithSSTReader> filtered_local;
+    filtered_local.reserve(parts_to_search.size());
+    for (auto & pw : parts_to_search)
     {
-        /// If block ranges are available, skip parts whose [min_block, max_block]
-        /// is fully contained within the source replica's active block ranges.
         if (has_block_ranges
             && boost::icl::within(
-                boost::icl::discrete_interval<Int64>::closed(part->info.min_block, part->info.max_block),
+                boost::icl::discrete_interval<Int64>::closed(pw.part->info.min_block, pw.part->info.max_block),
                 block_ranges))
             continue;
-
-        filtered_visible_parts.push_back(part);
+        filtered_local.push_back(std::move(pw));
     }
 
-    if (filtered_visible_parts.empty())
+    if (filtered_local.empty())
         return;
 
-    /// Reverse dedup: instead of scanning the large fetched part's SST and
-    /// looking up each key in every local part (O(fetched_keys)), we flip
-    /// the roles — scan each small local part's SST and MultiGet into the
-    /// fetched part's SST (O(Σ local_keys)).
-    ///
-    /// `prepareSSTReadersForDedup` opens the fetched part as `.input` and
-    /// the filtered local parts as `.visible_parts`. We swap the roles
-    /// below: the fetched part becomes the lookup target, and each local
-    /// part takes turns being the scan source.
-    auto [input, local_parts] = prepareSSTReadersForDedup(new_part, metadata_snapshot, filtered_visible_parts);
+    /// Reverse dedup: scan each local part's SST and MultiGet into
+    /// the fetched part's SST.
+    std::vector<PartWithSSTReader> fetched_as_target = {input};
 
     const size_t max_parallel = storage.getContext()->getServerSettings()[ServerSetting::unique_key_dedup_max_parallel_threads];
 
-    /// The fetched part serves as the lookup target in every iteration.
-    std::vector<PartWithSSTReader> fetched_as_target = {input};
-
-    /// For each local part, scan its SST (as the "input" role in
-    /// `dedupKeysThroughNewCommitParts`) and look up keys in the fetched
-    /// part (as the "visible_parts" / lookup target role).
-    for (auto & local_part : local_parts)
+    for (auto & local_part : filtered_local)
     {
         auto per_result = dedupKeysThroughNewCommitParts(
             local_part, fetched_as_target, max_parallel);
@@ -724,24 +676,23 @@ void MergeTreeDedupPartManager::dedupForFetch(
         "dedupForFetch [REVERSE DEDUP]: part '{}', has_block_ranges={}, total_visible={}, filtered_local={}, elapsed={}us",
         new_part->name,
         has_block_ranges,
-        all_visible_parts.size(),
-        filtered_visible_parts.size(),
+        parts_to_search.size(),
+        filtered_local.size(),
         watch.elapsedMicroseconds());
 }
 
 void MergeTreeDedupPartManager::dedupForMerge(
     const DataPartPtr & new_part,
-    const StorageMetadataPtr & metadata_snapshot,
-    const DataPartsVector & source_parts,
-    const MergeTreeData::DeleteBitmapSnapshotMap & source_delete_bitmap_snapshots,
-    const DataPartsVector & /*all_visible_parts*/)
+    const PartWithSSTReader & input,
+    const std::vector<PartWithSSTReader> & source_parts_with_readers,
+    const MergeTreeData::DeleteBitmapSnapshotMap & source_delete_bitmap_snapshots)
 {
     /// Merge only combines existing data — it does not introduce new
     /// unique keys. The only dedup work needed is propagating delete marks:
     /// if a concurrent INSERT marked a row as deleted in a source part, the
     /// corresponding row in the merged part must also be marked.
     size_t source_effective_rows = 0;
-    for (const auto & part : source_parts)
+    for (const auto & [part, reader] : source_parts_with_readers)
     {
         size_t deleted = 0;
         if (auto delete_bitmap = part->getDeleteBitmap())
@@ -757,15 +708,20 @@ void MergeTreeDedupPartManager::dedupForMerge(
     if (!new_part->rows_count || source_effective_rows >= new_part->rows_count)
         return;
 
-    dedupDeletedKeysFromSourceParts(new_part, source_parts, metadata_snapshot, source_delete_bitmap_snapshots);
+    dedupDeletedKeysFromSourceParts(new_part, input.reader, source_parts_with_readers, source_delete_bitmap_snapshots);
 }
 
 void MergeTreeDedupPartManager::dedupForMutation(
     const DataPartPtr & new_part,
-    const DataPartPtr & source_part)
+    const DataPartsVector & source_parts)
 {
+    if (source_parts.empty())
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "dedupForMutation: mutation part '{}' has no source parts", new_part->name);
+
     /// Mutation preserves row count, so row offsets are unchanged.
     /// Clone the delete mark bitmap directly from the source part.
+    const auto & source_part = source_parts.front();
     if (new_part->rows_count != source_part->rows_count)
         throw Exception(ErrorCodes::INCORRECT_DATA,
             "dedupForMutation: part '{}' has {} rows, but source part '{}' has {} rows",
@@ -784,7 +740,7 @@ void MergeTreeDedupPartManager::dedupForMutation(
 /// Returns a bitmap of merged-part offsets to mark as deleted, or nullptr.
 static ProjectionIndexBitmapPtr dedupDeletedKeysForOneSourcePart(
     const PartWithSSTReader & source_part_with_sst_reader,
-    const SSTFileReaderPtr & merged_sst_reader,
+    const SSTFileReaderPtr & merged_part_sst_reader,
     const DeleteBitmapPtr & diff_bitmap)
 {
     if (!diff_bitmap || diff_bitmap->cardinality() == 0)
@@ -837,7 +793,7 @@ static ProjectionIndexBitmapPtr dedupDeletedKeysForOneSourcePart(
             key_slices.emplace_back(k);
 
         std::vector<std::string> values;
-        auto statuses = merged_sst_reader->multiGet(key_slices, &values);
+        auto statuses = merged_part_sst_reader->multiGet(key_slices, &values);
 
         for (size_t j = 0; j < statuses.size(); ++j)
         {
@@ -895,15 +851,12 @@ static std::vector<DeleteBitmapPtr> computeDeleteBitmapDiffs(
 
 void MergeTreeDedupPartManager::dedupDeletedKeysFromSourceParts(
     const DataPartPtr & new_merged_part,
-    const DataPartsVector & source_covered_parts,
-    const StorageMetadataPtr & metadata_snapshot,
+    const SSTFileReaderPtr & input_reader,
+    const std::vector<PartWithSSTReader> & source_part_readers,
     const MergeTreeData::DeleteBitmapSnapshotMap & delete_bitmap_snapshots)
 {
-    auto [input, source_part_readers] = prepareSSTReadersForDedup(new_merged_part, metadata_snapshot, source_covered_parts);
-    SCOPE_EXIT({
-        input.releaseBufferMemory();
-        releaseAllBufferMemory(source_part_readers);
-    });
+    if (!input_reader)
+        return;
 
     /// Compute which rows were newly deleted by concurrent INSERTs since
     /// the merge/mutation started (diff = current_marks - snapshot_marks).
@@ -924,10 +877,10 @@ void MergeTreeDedupPartManager::dedupDeletedKeysFromSourceParts(
     for (size_t i = 0; i < num_parts; ++i)
     {
         runner.enqueueAndKeepTrack(
-            [&source_part_readers, &diff_bitmaps, &input, &per_part_bitmaps, i]
+            [&source_part_readers, &diff_bitmaps, &input_reader, &per_part_bitmaps, i]
             {
                 per_part_bitmaps[i] = dedupDeletedKeysForOneSourcePart(
-                    source_part_readers[i], input.reader, diff_bitmaps[i]);
+                    source_part_readers[i], input_reader, diff_bitmaps[i]);
             });
     }
 
@@ -969,12 +922,33 @@ void MergeTreeDedupPartManager::dedupPart(
         all_visible_parts = storage.getDataPartsVectorInPartitionForInternalUsage(
             {MergeTreeData::DataPartState::Active}, new_part->info.getPartitionId(), shared_lock);
     }
-
     /// Filter out the new part itself and empty parts.
     std::erase_if(all_visible_parts, [&](const auto & part)
     {
         return part->rows_count == 0 || part->name == new_part->name;
     });
+
+    auto [input, visible_parts] = prepareSSTReadersForDedup(new_part, metadata_snapshot, all_visible_parts);
+
+    /// Release all SST ReadBuffer memory when dedupPart finishes.
+    SCOPE_EXIT({
+        input.releaseBufferMemory();
+        releaseAllBufferMemory(visible_parts);
+    });
+
+    /// Select visible parts whose key range overlaps with the input.
+    std::vector<PartWithSSTReader> parts_to_search;
+    {
+        const auto & input_key_range = input.reader->getKeyRange();
+        parts_to_search.reserve(visible_parts.size());
+        for (auto & pw : visible_parts)
+        {
+            if (input_key_range.first.empty() || pw.reader->keyRangeIntersects(input_key_range))
+                parts_to_search.push_back(pw);
+        }
+        if (size_t skip_count = visible_parts.size() - parts_to_search.size())
+            ProfileEvents::increment(ProfileEvents::UniqueKeyDedupSkipPartsByKeyRange, skip_count);
+    }
 
     /// Infer operation type from part metadata and context:
     ///   level == 0 + mutation == 0                              → Insert optimize (full cross-part dedup)
@@ -984,27 +958,14 @@ void MergeTreeDedupPartManager::dedupPart(
     const auto & info = new_part->info;
 
     DataPartsVector source_parts;
-    DataPartPtr mutation_source;
 
-    if (info.level > 0)
+    if (info.level > 0 || info.mutation > 0)
     {
-        for (const auto & part : all_visible_parts)
+        for (const auto & part : parts_to_search)
         {
-            if (part->info.min_block >= info.min_block
-                && part->info.max_block <= info.max_block)
-            {
-                source_parts.push_back(part);
-
-                /// Mutation source: exact same block range, lower mutation version.
-                if (!mutation_source
-                    && info.mutation > 0
-                    && part->info.min_block == info.min_block
-                    && part->info.max_block == info.max_block
-                    && part->info.mutation < info.mutation)
-                {
-                    mutation_source = part;
-                }
-            }
+            if (part.part->info.min_block >= info.min_block
+                && part.part->info.max_block <= info.max_block)
+                source_parts.push_back(part.part);
         }
     }
 
@@ -1013,36 +974,12 @@ void MergeTreeDedupPartManager::dedupPart(
     if (info.level == 0 && info.mutation == 0)
     {
         /// Level-0 part with no mutation version — a fresh INSERT.
-        dedupForInsert(new_part, metadata_snapshot, all_visible_parts);
+        dedupForInsert(input, parts_to_search);
     }
-    else if (info.mutation > 0 && (info.level == 0 || mutation_source))
+    else if (info.mutation > 0)
     {
-        /// Part has a mutation version AND either:
-        ///   - level == 0 (mutation of an insert part — find source inline), or
-        ///   - a source part with the same block range exists (local mutation).
-        /// Clone the source part's delete marks.
         op_name = "mutation";
-
-        if (!mutation_source)
-        {
-            /// Level-0 mutation: source has the same block range at level 0.
-            for (const auto & part : all_visible_parts)
-            {
-                if (part->info.min_block == info.min_block
-                    && part->info.max_block == info.max_block
-                    && part->info.mutation < info.mutation)
-                {
-                    mutation_source = part;
-                    break;
-                }
-            }
-        }
-
-        if (!mutation_source)
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
-                "dedupPart: mutation part '{}' has no matching source part in visible_parts", new_part->name);
-
-        dedupForMutation(new_part, mutation_source);
+        dedupForMutation(new_part, source_parts);
     }
     else if (source_delete_bitmap_snapshots.has_value())
     {
@@ -1050,7 +987,23 @@ void MergeTreeDedupPartManager::dedupPart(
         /// The map may be empty when none of the source parts had delete bitmaps,
         /// but has_value() == true distinguishes it from a fetched part.
         op_name = "merge";
-        dedupForMerge(new_part, metadata_snapshot, source_parts, *source_delete_bitmap_snapshots, all_visible_parts);
+        /// Collect source parts with their SST readers from parts_to_search.
+        std::vector<PartWithSSTReader> source_parts_with_readers;
+        source_parts_with_readers.reserve(source_parts.size());
+        for (const auto & source_part : source_parts)
+        {
+            for (const auto & part_to_search : parts_to_search)
+            {
+                if (part_to_search.part.get() == source_part.get())
+                {
+                    source_parts_with_readers.push_back(part_to_search);
+                    break;
+                }
+            }
+        }
+
+        chassert(source_parts_with_readers.size() == source_parts.size());
+        dedupForMerge(new_part, input, source_parts_with_readers, *source_delete_bitmap_snapshots);
     }
     else
     {
@@ -1058,7 +1011,7 @@ void MergeTreeDedupPartManager::dedupPart(
         /// Try optimized dual-iterator path; falls back to full dedup if
         /// source parts have block gaps.
         op_name = "fetch";
-        dedupForFetch(new_part, metadata_snapshot, source_parts, all_visible_parts);
+        dedupForFetch(new_part, metadata_snapshot, source_parts, input, parts_to_search);
     }
 
     /// Ensure the new part is always present in `delta_deleted_rows_map`
@@ -1069,8 +1022,8 @@ void MergeTreeDedupPartManager::dedupPart(
     if (delta_deleted_rows_map.find(new_part.get()) == delta_deleted_rows_map.end())
         delta_deleted_rows_map[new_part.get()] = nullptr;
 
-    LOG_DEBUG(log, "dedupPart: part '{}', op={}, visible_parts={}, elapsed={}us",
-        new_part->name, op_name, all_visible_parts.size(), dedup_watch.elapsedMicroseconds());
+    LOG_DEBUG(log, "dedupPart: part '{}', op={}, parts_to_search={}, elapsed={}us",
+        new_part->name, op_name, parts_to_search.size(), dedup_watch.elapsedMicroseconds());
 }
 
 void MergeTreeDedupPartManager::commitDeleteBitmapBuffers(const DataPartsLock & /*lock*/)

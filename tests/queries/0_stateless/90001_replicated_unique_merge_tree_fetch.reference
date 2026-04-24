@@ -48,8 +48,8 @@
 7	7
 8	8
 9	9
---- mutation fetch: basic ---
---- r1 after mutation ---
+--- merge_tree fetch: basic ---
+--- r1 after merge_tree ---
 0	999
 1	101
 2	102
@@ -60,7 +60,7 @@
 7	7
 8	8
 9	9
---- r2 after mutation ---
+--- r2 after merge_tree ---
 0	999
 1	101
 2	102
@@ -71,7 +71,7 @@
 7	7
 8	8
 9	9
---- mutation fetch: update then insert ---
+--- merge_tree fetch: update then insert ---
 --- r1 final ---
 0	1000
 1	1001
@@ -94,8 +94,8 @@
 7	7
 8	8
 9	9
---- mutation fetch: update on r2 ---
---- r1 after r2 mutation ---
+--- merge_tree fetch: update on r2 ---
+--- r1 after r2 merge_tree ---
 0	0
 1	1
 2	2
@@ -106,7 +106,7 @@
 7	777
 8	777
 9	777
---- r2 after r2 mutation ---
+--- r2 after r2 merge_tree ---
 0	0
 1	1
 2	2

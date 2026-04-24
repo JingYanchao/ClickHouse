@@ -49,6 +49,21 @@ static void validateUniqueProjection(
         projection_name, full_table_name, projections.size());
 }
 
+static void validateNoRegularProjections(
+    const ProjectionsDescription & projections,
+    const String & full_table_name)
+{
+    for (const auto & projection : projections)
+    {
+        if (!projection.index)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "Regular projections are not supported for UniqueMergeTree. "
+                "Only projection indexes (with TYPE clause) are allowed. "
+                "Projection '{}' in table '{}' does not have a TYPE clause",
+                projection.name, full_table_name);
+    }
+}
+
 StorageReplicatedUniqueMergeTree::StorageReplicatedUniqueMergeTree(
     const TableZnodeInfo & zookeeper_info_,
     LoadingStrictnessLevel mode,

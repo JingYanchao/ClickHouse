@@ -1150,7 +1150,7 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::prepareProjectionsToMergeAndRe
         if (global_ctx->merge_may_reduce_rows && (mode != DeduplicateMergeProjectionMode::IGNORE || is_special_projection))
         {
             /// For UniqueMergeTree, unique projection indexes can use Direct Merge
-            /// with dedicated filtering/translation (UniqueKVOffsetTranslateTransform),
+            /// with dedicated filtering/translation (UniqueProjectionOffsetTransform),
             /// unless rows are being removed by TTL expiration.
             if (global_ctx->data->supportsUpsert()
                 && !ctx->need_remove_expired_values
@@ -1864,7 +1864,7 @@ bool MergeTask::MergeProjectionsStage::prepareProjections() const
             global_ctx->ttl_merges_blocker));
 
         /// Pass parent parts' delete bitmap snapshots to the projection merge sub-task.
-        /// The bitmaps are keyed by parent part name. UniqueKVOffsetTranslateTransform
+        /// The bitmaps are keyed by parent part name. UniqueProjectionOffsetTransform
         /// looks up the bitmap using the projection part's parent part name.
         if (!global_ctx->delete_bitmap_snapshots.empty())
             ctx->tasks_for_projections.back()->setDeleteBitmapSnapshots(global_ctx->delete_bitmap_snapshots);
