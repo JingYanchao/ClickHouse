@@ -458,6 +458,10 @@ std::shared_ptr<MergeTreeSettings> ProjectionIndexUnique::getDefaultSettings() c
 {
     auto settings = std::make_shared<MergeTreeSettings>();
     settings->set("allow_tuple_element_aggregation", true);
+
+    /// TODO: compact part deserialization performance is poor.
+    /// Set `min_bytes_for_wide_part` to 0 to force compact parts.
+    settings->set("min_bytes_for_wide_part", Field(UInt64(0)));
     return settings;
 }
 
