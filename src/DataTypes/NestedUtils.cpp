@@ -10,6 +10,7 @@
 #include <DataTypes/DataTypeTuple.h>
 #include <DataTypes/NestedUtils.h>
 #include <DataTypes/DataTypeNested.h>
+#include <DataTypes/DataTypeSortedStringKV.h>
 
 #include <Columns/ColumnArray.h>
 #include <Columns/ColumnTuple.h>
@@ -206,6 +207,20 @@ Block flattenNested(const Block & block)
     return flattenImpl(block, false);
 }
 
+/// Returns true if the data type is a non-empty Tuple that should be recursively flattened.
+/// Most custom-named types (e.g. Nested, Map) block flattening to preserve their structure,
+/// but SortedStringKV is an exception: it carries a custom name yet still needs to be flattened
+/// so that its inner SimpleAggregateFunction element can be recognized by AggregatingSortedAlgorithm.
+static bool isFlattenableTuple(const DataTypePtr & data_type)
+{
+    const auto * tuple_type = typeid_cast<const DataTypeTuple *>(data_type.get());
+    if (!tuple_type || tuple_type->getElements().empty())
+        return false;
+if (data_type->hasCustomName() && !dynamic_cast<const IDataTypeSortedStringKV *>(data_type->getCustomName()))
+        return false;
+    return true;
+}
+
 template <typename LeafCallback>
 static void flattenTupleRecursiveImpl(
     const ColumnPtr & column,
@@ -213,12 +228,13 @@ static void flattenTupleRecursiveImpl(
     LeafCallback && emit_leaf,
     const String & name_prefix = {})
 {
-    const auto * tuple_type = typeid_cast<const DataTypeTuple *>(data_type.get());
-    if (!tuple_type || tuple_type->getElements().empty() || data_type->hasCustomName())
+    if (!isFlattenableTuple(data_type))
     {
         emit_leaf(column, data_type, name_prefix);
         return;
     }
+
+    const auto * tuple_type = typeid_cast<const DataTypeTuple *>(data_type.get());
 
     /// If the column is ColumnConst, expand it to a full column first,
     /// so that all leaf columns are always non-const after flattening.
@@ -270,10 +286,10 @@ Block flattenTupleRecursive(const Block & block)
 /// Count the number of leaf (non-tuple) columns after recursive flattening.
 static size_t countFlattenedColumnsRecursive(const DataTypePtr & data_type)
 {
-    const auto * tuple_type = typeid_cast<const DataTypeTuple *>(data_type.get());
-    if (!tuple_type || tuple_type->getElements().empty() || data_type->hasCustomName())
+    if (!isFlattenableTuple(data_type))
         return 1;
 
+    const auto * tuple_type = typeid_cast<const DataTypeTuple *>(data_type.get());
     size_t count = 0;
     for (const auto & element_type : tuple_type->getElements())
         count += countFlattenedColumnsRecursive(element_type);
@@ -314,9 +330,9 @@ Columns flattenTupleColumnsRecursive(const Block & header, const Columns & colum
 
 static ColumnPtr reconstructTupleColumnImpl(const DataTypePtr & data_type, const Columns & flattened_columns, size_t & flattened_idx)
 {
-    const auto * tuple_type = typeid_cast<const DataTypeTuple *>(data_type.get());
-    if (tuple_type && !tuple_type->getElements().empty() && !data_type->hasCustomName())
+    if (isFlattenableTuple(data_type))
     {
+        const auto * tuple_type = typeid_cast<const DataTypeTuple *>(data_type.get());
         const auto & element_types = tuple_type->getElements();
         Columns tuple_columns;
         tuple_columns.reserve(element_types.size());

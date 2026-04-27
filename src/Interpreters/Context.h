@@ -111,6 +111,8 @@ class VectorSimilarityIndexCache;
 class TextIndexTokensCache;
 class TextIndexHeaderCache;
 class TextIndexPostingsCache;
+class SSTFileReaderCache;
+
 class ProcessList;
 class QueryStatus;
 using QueryStatusPtr = std::shared_ptr<QueryStatus>;
@@ -1381,6 +1383,11 @@ public:
     void updateIndexMarkCacheConfiguration(const Poco::Util::AbstractConfiguration & config, size_t max_cache_size);
     std::shared_ptr<MarkCache> getIndexMarkCache() const;
     void clearIndexMarkCache() const;
+
+    void setSSTFileReaderCache(const String & cache_policy, size_t max_cache_size_in_bytes, double size_ratio);
+    void updateSSTFileReaderCacheConfiguration(const Poco::Util::AbstractConfiguration & config, size_t max_cache_size);
+    std::shared_ptr<SSTFileReaderCache> getSSTFileReaderCache() const;
+    void clearSSTFileReaderCache() const;
 
     void setVectorSimilarityIndexCache(const String & cache_policy, size_t max_size_in_bytes, size_t max_entries, double size_ratio);
     void updateVectorSimilarityIndexCacheConfiguration(const Poco::Util::AbstractConfiguration & config, size_t max_cache_size);

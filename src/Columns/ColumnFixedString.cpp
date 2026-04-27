@@ -566,4 +566,15 @@ std::span<char> ColumnFixedString::insertRawUninitialized(size_t count)
     return {reinterpret_cast<char *>(chars.data() + start), count * n};
 }
 
+char * ColumnFixedString::serializeValueIntoMemoryAsComparableRowFormat(size_t row, char * memory) const
+{
+    memcpy(memory, &chars[row * n], n);
+    return memory + n;
+}
+
+size_t ColumnFixedString::collectComparableSerializedValueSize() const
+{
+    return n * size();
+}
+
 }

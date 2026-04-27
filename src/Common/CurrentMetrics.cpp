@@ -350,6 +350,8 @@
     M(NamedCollection, "Number of named collections") \
     M(PrimaryIndexCacheBytes, "Total size of primary index cache in bytes") \
     M(PrimaryIndexCacheFiles, "Total number of index files cached in the primary index cache") \
+    M(SSTReaderCacheBytes, "Total size of the SST reader cache in bytes") \
+    M(SSTReaderCacheFiles, "Total number of SST file readers cached in the SST reader cache") \
     M(PageCacheBytes, "Total size of userspace page cache in bytes") \
     M(PageCacheCells, "Total number of entries in the userspace page cache") \
     M(UncompressedCacheBytes, "Total size of uncompressed cache in bytes. Uncompressed cache does not usually improve the performance and should be mostly avoided") \

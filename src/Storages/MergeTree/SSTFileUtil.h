@@ -3,12 +3,22 @@
 #include <IO/HashingWriteBuffer.h>
 #include <IO/WriteBufferFromFileBase.h>
 #include <IO/ReadBufferFromFileBase.h>
+#include <IO/ReadSettings.h>
+#include <Storages/MergeTree/IDataPartStorage.h>
+#include <Storages/MergeTree/MergeTreeReaderStream.h>
 #include <base/types.h>
 #include <memory>
 #include <unordered_map>
 #include <rocksdb/sst_file_reader.h>
 #include <rocksdb/iterator.h>
 #include <rocksdb/db.h>
+
+namespace ProfileEvents
+{
+    extern const Event SSTReaderCacheHits;
+    extern const Event SSTReaderCacheMisses;
+}
+
 namespace DB
 {
 
@@ -20,7 +30,7 @@ using MutableDataPartStoragePtr = std::shared_ptr<IDataPartStorage>;
 class SSTFileWriter;
 
 /// SST data file extension for SST-based column types.
-static constexpr auto SST_DATA_FILE_EXTENSION = ".sst";
+inline constexpr auto SST_DATA_FILE_EXTENSION = ".sst";
 
 /// SST file write stream: manages FileBuffer + SSTFileWriter for a single column.
 class SSTFileWriteStream
@@ -51,6 +61,7 @@ private:
     std::unique_ptr<WriteBufferFromFileBase> plain_file;
     std::unique_ptr<HashingWriteBuffer> hashing;
     std::unique_ptr<SSTFileWriter> sst_writer;
+    bool pre_finalized = false;
 };
 
 using SSTFileWriteStreams = std::unordered_map<String, std::unique_ptr<SSTFileWriteStream>>;
@@ -60,27 +71,93 @@ using SSTReadBuffers = std::unordered_map<String, std::unique_ptr<ReadBufferFrom
 
 /// RocksDB Env helpers
 std::unique_ptr<rocksdb::Env> createWriteBufferFileSystemEnv(WriteBuffer * write_buffer);
-std::unique_ptr<rocksdb::Env> createReadBufferFileSystemEnv(SeekableReadBuffer * read_buffer, uint64_t base_offset, uint64_t region_size);
+std::unique_ptr<rocksdb::Env> createReadBufferFileSystemEnv(const DataPartStoragePtr & storage);
 
 class SSTFileReader
 {
 public:
+    using MinMax = std::pair<std::string, std::string>;
     using IndexPropertiesPtr = std::shared_ptr<const rocksdb::TableProperties>;
 
-    SSTFileReader(SeekableReadBuffer * read_buffer, uint64_t base_offset, uint64_t region_size);
+    SSTFileReader(SeekableReadBuffer * read_buffer, uint64_t file_offset, uint64_t file_size);
+    /// Construct from a DataPartStorage: automatically opens the SST file,
+    /// reads file size, and manages the underlying ReadBuffer internally.
+    /// This is the preferred constructor for dedup / part-level access.
+    SSTFileReader(const DataPartStoragePtr & storage, const String & sst_file_name);
 
     std::unique_ptr<rocksdb::Iterator> newIterator(const rocksdb::ReadOptions & options) const;
-    bool mayContainKey(std::string_view key) const;
     void verifyChecksums() const;
     IndexPropertiesPtr getProperties() const;
-    bool isEmpty() const;
+    /// Single key lookup using MultiGet internally.
+    bool get(const rocksdb::Slice & key, std::string * value_out) const;
+    /// Batch key lookup using MultiGet. Returns a vector of statuses, one per key.
+    /// For each key where status is OK, the corresponding entry in values_out is populated.
+    std::vector<rocksdb::Status> multiGet(const std::vector<rocksdb::Slice> & keys, std::vector<std::string> * values_out) const;
+    /// Release ReadBuffer memory (1MB per file) to save memory.
+    /// After calling this, the index reader can still be used normally
+    /// (bloom filter and index blocks remain pinned in the TableReader).
+    void releaseBufferMemory() const;
+
+    /// Retrieve pre-sampled keys from SST table properties.
+    /// Sample keys are collected during SST write time via
+    /// SampleKeyCollector and stored as user-collected properties.
+    std::vector<std::string> getSampleKeys() const;
+
+    /// Check whether this SST file's key range intersects with the other's.
+    bool keyRangeIntersects(const MinMax & other) const;
+
+    const MinMax & getKeyRange() const { return key_range; }
 
 private:
-    using MinMax = std::pair<std::string, std::string>;
+    void init(const String & file_name);
+
     std::unique_ptr<rocksdb::Env> sst_env;
     std::unique_ptr<rocksdb::SstFileReader> index_reader;
     MinMax key_range;
 };
+
+using SSTFileReaderPtr = std::shared_ptr<const SSTFileReader>;
+using SSTFileReaders = std::vector<SSTFileReaderPtr>;
+using SSTFileReaderCacheValue = const SSTFileReader;
+
+class SSTFileReaderCache
+    : public CacheBase<UInt128, SSTFileReaderCacheValue, UInt128TrivialHash>
+{
+private:
+    using Base = CacheBase<UInt128, SSTFileReaderCacheValue, UInt128TrivialHash>;
+
+public:
+    SSTFileReaderCache(
+        const String & cache_policy,
+        CurrentMetrics::Metric size_in_bytes_metric,
+        CurrentMetrics::Metric count_metric,
+        size_t max_size_in_bytes,
+        double size_ratio)
+        : Base(cache_policy, size_in_bytes_metric, count_metric, max_size_in_bytes, Base::NO_MAX_COUNT, size_ratio)
+    {
+    }
+
+    /// Compute cache key from table UUID and part name.
+    static UInt128 hash(const UUID & table_uuid, const String & part_name)
+    {
+        SipHash s;
+        s.update(reinterpret_cast<const char *>(&table_uuid), sizeof(table_uuid));
+        s.update(part_name.data(), part_name.size());
+        return s.get128();
+    }
+
+    template <typename LoadFunc>
+    MappedPtr getOrSet(const Key & key, LoadFunc && load)
+    {
+        auto result = Base::getOrSet(key, std::forward<LoadFunc>(load));
+        if (result.second)
+            ProfileEvents::increment(ProfileEvents::SSTReaderCacheMisses);
+        else
+            ProfileEvents::increment(ProfileEvents::SSTReaderCacheHits);
+        return result.first;
+    }
+};
+using SSTFileReaderCachePtr = std::shared_ptr<SSTFileReaderCache>;
 
 class SSTFileWriter
 {
@@ -100,6 +177,16 @@ private:
     std::unique_ptr<rocksdb::SstFileWriter> writer;
     bool finished = false;
     bool has_entries = false;
+};
+
+class SSTFileReadStream : public MergeTreeReaderStreamSingleColumnWholePart
+{
+public:
+    template <typename... Args>
+    explicit SSTFileReadStream(Args &&... args)
+        : MergeTreeReaderStreamSingleColumnWholePart{std::forward<Args>(args)...}
+    {
+    }
 };
 
 }

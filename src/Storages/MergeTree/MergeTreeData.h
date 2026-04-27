@@ -1133,8 +1133,8 @@ public:
 
     /// Get constant pointer to storage settings.
     /// Copy this pointer into your scope and you will get consistent settings.
-    /// When `projection` is provided, apply projection-level overrides on top of the table settings.
-    MergeTreeSettingsPtr getSettings(ProjectionDescriptionRawPtr projection = nullptr) const;
+    /// If settings_changes is provided, apply these overrides on top of the table settings.
+    MergeTreeSettingsPtr getSettings(const SettingsChanges * settings_changes = nullptr) const;
 
     StorageMetadataPtr getInMemoryMetadataPtr(bool bypass_metadata_cache = false) const override; /// NOLINT
 

@@ -52,6 +52,8 @@ class MarkCache;
 class UncompressedCache;
 class MergeTreeTransaction;
 class PackedFilesReader;
+class SSTFileReader;
+using SSTFileReaderPtr = std::shared_ptr<const SSTFileReader>;
 
 struct MergeTreeReadTaskInfo;
 using MergeTreeReadTaskInfoPtr = std::shared_ptr<const MergeTreeReadTaskInfo>;
@@ -591,6 +593,11 @@ public:
 
     /// True if here is lightweight deleted mask file in part.
     bool hasLightweightDelete() const;
+
+    /// Returns cached SST reader for the unique projection of this part.
+    /// Looks up or creates the reader in the global SSTFileReaderCache.
+    /// Returns nullptr if no unique projection SST exists.
+    SSTFileReaderPtr getOrOpenSSTReader(const StorageMetadataPtr & metadata_snapshot) const;
 
     /// Read existing rows count from _row_exists column
     UInt64 readExistingRowsCount();

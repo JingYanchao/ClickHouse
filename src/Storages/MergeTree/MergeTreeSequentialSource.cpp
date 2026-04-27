@@ -5,6 +5,7 @@
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/MergeTree/MergeTreeVirtualColumns.h>
 #include <Processors/Transforms/FilterTransform.h>
+#include <Processors/Transforms/UniqueProjectionOffsetTransform.h>
 #include <Processors/QueryPlan/ISourceStep.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include <QueryPipeline/Pipe.h>
@@ -22,6 +23,7 @@
 #include <Processors/Merges/Algorithms/MergeTreeReadInfo.h>
 #include <Storages/MergeTree/MergedPartOffsets.h>
 #include <Storages/MergeTree/checkDataPart.h>
+#include <Storages/MergeTree/ProjectionIndex/ProjectionIndexUnique.h>
 #include <Common/ThrottlerArray.h>
 
 namespace DB
@@ -318,6 +320,13 @@ Pipe createMergeTreeSequentialSource(
     info->const_virtual_fields.emplace("_part_index", info->part_index_in_query);
     info->const_virtual_fields.emplace("_part_starting_offset", info->part_starting_offset_in_query);
 
+    /// Check if this is a unique projection part that needs offset translation
+    /// inside the embedded _unique_kv SST values.
+    const bool is_unique_projection_merge =
+        info->data_part->isProjectionPart()
+        && info->merged_part_offsets
+        && std::ranges::find(columns_to_read, String(ProjectionIndexUnique::kv_column_name)) != columns_to_read.end();
+
     /// The part might have some rows masked by lightweight deletes
     bool has_lightweight_delete = info->data_part->hasLightweightDelete() || info->alter_conversions->hasLightweightDelete();
     const bool need_to_filter_deleted_rows = apply_deleted_mask && has_lightweight_delete && !info->data_part->info.isPatch();
@@ -330,6 +339,8 @@ Pipe createMergeTreeSequentialSource(
 
         info->mutation_steps.push_back(createLightweightDeleteStep(!has_filter_column));
     }
+
+    auto saved_info_for_unique_projection_transform = is_unique_projection_merge ? info : nullptr;
 
     auto result_header = std::make_shared<const Block>(storage_snapshot->getSampleBlockForColumns(columns_to_read));
     LoadedMergeTreeDataPartInfoForReader info_for_reader(info->data_part, info->alter_conversions);
@@ -373,6 +384,19 @@ Pipe createMergeTreeSequentialSource(
             return std::make_shared<FilterTransform>(
                 header, nullptr, RowExistsColumn::name, !has_filter_column, false, filtered_rows_count);
         });
+    }
+
+    /// For unique projection parts: translate the embedded part_offset values
+    /// inside _unique_kv via MergedPartOffsets.
+    if (is_unique_projection_merge)
+    {
+        pipe.addSimpleTransform(
+            [task_info = std::move(saved_info_for_unique_projection_transform)](const SharedHeader & header)
+            {
+                return std::make_shared<UniqueProjectionOffsetTransform>(
+                    *header, task_info->merged_part_offsets, task_info->part_index_in_query,
+                    task_info->part_starting_offset_in_query);
+            });
     }
 
     return pipe;

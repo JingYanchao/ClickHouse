@@ -10,7 +10,7 @@ SETTINGS min_rows_for_wide_part = 1000000, min_bytes_for_wide_part = 1000000000,
 
 -- Insert data spanning multiple granules
 INSERT INTO test_sorted_string_kv_compact 
-SELECT number, (concat('key', toString(number)), concat('value', toString(number * 10))) 
+SELECT number, (concat('key', toString(number)), number * 10) 
 FROM numbers(10000);
 
 -- Test reading across granule boundaries (8192)
@@ -24,10 +24,10 @@ WHERE id BETWEEN 8190 AND 8195 ORDER BY id;
 
 -- Verify exact key-value pairs at granule boundaries
 SELECT 
-    (SELECT (kv.1, kv.2) FROM test_sorted_string_kv_compact WHERE id = 8191) = ('key8191', 'value81910') AS boundary_8191_correct,
-    (SELECT (kv.1, kv.2) FROM test_sorted_string_kv_compact WHERE id = 8192) = ('key8192', 'value81920') AS boundary_8192_correct,
-    (SELECT (kv.1, kv.2) FROM test_sorted_string_kv_compact WHERE id = 0) = ('key0', 'value0') AS first_row_correct,
-    (SELECT (kv.1, kv.2) FROM test_sorted_string_kv_compact WHERE id = 9999) = ('key9999', 'value99990') AS last_row_correct;
+    (SELECT (kv.1, kv.2) FROM test_sorted_string_kv_compact WHERE id = 8191) = ('key8191', 81910) AS boundary_8191_correct,
+    (SELECT (kv.1, kv.2) FROM test_sorted_string_kv_compact WHERE id = 8192) = ('key8192', 81920) AS boundary_8192_correct,
+    (SELECT (kv.1, kv.2) FROM test_sorted_string_kv_compact WHERE id = 0) = ('key0', 0) AS first_row_correct,
+    (SELECT (kv.1, kv.2) FROM test_sorted_string_kv_compact WHERE id = 9999) = ('key9999', 99990) AS last_row_correct;
 
 -- Test filtering across granules
 SELECT count() FROM test_sorted_string_kv_compact WHERE kv.1 LIKE 'key1%';
@@ -43,11 +43,11 @@ SETTINGS min_rows_for_wide_part = 1, min_bytes_for_wide_part = 1, index_granular
 
 -- Insert data in multiple batches, then merge to create wide part
 INSERT INTO test_sorted_string_kv_wide_multi 
-SELECT number, (concat('key', toString(number)), concat('value', toString(number * 10))) 
+SELECT number, (concat('key', toString(number)), number * 10) 
 FROM numbers(5000);
 
 INSERT INTO test_sorted_string_kv_wide_multi 
-SELECT number + 5000, (concat('key', toString(number + 5000)), concat('value', toString((number + 5000) * 10))) 
+SELECT number + 5000, (concat('key', toString(number + 5000)), (number + 5000) * 10) 
 FROM numbers(5000);
 
 OPTIMIZE TABLE test_sorted_string_kv_wide_multi FINAL;
@@ -61,19 +61,19 @@ WHERE id BETWEEN 8190 AND 8195 ORDER BY id;
 
 -- Verify first, last, and cross-part boundary values (part boundary is at row 5000)
 SELECT 
-    (SELECT (kv.1, kv.2) FROM test_sorted_string_kv_wide_multi WHERE id = 0) = ('key0', 'value0') AS first_row_correct,
-    (SELECT (kv.1, kv.2) FROM test_sorted_string_kv_wide_multi WHERE id = 4999) = ('key4999', 'value49990') AS part_boundary_start_correct,
-    (SELECT (kv.1, kv.2) FROM test_sorted_string_kv_wide_multi WHERE id = 5000) = ('key5000', 'value50000') AS part_boundary_end_correct,
-    (SELECT (kv.1, kv.2) FROM test_sorted_string_kv_wide_multi WHERE id = 9999) = ('key9999', 'value99990') AS last_row_correct,
-    (SELECT (kv.1, kv.2) FROM test_sorted_string_kv_wide_multi WHERE id = 8191) = ('key8191', 'value81910') AS granule_boundary_correct;
+    (SELECT (kv.1, kv.2) FROM test_sorted_string_kv_wide_multi WHERE id = 0) = ('key0', 0) AS first_row_correct,
+    (SELECT (kv.1, kv.2) FROM test_sorted_string_kv_wide_multi WHERE id = 4999) = ('key4999', 49990) AS part_boundary_start_correct,
+    (SELECT (kv.1, kv.2) FROM test_sorted_string_kv_wide_multi WHERE id = 5000) = ('key5000', 50000) AS part_boundary_end_correct,
+    (SELECT (kv.1, kv.2) FROM test_sorted_string_kv_wide_multi WHERE id = 9999) = ('key9999', 99990) AS last_row_correct,
+    (SELECT (kv.1, kv.2) FROM test_sorted_string_kv_wide_multi WHERE id = 8191) = ('key8191', 81910) AS granule_boundary_correct;
 
 -- Verify that all key-value pairs match expected pattern
 SELECT count() = 10000 AS all_rows_have_correct_pattern
 FROM test_sorted_string_kv_wide_multi 
-WHERE kv.1 = concat('key', toString(id)) AND kv.2 = concat('value', toString(id * 10));
+WHERE kv.1 = concat('key', toString(id)) AND kv.2 = id * 10;
 
 -- Test sequential scan
-SELECT sum(toUInt64OrZero(kv.2)) FROM test_sorted_string_kv_wide_multi WHERE id < 100;
+SELECT sum(kv.2) FROM test_sorted_string_kv_wide_multi WHERE id < 100;
 
 DROP TABLE test_sorted_string_kv_wide_multi;
 
@@ -85,10 +85,10 @@ ENGINE = MergeTree ORDER BY kv.1
 SETTINGS min_rows_for_wide_part = 1, min_bytes_for_wide_part = 1, index_granularity = 8192;
 
 -- Insert multiple small parts
-INSERT INTO test_sorted_string_kv_wide_parts VALUES (1, ('part1_key1', 'part1_val1'));
-INSERT INTO test_sorted_string_kv_wide_parts VALUES (2, ('part1_key2', 'part1_val2'));
-INSERT INTO test_sorted_string_kv_wide_parts VALUES (100, ('part2_key1', 'part2_val1'));
-INSERT INTO test_sorted_string_kv_wide_parts VALUES (200, ('part3_key1', 'part3_val1'));
+INSERT INTO test_sorted_string_kv_wide_parts VALUES (1, ('part1_key1', 11));
+INSERT INTO test_sorted_string_kv_wide_parts VALUES (2, ('part1_key2', 12));
+INSERT INTO test_sorted_string_kv_wide_parts VALUES (100, ('part2_key1', 21));
+INSERT INTO test_sorted_string_kv_wide_parts VALUES (200, ('part3_key1', 31));
 
 -- Read from multiple parts
 SELECT id, kv.1 AS key, kv.2 AS value FROM test_sorted_string_kv_wide_parts ORDER BY id;
@@ -100,7 +100,7 @@ SELECT id, kv.1 AS key, kv.2 AS value FROM test_sorted_string_kv_wide_parts ORDE
 -- Verify data integrity after merge
 SELECT 
     (SELECT count() FROM test_sorted_string_kv_wide_parts) = 4 AS row_count_correct,
-    (SELECT groupArray((id, kv.1, kv.2)) FROM test_sorted_string_kv_wide_parts) = [(1, 'part1_key1', 'part1_val1'), (2, 'part1_key2', 'part1_val2'), (100, 'part2_key1', 'part2_val1'), (200, 'part3_key1', 'part3_val1')] AS merged_data_correct;
+    (SELECT groupArray((id, kv.1, kv.2)) FROM test_sorted_string_kv_wide_parts) = [(1, 'part1_key1', 11), (2, 'part1_key2', 12), (100, 'part2_key1', 21), (200, 'part3_key1', 31)] AS merged_data_correct;
 
 DROP TABLE test_sorted_string_kv_wide_parts;
 
@@ -112,9 +112,9 @@ ENGINE = MergeTree ORDER BY (date, kv.1)
 SETTINGS index_granularity = 8192;
 
 INSERT INTO test_sorted_string_kv_pk VALUES 
-    (1, ('sensor1', '25.5'), '2024-01-01'),
-    (2, ('sensor2', '30.0'), '2024-01-01'),
-    (3, ('sensor3', '28.3'), '2024-01-02');
+    (1, ('sensor1', 255), '2024-01-01'),
+    (2, ('sensor2', 300), '2024-01-01'),
+    (3, ('sensor3', 283), '2024-01-02');
 
 SELECT id, kv.1 AS sensor, kv.2 AS reading, date FROM test_sorted_string_kv_pk ORDER BY date, id;
 
@@ -129,7 +129,7 @@ CREATE TABLE test_sorted_string_kv_empty (id UInt64, kv SortedStringKV)
 ENGINE = MergeTree ORDER BY kv.1
 SETTINGS index_granularity = 8192;
 
-INSERT INTO test_sorted_string_kv_empty SELECT number, (toString(number), toString(number * 2)) FROM numbers(10);
+INSERT INTO test_sorted_string_kv_empty SELECT number, (toString(number), number * 2) FROM numbers(10);
 
 DELETE FROM test_sorted_string_kv_empty WHERE 1 = 1;
 
@@ -145,7 +145,7 @@ ENGINE = MergeTree ORDER BY kv.1
 SETTINGS index_granularity = 8192;
 
 -- Insert data spanning multiple granules (25000 rows = ~3 granules)
-INSERT INTO test_sorted_string_kv_large SELECT number, (concat('k', toString(number)), concat('v', toString(number * 100))) FROM numbers(25000);
+INSERT INTO test_sorted_string_kv_large SELECT number, (concat('k', toString(number)), number * 100) FROM numbers(25000);
 
 SELECT count() FROM test_sorted_string_kv_large;
 
@@ -155,16 +155,16 @@ SELECT count() FROM test_sorted_string_kv_large WHERE id BETWEEN 8190 AND 8200;
 -- Verify granule boundary values in large dataset
 -- Granule 1 ends at 8191, Granule 2 ends at 16383, Granule 3 ends at 24575
 SELECT 
-    (SELECT (kv.1, kv.2) FROM test_sorted_string_kv_large WHERE id = 8191) = ('k8191', 'v819100') AS granule_1_boundary_correct,
-    (SELECT (kv.1, kv.2) FROM test_sorted_string_kv_large WHERE id = 8192) = ('k8192', 'v819200') AS granule_2_start_correct,
-    (SELECT (kv.1, kv.2) FROM test_sorted_string_kv_large WHERE id = 16383) = ('k16383', 'v1638300') AS granule_2_boundary_correct,
-    (SELECT (kv.1, kv.2) FROM test_sorted_string_kv_large WHERE id = 16384) = ('k16384', 'v1638400') AS granule_3_start_correct,
-    (SELECT (kv.1, kv.2) FROM test_sorted_string_kv_large WHERE id = 24999) = ('k24999', 'v2499900') AS last_row_correct;
+    (SELECT (kv.1, kv.2) FROM test_sorted_string_kv_large WHERE id = 8191) = ('k8191', 819100) AS granule_1_boundary_correct,
+    (SELECT (kv.1, kv.2) FROM test_sorted_string_kv_large WHERE id = 8192) = ('k8192', 819200) AS granule_2_start_correct,
+    (SELECT (kv.1, kv.2) FROM test_sorted_string_kv_large WHERE id = 16383) = ('k16383', 1638300) AS granule_2_boundary_correct,
+    (SELECT (kv.1, kv.2) FROM test_sorted_string_kv_large WHERE id = 16384) = ('k16384', 1638400) AS granule_3_start_correct,
+    (SELECT (kv.1, kv.2) FROM test_sorted_string_kv_large WHERE id = 24999) = ('k24999', 2499900) AS last_row_correct;
 
 -- Verify random sampling of data integrity across all granules
 SELECT count() = 25000 AS all_rows_match_pattern
 FROM test_sorted_string_kv_large 
-WHERE kv.1 = concat('k', toString(id)) AND kv.2 = concat('v', toString(id * 100));
+WHERE kv.1 = concat('k', toString(id)) AND kv.2 = id * 100;
 
 -- Test filtering on large dataset
 SELECT count() FROM test_sorted_string_kv_large WHERE kv.1 LIKE 'k1%';
@@ -179,8 +179,8 @@ ENGINE = MergeTree ORDER BY kv1.1
 SETTINGS index_granularity = 8192;
 
 INSERT INTO test_sorted_string_kv_multi VALUES 
-    (1, ('key1', 'val1'), ('a', 'b')),
-    (2, ('key2', 'val2'), ('c', 'd'));
+    (1, ('key1', 10), ('a', 20)),
+    (2, ('key2', 30), ('c', 40));
 
 SELECT id, kv1.1 AS k1, kv1.2 AS v1, kv2.1 AS k2, kv2.2 AS v2 FROM test_sorted_string_kv_multi ORDER BY id;
 
@@ -196,8 +196,8 @@ ENGINE = MergeTree ORDER BY id
 SETTINGS min_rows_for_wide_part = 1, min_bytes_for_wide_part = 1, index_granularity = 8192;
 
 INSERT INTO test_sorted_string_kv_basic VALUES 
-    (1, ('name', 'Alice')),
-    (2, ('city', 'Beijing')),
-    (3, ('country', 'China')); -- { serverError INCORRECT_DATA }
+    (1, ('name', 1)),
+    (2, ('city', 2)),
+    (3, ('country', 3)); -- { serverError INCORRECT_DATA }
 
 DROP TABLE test_sorted_string_kv_basic;

@@ -263,4 +263,6 @@ private:
     LoggerPtr logger = getLogger("MergedPartOffsets");
 };
 
+using MergedPartOffsetsPtr = std::shared_ptr<MergedPartOffsets>;
+
 }
