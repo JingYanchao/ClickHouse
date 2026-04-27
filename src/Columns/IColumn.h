@@ -364,6 +364,16 @@ public:
     /// in a single step. For more details, refer to the HashMethodSerialized implementation.
     virtual void collectSerializedValueSizes(PaddedPODArray<UInt64> & /* sizes */, const UInt8 * /* is_null */, const SerializationSettings * settings) const;
 
+    /// Serialize the value of n-th element into memory, in a format that is comparable in byte-wise.
+    virtual char * serializeValueIntoMemoryAsComparableRowFormat(size_t /* n */, char * /* memory */) const;
+
+    virtual size_t collectComparableSerializedValueSize() const;
+
+    virtual bool supportsSerializeValueIntoMemoryAsComparable() const
+    {
+        return false;
+    }
+
     /// Deserializes a value that was serialized using IColumn::serializeValueIntoArena method.
     /// Note that it needs to deal with user input
     virtual void deserializeAndInsertFromArena(ReadBuffer & in, const SerializationSettings * settings) = 0;

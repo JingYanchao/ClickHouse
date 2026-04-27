@@ -37,6 +37,8 @@
 #include <Storages/MergeTree/MergeTreeIndexGranularityConstant.h>
 #include <Storages/MergeTree/PatchParts/PatchPartsUtils.h>
 #include <Storages/MergeTree/PrimaryIndexCache.h>
+#include <Storages/MergeTree/SSTFileUtil.h>
+#include <Storages/MergeTree/ProjectionIndex/ProjectionIndexUnique.h>
 #include <Storages/MergeTree/LoadedMergeTreeDataPartInfoForReader.h>
 #include <Storages/MergeTree/MergeTreeMarksLoader.h>
 #include <Storages/MergeTree/MergeTreeIndices.h>
@@ -2064,6 +2066,48 @@ bool IMergeTreeDataPart::supportLightweightDeleteMutate() const
 bool IMergeTreeDataPart::hasLightweightDelete() const
 {
     return columns.contains(RowExistsColumn::name);
+}
+
+SSTFileReaderPtr IMergeTreeDataPart::getOrOpenSSTReader(const StorageMetadataPtr & metadata_snapshot) const
+{
+    auto context = storage.getContext();
+    auto cache = context->getSSTFileReaderCache();
+    if (!cache)
+        return nullptr;
+
+    auto table_uuid = storage.getStorageID().uuid;
+    auto cache_key = SSTFileReaderCache::hash(table_uuid, name);
+
+    auto cached = cache->getOrSet(cache_key, [&]() -> SSTFileReaderCache::MappedPtr
+    {
+        const auto & projections = metadata_snapshot->getProjections();
+        for (const auto & projection : projections)
+        {
+            if (!projection.index)
+                continue;
+            auto * unique_index = dynamic_cast<const ProjectionIndexUnique *>(projection.index.get());
+            if (!unique_index)
+                continue;
+
+            auto it = projection_parts.find(projection.name);
+            if (it == projection_parts.end())
+                return {};
+
+            const auto & proj_part = *it->second;
+            const auto & proj_storage = proj_part.getDataPartStorage();
+            if (!proj_storage.existsFile(ProjectionIndexUnique::getSSTFileName()))
+                return {};
+
+            auto file_size = proj_storage.getFileSize(ProjectionIndexUnique::getSSTFileName());
+            if (file_size == 0)
+                return {};
+
+            return std::make_shared<const SSTFileReader>(proj_part.getDataPartStoragePtr(), ProjectionIndexUnique::getSSTFileName());
+        }
+        return {};
+    });
+
+    return cached;
 }
 
 void IMergeTreeDataPart::assertHasVersionMetadata(MergeTreeTransaction * txn) const

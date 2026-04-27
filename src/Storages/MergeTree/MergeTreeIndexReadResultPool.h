@@ -10,6 +10,9 @@
 namespace DB
 {
 
+class ReadBuffer;
+class WriteBuffer;
+
 class IMergeTreeDataPart;
 using DataPartPtr = std::shared_ptr<const IMergeTreeDataPart>;
 
@@ -83,24 +86,45 @@ struct ProjectionIndexBitmap
     ProjectionIndexBitmap(const ProjectionIndexBitmap &) = delete;
     ProjectionIndexBitmap & operator=(const ProjectionIndexBitmap &) = delete;
 
+    static ProjectionIndexBitmapPtr create(size_t size);
     static ProjectionIndexBitmapPtr create32();
     static ProjectionIndexBitmapPtr create64();
 
     void intersectWith(const ProjectionIndexBitmap & other);
+    void unionWith(const ProjectionIndexBitmap & other);
+    /// Compute difference: removes from this bitmap all values present in other.
+    /// Result is this AND NOT other.
+    void andNotWith(const ProjectionIndexBitmap & other);
     size_t cardinality() const;
     bool empty() const;
 
     template <typename Offset>
-    bool contains(std::type_identity_t<Offset> value);
+    bool contains(std::type_identity_t<Offset> value) const;
+
+    /// Type-dispatching overload: automatically calls Bitmap32 or Bitmap64 based on internal type.
+    bool contains(UInt64 value) const;
 
     template <typename Offset>
     void add(std::type_identity_t<Offset> value);
 
+    /// Type-dispatching overload: automatically calls Bitmap32 or Bitmap64 based on internal type.
+    void add(UInt64 value);
+
     template <typename Offset>
     void addBulk(const std::type_identity_t<Offset> * values, size_t size);
 
+    /// Flips all bits in the range [begin, end).
+    /// After flipping, bits that were 0 become 1 and vice versa.
+    void flipRange(size_t begin, size_t end);
+
     /// Checks whether the bitmap has no bits set in the range [begin, end).
     bool rangeAllZero(size_t begin, size_t end) const;
+
+    /// Checks whether the bitmap contains all values in the range [begin, end).
+    bool containsRange(size_t begin, size_t end) const;
+
+    /// Returns the number of values in the bitmap within the range [begin, end).
+    size_t rangeCardinality(size_t begin, size_t end) const;
 
     /// Appends a `PaddedPODArray<UInt8>` in the range [starting_row, starting_row + num_rows)
     /// with `1`s at positions corresponding to values present in the bitmap.
@@ -113,6 +137,14 @@ struct ProjectionIndexBitmap
     ///
     /// Returns true if at least one value in the bitmap falls within the specified range.
     bool appendToFilter(PaddedPODArray<UInt8> & filter, size_t starting_row, size_t num_rows) const;
+
+    /// Portable serialization for UniqueMergeTree delete marks.
+    /// Format: 4 bytes size + 32-bit roaring portable data (no type tag).
+    void serializePortable(WriteBuffer & out) const;
+
+    /// Portable deserialization for UniqueMergeTree delete marks.
+    /// Always creates a Bitmap32. Returns a new ProjectionIndexBitmapPtr.
+    static ProjectionIndexBitmapPtr deserializePortable(ReadBuffer & in);
 };
 
 class MergeTreeSelectProcessor;

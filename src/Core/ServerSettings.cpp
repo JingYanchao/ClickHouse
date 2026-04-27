@@ -14,6 +14,7 @@
 #include <Storages/MarkCache.h>
 #include <Storages/MergeTree/MergeTreeBackgroundExecutor.h>
 #include <Storages/MergeTree/PrimaryIndexCache.h>
+#include <Storages/MergeTree/SSTFileUtil.h>
 #include <Storages/MergeTree/VectorSimilarityIndexCache.h>
 #include <Storages/MergeTree/TextIndexCache.h>
 #include <Interpreters/Cache/QueryResultCache.h>
@@ -528,6 +529,13 @@ namespace
     DECLARE(UInt64, parquet_metadata_cache_size, DEFAULT_PARQUET_METADATA_CACHE_MAX_SIZE, "Maximum size of parquet metadata cache in bytes. Zero means disabled.", 0) \
     DECLARE(UInt64, parquet_metadata_cache_max_entries, DEFAULT_PARQUET_METADATA_CACHE_MAX_ENTRIES, "Maximum size of parquet metadata files cache in entries. Zero means disabled.", 0) \
     DECLARE(Double, parquet_metadata_cache_size_ratio, DEFAULT_PARQUET_METADATA_CACHE_SIZE_RATIO, "The size of the protected queue (in case of SLRU policy) in the parquet metadata cache relative to the cache's total size.", 0) \
+    DECLARE(String, sst_reader_cache_policy, DEFAULT_SST_READER_CACHE_POLICY, "SST file reader cache policy name.", 0) \
+    DECLARE(UInt64, sst_reader_cache_size, DEFAULT_SST_READER_CACHE_MAX_SIZE, R"(Maximum number of entries in the SST file reader cache used by unique dedup.
+
+    :::note
+    This setting can be modified at runtime and will take effect immediately.
+    :::)", 0) \
+    DECLARE(Double, sst_reader_cache_size_ratio, DEFAULT_SST_READER_CACHE_SIZE_RATIO, "The size of the protected queue (in case of SLRU policy) in the SST reader cache relative to the cache's total size.", 0) \
     DECLARE(String, allowed_disks_for_table_engines, "", "List of disks allowed for use with Iceberg", 0) \
     DECLARE(String, vector_similarity_index_cache_policy, DEFAULT_VECTOR_SIMILARITY_INDEX_CACHE_POLICY, "Vector similarity index cache policy name.", 0) \
     DECLARE(UInt64, vector_similarity_index_cache_size, DEFAULT_VECTOR_SIMILARITY_INDEX_CACHE_MAX_SIZE, R"(Size of cache for vector similarity indexes. Zero means disabled.
@@ -1780,6 +1788,7 @@ void ServerSettings::dumpToSystemServerSettingsColumns(ServerSettingColumnsParam
             {"text_index_header_cache_size", {std::to_string(context->getTextIndexHeaderCache()->maxSizeInBytes()), ChangeableWithoutRestart::Yes}},
             {"text_index_postings_cache_size", {std::to_string(context->getTextIndexPostingsCache()->maxSizeInBytes()), ChangeableWithoutRestart::Yes}},
             {"query_cache_max_size_in_bytes", {std::to_string(context->getQueryResultCache()->maxSizeInBytes()), ChangeableWithoutRestart::Yes}},
+            {"sst_reader_cache_size", {context->getSSTFileReaderCache() ? std::to_string(context->getSSTFileReaderCache()->maxSizeInBytes()) : "0", ChangeableWithoutRestart::Yes}},
 
             {"merge_workload", {context->getMergeWorkload(), ChangeableWithoutRestart::Yes}},
             {"mutation_workload", {context->getMutationWorkload(), ChangeableWithoutRestart::Yes}},

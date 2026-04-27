@@ -1,8 +1,11 @@
 #include <Storages/MergeTree/MergeTreeIndexReadResultPool.h>
 
+#include <IO/ReadBuffer.h>
+#include <IO/WriteBuffer.h>
 #include <Storages/MergeTree/MergeTreeDataSelectExecutor.h>
 #include <Storages/MergeTree/MergeTreeReadPoolProjectionIndex.h>
 #include <Storages/MergeTree/MergeTreeSelectProcessor.h>
+#include <roaring/roaring.h>
 
 namespace CurrentMetrics
 {
@@ -21,6 +24,7 @@ namespace DB
 
 namespace ErrorCodes
 {
+    extern const int INCORRECT_DATA;
     extern const int MEMORY_LIMIT_EXCEEDED;
 }
 
@@ -150,6 +154,14 @@ ProjectionIndexBitmap::~ProjectionIndexBitmap()
     }
 }
 
+ProjectionIndexBitmapPtr ProjectionIndexBitmap::create(size_t size)
+{
+    if (size <= std::numeric_limits<UInt32>::max())
+        return create32();
+    else
+        return create64();
+}
+
 ProjectionIndexBitmapPtr ProjectionIndexBitmap::create32()
 {
     return std::make_shared<ProjectionIndexBitmap>(BitmapType::Bitmap32);
@@ -169,6 +181,24 @@ void ProjectionIndexBitmap::intersectWith(const ProjectionIndexBitmap & other) /
         roaring64_bitmap_and_inplace(data.bitmap64, other.data.bitmap64);
 }
 
+void ProjectionIndexBitmap::unionWith(const ProjectionIndexBitmap & other) // NOLINT
+{
+    chassert(type == other.type);
+    if (type == BitmapType::Bitmap32)
+        roaring_bitmap_or_inplace(data.bitmap32, other.data.bitmap32);
+    else
+        roaring64_bitmap_or_inplace(data.bitmap64, other.data.bitmap64);
+}
+
+void ProjectionIndexBitmap::andNotWith(const ProjectionIndexBitmap & other) // NOLINT
+{
+    chassert(type == other.type);
+    if (type == BitmapType::Bitmap32)
+        roaring_bitmap_andnot_inplace(data.bitmap32, other.data.bitmap32);
+    else
+        roaring64_bitmap_andnot_inplace(data.bitmap64, other.data.bitmap64);
+}
+
 size_t ProjectionIndexBitmap::cardinality() const
 {
     if (type == BitmapType::Bitmap32)
@@ -186,7 +216,7 @@ bool ProjectionIndexBitmap::empty() const
 }
 
 template <typename Offset>
-bool ProjectionIndexBitmap::contains(std::type_identity_t<Offset> value)
+bool ProjectionIndexBitmap::contains(std::type_identity_t<Offset> value) const
 {
     static_assert(
         std::is_same_v<Offset, UInt32> || std::is_same_v<Offset, UInt64>,
@@ -246,6 +276,18 @@ void ProjectionIndexBitmap::addBulk(const std::type_identity_t<Offset> * values,
     }
 }
 
+void ProjectionIndexBitmap::flipRange(size_t begin, size_t end)
+{
+    if (type == BitmapType::Bitmap32)
+    {
+        roaring_bitmap_flip_inplace(data.bitmap32, begin, end);
+    }
+    else
+    {
+        roaring64_bitmap_flip_inplace(data.bitmap64, begin, end);
+    }
+}
+
 bool ProjectionIndexBitmap::rangeAllZero(size_t begin, size_t end) const
 {
     if (type == BitmapType::Bitmap32)
@@ -279,6 +321,28 @@ bool ProjectionIndexBitmap::rangeAllZero(size_t begin, size_t end) const
     }
 }
 
+
+bool ProjectionIndexBitmap::containsRange(size_t begin, size_t end) const
+{
+    if (begin >= end)
+        return true;
+
+    if (type == BitmapType::Bitmap32)
+        return roaring_bitmap_contains_range(data.bitmap32, static_cast<UInt32>(begin), static_cast<UInt32>(end));
+    else
+        return roaring64_bitmap_contains_range(data.bitmap64, begin, end);
+}
+
+size_t ProjectionIndexBitmap::rangeCardinality(size_t begin, size_t end) const
+{
+    if (begin >= end)
+        return 0;
+
+    if (type == BitmapType::Bitmap32)
+        return roaring_bitmap_range_cardinality(data.bitmap32, static_cast<UInt32>(begin), static_cast<UInt32>(end));
+    else
+        return roaring64_bitmap_range_cardinality(data.bitmap64, begin, end);
+}
 
 bool ProjectionIndexBitmap::appendToFilter(PaddedPODArray<UInt8> & filter, size_t starting_row, size_t num_rows) const
 {
@@ -335,8 +399,56 @@ bool ProjectionIndexBitmap::appendToFilter(PaddedPODArray<UInt8> & filter, size_
     }
 }
 
-template bool ProjectionIndexBitmap::contains<UInt32>(UInt32 value);
-template bool ProjectionIndexBitmap::contains<UInt64>(UInt64 value);
+void ProjectionIndexBitmap::serializePortable(WriteBuffer & out) const
+{
+    /// Format: 4 bytes serialized size + serialized 32-bit roaring data.
+    /// No type tag — UniqueMergeTree delete marks always use Bitmap32.
+    chassert(type == BitmapType::Bitmap32);
+
+    size_t size = roaring_bitmap_portable_size_in_bytes(data.bitmap32);
+    UInt32 size32 = static_cast<UInt32>(size);
+    out.write(reinterpret_cast<const char *>(&size32), sizeof(size32));
+
+    std::vector<char> buf(size);
+    roaring_bitmap_portable_serialize(data.bitmap32, buf.data());
+    out.write(buf.data(), size);
+}
+
+ProjectionIndexBitmapPtr ProjectionIndexBitmap::deserializePortable(ReadBuffer & in)
+{
+    /// Always deserialize as Bitmap32 — UniqueMergeTree delete marks use 32-bit bitmaps.
+    UInt32 size32 = 0;
+    in.readStrict(reinterpret_cast<char *>(&size32), sizeof(size32));
+
+    std::vector<char> buf(size32);
+    in.readStrict(buf.data(), size32);
+
+    auto bitmap = std::make_shared<ProjectionIndexBitmap>(BitmapType::Bitmap32);
+    roaring_bitmap_free(bitmap->data.bitmap32);
+    bitmap->data.bitmap32 = roaring_bitmap_portable_deserialize_safe(buf.data(), size32);
+    if (!bitmap->data.bitmap32)
+        throw Exception(ErrorCodes::INCORRECT_DATA, "Failed to deserialize 32-bit roaring bitmap");
+    return bitmap;
+}
+
+bool ProjectionIndexBitmap::contains(UInt64 value) const
+{
+    if (type == BitmapType::Bitmap32)
+        return roaring_bitmap_contains(data.bitmap32, static_cast<UInt32>(value));
+    else
+        return roaring64_bitmap_contains(data.bitmap64, value);
+}
+
+void ProjectionIndexBitmap::add(UInt64 value)
+{
+    if (type == BitmapType::Bitmap32)
+        roaring_bitmap_add(data.bitmap32, static_cast<UInt32>(value));
+    else
+        roaring64_bitmap_add(data.bitmap64, value);
+}
+
+template bool ProjectionIndexBitmap::contains<UInt32>(UInt32 value) const;
+template bool ProjectionIndexBitmap::contains<UInt64>(UInt64 value) const;
 
 template void ProjectionIndexBitmap::add<UInt32>(UInt32 value);
 template void ProjectionIndexBitmap::add<UInt64>(UInt64 value);

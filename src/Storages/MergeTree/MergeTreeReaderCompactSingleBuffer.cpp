@@ -64,7 +64,7 @@ try
                 continue;
 
             stream->adjustRightMark(current_task_last_mark); /// Must go before seek.
-            stream->seekToMarkAndColumn(from_mark, has_substream_marks ? columns_substreams.getFirstSubstreamPosition(*column_positions[pos]) : *column_positions[pos]);
+            stream->seekToMarkAndColumn(from_mark, has_substream_marks ? columns_substreams.getFirstSubstreamPosition(column_positions[pos].value_or(0)) : column_positions[pos].value_or(0));
 
             auto * cache_for_subcolumns = columns_for_offsets[pos] ? nullptr : &columns_cache_for_subcolumns;
             auto & deserialize_states_cache = deserialize_states_caches[columns_to_read[pos].getNameInStorage()];
@@ -137,7 +137,7 @@ try
 
     for (auto & column : columns_to_read)
     {
-        if (dynamic_cast<const DataTypeSortedStringKV *>(column.type->getCustomName()))
+        if (dynamic_cast<const IDataTypeSortedStringKV *>(column.type->getCustomName()))
         {
             auto stream_name = IMergeTreeDataPart::getStreamNameForColumn(
                 column, {}, SST_DATA_FILE_EXTENSION, data_part_info_for_read->getChecksums(), storage_settings);

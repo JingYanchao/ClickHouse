@@ -147,6 +147,7 @@ namespace MergeTreeSetting
     extern const MergeTreeSettingsBool materialize_statistics_on_merge;
     extern const MergeTreeSettingsBool propagate_types_serialization_versions_to_nested_types;
     extern const MergeTreeSettingsMergeTreeMapSerializationVersion map_serialization_version;
+    extern const MergeTreeSettingsBool allow_tuple_element_aggregation;
 }
 
 namespace ErrorCodes
@@ -2877,6 +2878,12 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::createMergedStream() const
             max_dynamic_subcolumns = (*merge_tree_settings)[MergeTreeSetting::merge_max_dynamic_subcolumns_in_wide_part].valueOrNullopt();
         else if (global_ctx->future_part->part_format.part_type == MergeTreeDataPartType::Compact)
             max_dynamic_subcolumns = (*merge_tree_settings)[MergeTreeSetting::merge_max_dynamic_subcolumns_in_compact_part].valueOrNullopt();
+
+        /// Propagate allow_tuple_element_aggregation from projection settings
+        /// so that AggregatingSortedTransform can aggregate Tuple elements.
+        if (global_ctx->projection)
+            global_ctx->merging_params.allow_tuple_element_aggregation
+                = (*merge_tree_settings)[MergeTreeSetting::allow_tuple_element_aggregation];
 
         auto merge_step = std::make_unique<MergePartsStep>(
             merge_parts_query_plan.getCurrentHeader(),

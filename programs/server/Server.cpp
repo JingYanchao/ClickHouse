@@ -334,6 +334,9 @@ namespace ServerSetting
     extern const ServerSettingsBool shutdown_wait_backups_and_restores;
     extern const ServerSettingsUInt64 shutdown_wait_unfinished;
     extern const ServerSettingsBool shutdown_wait_unfinished_queries;
+extern const ServerSettingsString sst_reader_cache_policy;
+extern const ServerSettingsUInt64 sst_reader_cache_size;
+extern const ServerSettingsDouble sst_reader_cache_size_ratio;
     extern const ServerSettingsUInt64 storage_connections_soft_limit;
     extern const ServerSettingsUInt64 storage_connections_store_limit;
     extern const ServerSettingsUInt64 storage_connections_hard_limit;
@@ -1967,6 +1970,11 @@ try
     }
     global_context->setMarkCache(mark_cache_policy, mark_cache_size, mark_cache_size_ratio);
 
+    String sst_reader_cache_policy = server_settings[ServerSetting::sst_reader_cache_policy];
+    size_t sst_reader_cache_size = server_settings[ServerSetting::sst_reader_cache_size];
+    double sst_reader_cache_size_ratio = server_settings[ServerSetting::sst_reader_cache_size_ratio];
+    global_context->setSSTFileReaderCache(sst_reader_cache_policy, sst_reader_cache_size, sst_reader_cache_size_ratio);
+
     String primary_index_cache_policy = server_settings[ServerSetting::primary_index_cache_policy];
     size_t primary_index_cache_size = server_settings[ServerSetting::primary_index_cache_size];
     double primary_index_cache_size_ratio = server_settings[ServerSetting::primary_index_cache_size_ratio];
@@ -2465,6 +2473,7 @@ try
                 global_context->updateTextIndexTokensCacheConfiguration(config(), max_cache_size_in_bytes);
                 global_context->updateTextIndexHeaderCacheConfiguration(config(), max_cache_size_in_bytes);
                 global_context->updateTextIndexPostingsCacheConfiguration(config(), max_cache_size_in_bytes);
+                global_context->updateSSTFileReaderCacheConfiguration(config(), max_cache_size_in_bytes);
                 global_context->updateMMappedFileCacheConfiguration(config(), max_cache_size_in_bytes);
                 global_context->updateQueryResultCacheConfiguration(config(), max_cache_size_in_bytes);
                 global_context->updateQueryConditionCacheConfiguration(config(), max_cache_size_in_bytes);

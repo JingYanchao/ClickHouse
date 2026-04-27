@@ -229,6 +229,13 @@ public:
     std::string_view getRawData() const override { return {reinterpret_cast<const char *>(chars.data()), chars.size()}; }
     std::span<char> insertRawUninitialized(size_t count) override;
 
+    ALWAYS_INLINE char * serializeValueIntoMemoryAsComparableRowFormat(size_t row, char * memory) const override;
+    size_t collectComparableSerializedValueSize() const override;
+    bool supportsSerializeValueIntoMemoryAsComparable() const override
+    {
+        return true;
+    }
+
     /// Specialized part of interface, not from IColumn.
     void insertString(const String & string) { insertData(string.c_str(), string.size()); }
     Chars & getChars() { return chars; }

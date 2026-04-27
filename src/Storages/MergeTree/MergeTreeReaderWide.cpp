@@ -277,7 +277,7 @@ void MergeTreeReaderWide::addStreams(
             return;
         }
 
-        if (dynamic_cast<const DataTypeSortedStringKV *>(name_and_type.type->getCustomName()))
+        if (dynamic_cast<const IDataTypeSortedStringKV *>(name_and_type.type->getCustomName()))
         {
             auto sst_stream_name = IMergeTreeDataPart::getStreamNameForColumn(
                 name_and_type, substream_path, SST_DATA_FILE_EXTENSION,
@@ -332,7 +332,7 @@ MergeTreeReaderWide::FileStreams::iterator MergeTreeReaderWide::addStream(const 
     };
 
     if (read_without_marks)
-        return streams.emplace(stream_name, create_stream.operator()<MergeTreeReaderStreamSingleColumnWholePart>()).first;
+        return streams.emplace(stream_name, create_stream.operator()<SSTFileReadStream>()).first;
 
     marks_loader->startAsyncLoad();
     return streams.emplace(stream_name, create_stream.operator()<MergeTreeReaderStreamSingleColumn>()).first;
@@ -634,10 +634,10 @@ void MergeTreeReaderWide::readData(
     };
 
     deserialize_settings.continuous_reading = continue_reading;
-    if (dynamic_cast<const DataTypeSortedStringKV *>(name_and_type.type->getCustomName()))
+    if (dynamic_cast<const IDataTypeSortedStringKV *>(name_and_type.type->getCustomName()))
     {
         deserialize_settings.sst_read_stream_getter
-            = [&](const ISerialization::SubstreamPath & substream_path) -> MergeTreeReaderStreamSingleColumnWholePart *
+            = [&](const ISerialization::SubstreamPath & substream_path) -> SSTFileReadStream *
             {
                 auto stream_name = IMergeTreeDataPart::getStreamNameForColumn(
                     name_and_type,

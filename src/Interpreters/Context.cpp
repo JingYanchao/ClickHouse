@@ -41,6 +41,7 @@
 #include <Interpreters/Context_fwd.h>
 #include <Server/ServerType.h>
 #include <Storages/MarkCache.h>
+#include <Storages/MergeTree/SSTFileUtil.h>
 #include <Common/JemallocCacheArena.h>
 #include <Storages/MergeTree/MergeList.h>
 #include <Storages/MergeTree/MovesList.h>
@@ -256,6 +257,8 @@ namespace CurrentMetrics
     extern const Metric IndexMarkCacheFiles;
     extern const Metric MarkCacheBytes;
     extern const Metric MarkCacheFiles;
+    extern const Metric SSTReaderCacheBytes;
+    extern const Metric SSTReaderCacheFiles;
     extern const Metric UncompressedCacheBytes;
     extern const Metric UncompressedCacheCells;
     extern const Metric IndexUncompressedCacheBytes;
@@ -556,6 +559,7 @@ struct ContextSharedPart : boost::noncopyable
     mutable QueryConditionCachePtr query_condition_cache TSA_GUARDED_BY(mutex);       /// Cache of matching marks for predicates
     mutable QueryResultCachePtr query_result_cache TSA_GUARDED_BY(mutex);             /// Cache of query results.
     mutable MarkCachePtr index_mark_cache TSA_GUARDED_BY(mutex);                      /// Cache of marks in compressed files of MergeTree indices.
+    mutable SSTFileReaderCachePtr sst_file_reader_cache TSA_GUARDED_BY(mutex);        /// Cache of SST file readers for unique dedup.
     mutable MMappedFileCachePtr mmap_cache TSA_GUARDED_BY(mutex);                     /// Cache of mmapped files to avoid frequent open/map/unmap/close and to reuse from several threads.
 #if USE_AVRO
     mutable IcebergMetadataFilesCachePtr iceberg_metadata_files_cache TSA_GUARDED_BY(mutex);   /// Cache of deserialized iceberg metadata files.
@@ -4132,6 +4136,48 @@ void Context::clearIndexMarkCache() const
         cache->clear();
 
     JemallocCacheArena::purge();
+}
+
+void Context::setSSTFileReaderCache(const String & cache_policy, size_t max_cache_size_in_bytes, double size_ratio)
+{
+    std::lock_guard lock(shared->mutex);
+
+    if (shared->sst_file_reader_cache)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "SST file reader cache has been already created.");
+
+    shared->sst_file_reader_cache = std::make_shared<SSTFileReaderCache>(
+        cache_policy, CurrentMetrics::SSTReaderCacheBytes, CurrentMetrics::SSTReaderCacheFiles,
+        max_cache_size_in_bytes, size_ratio);
+}
+
+SSTFileReaderCachePtr Context::getSSTFileReaderCache() const
+{
+    SharedLockGuard lock(shared->mutex);
+    return shared->sst_file_reader_cache;
+}
+
+void Context::clearSSTFileReaderCache() const
+{
+    SSTFileReaderCachePtr cache = getSSTFileReaderCache();
+
+    if (cache)
+        cache->clear();
+}
+
+void Context::updateSSTFileReaderCacheConfiguration(const Poco::Util::AbstractConfiguration & config, size_t max_cache_size)
+{
+    std::lock_guard lock(shared->mutex);
+
+    if (!shared->sst_file_reader_cache)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "SST file reader cache was not created yet.");
+
+    size_t max_size = config.getUInt64("sst_reader_cache_size", DEFAULT_SST_READER_CACHE_MAX_SIZE);
+    if (max_size > max_cache_size)
+    {
+        max_size = max_cache_size;
+        LOG_DEBUG(shared->log, "Lowered SST file reader cache size to {} because the system has limited RAM", formatReadableSizeWithBinarySuffix(max_size));
+    }
+    shared->sst_file_reader_cache->setMaxSizeInBytes(max_size);
 }
 
 void Context::setVectorSimilarityIndexCache(const String & cache_policy, size_t max_size_in_bytes, size_t max_entries, double size_ratio)

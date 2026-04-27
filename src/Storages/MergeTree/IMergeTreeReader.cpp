@@ -592,7 +592,7 @@ MergeTreeReaderPtr createMergeTreeReaderIndex(
     throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot create reader for index with type {}", index.index->index.type);
 }
 
-std::unique_ptr<MergeTreeReaderStreamSingleColumnWholePart> IMergeTreeReader::createSSTReadStream(
+std::unique_ptr<SSTFileReadStream> IMergeTreeReader::createSSTReadStream(
     const String & stream_name,
     const ReadBufferFromFileBase::ProfileCallback & profile_callback_,
     clockid_t clock_type_)
@@ -600,7 +600,10 @@ std::unique_ptr<MergeTreeReaderStreamSingleColumnWholePart> IMergeTreeReader::cr
     static constexpr size_t marks_count = 1;
     auto stream_settings = settings;
     stream_settings.is_compressed = false;
-    return std::make_unique<MergeTreeReaderStreamSingleColumnWholePart>(
+    /// Disable O_DIRECT and mmap for SST files: RocksDB issues unaligned reads
+    /// that violate O_DIRECT constraints, causing EINVAL from pread.
+    stream_settings.read_settings.direct_io_threshold = 0;
+    return std::make_unique<SSTFileReadStream>(
         data_part_info_for_read->getDataPartStorage(),
         stream_name,
             SST_DATA_FILE_EXTENSION,

@@ -553,7 +553,7 @@ void MergeTreeDataPartWriterWide::writeColumn(
         return {stream->plain_hashing.count(), stream->compressed_hashing.offset()};
     };
 
-    if (dynamic_cast<const DataTypeSortedStringKV *>(name_and_type.type->getCustomName()))
+if (dynamic_cast<const IDataTypeSortedStringKV *>(name_and_type.type->getCustomName()))
     {
         serialize_settings.sst_write_stream_getter
             = [&](const ISerialization::SubstreamPath & substream_path) -> SSTFileWriteStream *

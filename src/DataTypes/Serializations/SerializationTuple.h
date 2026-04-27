@@ -12,7 +12,7 @@ public:
     using ElementSerializationPtr = std::shared_ptr<const SerializationNamed>;
     using ElementSerializations = std::vector<ElementSerializationPtr>;
 
-private:
+protected:
     SerializationTuple(ElementSerializations elems_, bool has_explicit_names_)
         : elems(std::move(elems_)), has_explicit_names(has_explicit_names_)
     {

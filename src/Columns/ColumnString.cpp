@@ -345,6 +345,65 @@ void ColumnString::skipSerializedInArena(ReadBuffer & in) const
     in.ignore(string_size);
 }
 
+static constexpr size_t SERIALIZE_GROUP_SIZE = 8;
+static constexpr char DEFAULT_SERIALIZE_MARK = 0xff;
+/// serializeValueIntoMemoryAsComparableRowFormat guarantees the encoded value is in ascending order for comparison,
+/// encoding with the following rule:
+/// - [group1][marker1]...[groupN][markerN]
+/// - group is 8 bytes slice which is padding with 0.
+/// - marker is `0xFF - padding 0 count`.
+/// - if the last group doesn't have padding bytes, add a empty str group (0, 0, 0, 0, 0, 0, 0, 0, 247]) behind it.
+/// for example:
+///   [] -> [0, 0, 0, 0, 0, 0, 0, 0, 247]
+///   [1, 2, 3] -> [1, 2, 3, 0, 0, 0, 0, 0, 250]
+///   [1, 2, 3, 0] -> [1, 2, 3, 0, 0, 0, 0, 0, 251]
+///   [1, 2, 3, 4, 5, 6, 7, 8] -> [1, 2, 3, 4, 5, 6, 7, 8, 255, 0, 0, 0, 0, 0, 0, 0, 0, 247]
+///   [1, 2, 3, 4, 5, 6, 7, 8, 9] -> [1, 2, 3, 4, 5, 6, 7, 8, 255, 9, 0, 0, 0, 0, 0, 0, 0, 248]
+char * ColumnString::serializeValueIntoMemoryAsComparableRowFormat(size_t n, char * memory) const
+{
+    auto string_size = sizeAt(n) - 1; /// Remove the terminating 0.
+    auto offset = offsetAt(n);
+
+    auto write_group = [&] (size_t pos)
+    {
+        auto copy_count = std::min(string_size - pos, SERIALIZE_GROUP_SIZE);
+        auto padding_count = SERIALIZE_GROUP_SIZE - copy_count;
+        memcpy(memory, &chars[offset + pos], copy_count);
+        /// Explicitly zero-fill padding bytes so the encoded key is deterministic
+        /// regardless of the buffer's prior contents.
+        if (padding_count > 0)
+            memset(memory + copy_count, 0, padding_count);
+        memory += SERIALIZE_GROUP_SIZE;
+        *memory = DEFAULT_SERIALIZE_MARK - static_cast<char>(padding_count);
+        ++memory;
+    };
+
+    /// Whether the string size is less or greater than SERIALIZE_GROUP_SIZE,
+    /// the encoded value has at least one encode group.
+    write_group(0);
+    /// If the string size is a multiple of SERIALIZE_GROUP_SIZE,
+    /// the last group should be an empty group ([0, 0, 0, 0, 0, 0, 0, 0, 247]).
+    for (size_t i = SERIALIZE_GROUP_SIZE; i <= string_size; i += SERIALIZE_GROUP_SIZE)
+    {
+        write_group(i);
+    }
+    return memory;
+}
+
+size_t ColumnString::collectComparableSerializedValueSize() const
+{
+    if (size() == 0)
+        return 0;
+    auto get_serialized_size = [](size_t raw_size)
+    {
+        return (raw_size / SERIALIZE_GROUP_SIZE + 1) * (SERIALIZE_GROUP_SIZE + 1);
+    };
+    size_t total_size = 0;
+    for (size_t i = 0; i < size(); ++i)
+        total_size += get_serialized_size(sizeAt(i) - 1); /// Ignore the terminating 0.
+    return total_size;
+}
+
 ColumnPtr ColumnString::index(const IColumn & indexes, size_t limit) const
 {
     return selectIndexImpl(*this, indexes, limit);
