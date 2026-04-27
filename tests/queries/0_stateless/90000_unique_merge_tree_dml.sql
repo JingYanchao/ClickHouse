@@ -1,11 +1,7 @@
 -- Test: UniqueMergeTree basic DML operations
 --
 -- Covers INSERT (with and without version), UPDATE (with and without version).
-
--- ===================================================================
 -- INSERT: basic dedup
--- ===================================================================
-
 drop table if exists unique_merge_tree_insert;
 
 CREATE TABLE IF NOT EXISTS unique_merge_tree_insert
@@ -35,11 +31,7 @@ insert into unique_merge_tree_insert values(21, 11, 11),(10, 10, 10),(21, 12, 12
 select * from unique_merge_tree_insert order by id;
 
 drop table if exists unique_merge_tree_insert;
-
--- ===================================================================
 -- INSERT with version column
--- ===================================================================
-
 drop table if exists unique_merge_tree_insert_version;
 
 CREATE TABLE IF NOT EXISTS unique_merge_tree_insert_version
@@ -70,11 +62,7 @@ insert into unique_merge_tree_insert_version values(21, 11, 11, 8),(10, 10, 10, 
 select `id`, `value1`, `value2` from unique_merge_tree_insert_version order by id;
 
 drop table if exists unique_merge_tree_insert_version;
-
--- ===================================================================
 -- INSERT with version: lower version should NOT overwrite higher version
--- ===================================================================
-
 drop table if exists unique_version_order;
 
 CREATE TABLE unique_version_order
@@ -103,11 +91,7 @@ INSERT INTO unique_version_order SELECT number, 1000, 10 FROM numbers(5);
 SELECT id, value FROM unique_version_order ORDER BY id;
 
 DROP TABLE unique_version_order;
-
--- ===================================================================
 -- UPDATE: basic
--- ===================================================================
-
 drop table if exists unique_merge_tree_update;
 
 CREATE TABLE IF NOT EXISTS unique_merge_tree_update
@@ -141,11 +125,7 @@ select * from unique_merge_tree_update order by id;
 update unique_merge_tree_update set value1=100, value2=200, id=100 where id=1; -- { serverError 36 }
 
 drop table if exists unique_merge_tree_update;
-
--- ===================================================================
 -- UPDATE with version column
--- ===================================================================
-
 drop table if exists unique_merge_tree_update_version;
 
 CREATE TABLE IF NOT EXISTS unique_merge_tree_update_version
@@ -177,11 +157,7 @@ select `id`, `value1`, `value2` from unique_merge_tree_update_version order by i
 update unique_merge_tree_update_version set value1=100, value2=200, id=100 where id=1; -- { serverError 36 }
 
 drop table if exists unique_merge_tree_update_version;
-
--- ===================================================================
 -- INSERT with version: equal version tiebreak (later insert wins)
--- ===================================================================
-
 drop table if exists unique_version_tiebreak;
 
 CREATE TABLE unique_version_tiebreak
@@ -201,11 +177,7 @@ INSERT INTO unique_version_tiebreak SELECT number, 200, 5 FROM numbers(10);
 SELECT id, value FROM unique_version_tiebreak ORDER BY id;
 
 DROP TABLE unique_version_tiebreak;
-
--- ===================================================================
 -- INSERT: IPv4 unique key type
--- ===================================================================
-
 drop table if exists test_ipv4;
 drop table if exists test_ipv4_upsert;
 CREATE TABLE test_ipv4
@@ -231,11 +203,7 @@ select count(*) from test_ipv4_upsert;
 
 drop table test_ipv4;
 drop table test_ipv4_upsert;
-
--- ===================================================================
 -- INSERT: UUID unique key type
--- ===================================================================
-
 drop table if exists test_uuid;
 drop table if exists test_uuid_upsert;
 CREATE TABLE test_uuid
@@ -262,10 +230,7 @@ select count(*) from test_uuid_upsert;
 
 drop table test_uuid;
 drop table test_uuid_upsert;
-
--- ===================================================================
 -- INSERT: expression unique key
--- ===================================================================
 
 drop table if exists unique_expr_key_dml;
 
@@ -291,3 +256,71 @@ UPDATE unique_expr_key_dml SET value = 999 WHERE a = 2 AND b = 1;
 SELECT a, b, value FROM unique_expr_key_dml ORDER BY a, b;
 
 DROP TABLE unique_expr_key_dml;
+
+-- TRUNCATE: write → truncate → re-insert should succeed without error
+
+drop table if exists unique_truncate_dml;
+
+CREATE TABLE unique_truncate_dml
+(
+    id UInt32,
+    value1 UInt32,
+    value2 UInt32,
+    PROJECTION __unique_index INDEX id TYPE unique
+)
+ENGINE = UniqueMergeTree()
+ORDER BY id;
+
+-- Insert initial data
+INSERT INTO unique_truncate_dml SELECT number, number * 10, number * 100 FROM numbers(10);
+SELECT count() FROM unique_truncate_dml;
+SELECT * FROM unique_truncate_dml ORDER BY id;
+
+-- Truncate the table
+TRUNCATE TABLE unique_truncate_dml;
+SELECT count() FROM unique_truncate_dml;
+
+-- Re-insert same keys after truncate, should succeed
+INSERT INTO unique_truncate_dml SELECT number, number * 20, number * 200 FROM numbers(5);
+SELECT count() FROM unique_truncate_dml;
+SELECT * FROM unique_truncate_dml ORDER BY id;
+
+-- Upsert to verify dedup still works
+INSERT INTO unique_truncate_dml VALUES (0, 999, 999);
+SELECT * FROM unique_truncate_dml ORDER BY id;
+
+DROP TABLE unique_truncate_dml;
+
+-- TRUNCATE with version column: write → truncate → re-insert
+
+drop table if exists unique_truncate_version_dml;
+
+CREATE TABLE unique_truncate_version_dml
+(
+    id UInt32,
+    value1 UInt32,
+    value2 UInt32,
+    version UInt64,
+    PROJECTION __unique_index INDEX id TYPE unique('version')
+)
+ENGINE = UniqueMergeTree()
+ORDER BY id;
+
+-- Insert initial data with version=1
+INSERT INTO unique_truncate_version_dml SELECT number, number * 10, number * 100, 1 FROM numbers(10);
+SELECT count() FROM unique_truncate_version_dml;
+
+-- Truncate the table
+TRUNCATE TABLE unique_truncate_version_dml;
+SELECT count() FROM unique_truncate_version_dml;
+
+-- Re-insert same keys after truncate (version=1), should succeed
+INSERT INTO unique_truncate_version_dml SELECT number, number * 20, number * 200, 1 FROM numbers(5);
+SELECT count() FROM unique_truncate_version_dml;
+SELECT id, value1, value2 FROM unique_truncate_version_dml ORDER BY id;
+
+-- Overwrite with higher version
+INSERT INTO unique_truncate_version_dml VALUES (0, 999, 999, 2);
+SELECT id, value1, value2 FROM unique_truncate_version_dml ORDER BY id;
+
+DROP TABLE unique_truncate_version_dml;

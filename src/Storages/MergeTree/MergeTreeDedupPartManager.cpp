@@ -902,7 +902,7 @@ void MergeTreeDedupPartManager::dedupPart(
     const DataPartPtr & new_part,
     const std::optional<MergeTreeData::DeleteBitmapSnapshotMap> & source_delete_bitmap_snapshots)
 {
-    if (!new_part)
+    if (!new_part || new_part->rows_count == 0)
         return;
 
     /// Defensive check: `checkAndDedupPartsOnStartup` must complete before
