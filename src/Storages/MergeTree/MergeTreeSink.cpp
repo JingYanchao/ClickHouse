@@ -4,6 +4,7 @@
 #include <Storages/StorageMergeTree.h>
 #include <Storages/MergeTree/MergeTreeDataWriter.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
+#include <Storages/MergeTree/MergeTreeDedupPartManager.h>
 #include <Interpreters/InsertDeduplication.h>
 #include <Interpreters/PartLog.h>
 #include <Interpreters/Context.h>
@@ -327,9 +328,32 @@ std::vector<std::string> MergeTreeSink::commitPart(MergeTreeMutableDataPartPtr &
     /// It's important to create it outside of lock scope because
     /// otherwise it can lock parts in destructor and deadlock is possible.
     MergeTreeData::Transaction transaction(storage, context->getCurrentTransaction().get());
+
+    std::unique_ptr<PlainCommittingBlockHolder> block_holder;
+    std::optional<UniqueProcessLock> dedup_lock;
+
+    if (storage.supportsUpsert())
+    {
+        auto dedup_mgr = storage.getDedupManager();
+
+        /// Step 1: Acquire dedup_lock FIRST to serialize concurrent upsert commits.
+        dedup_lock.emplace(dedup_mgr->lockUniqueProcess());
+
+        /// Step 2: Allocate block number under DataPartsLock.
+        /// This ensures block_number ordering matches dedup_lock acquisition order,
+        {
+            auto lock = storage.lockParts();
+            block_holder = storage.fillNewPartName(part, lock);
+        }
+        dedup_mgr->dedupPart(part);
+    }
+
     {
         auto lock = storage.lockParts();
-        auto block_holder = storage.fillNewPartName(part, lock);
+
+        /// For non-upsert tables, allocate block number in the normal position.
+        if (!block_holder)
+            block_holder = storage.fillNewPartName(part, lock);
 
         if (!deduplication_hashes.empty())
         {

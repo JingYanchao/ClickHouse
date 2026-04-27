@@ -1,6 +1,7 @@
 #include <cstddef>
 #include <Storages/MergeTree/MutatePlainMergeTreeTask.h>
 
+#include <Storages/MergeTree/MergeTreeDedupPartManager.h>
 #include <Storages/StorageMergeTree.h>
 #include <Interpreters/TransactionLog.h>
 #include <Interpreters/Context.h>
@@ -125,6 +126,21 @@ bool MutatePlainMergeTreeTask::executeStep()
                 /// removePartsInRangeFromWorkingSet only removes Active parts and misses the PreActive
                 /// mutation result. After REPLACE releases the lock, the mutation's commit promotes
                 /// the PreActive part to Active, "resurrecting" old data.
+                ///
+                /// For UniqueMergeTree, use an explicit lock → rename → dedup → lockParts → commit
+                /// sequence (same pattern as INSERT in MergeTreeSink) instead of the hook-based
+                /// approach. This ensures the dedup manager sees the renamed part in the correct
+                /// state and the unique_process_mutex serializes the whole operation.
+                if (storage.supportsUpsert())
+                {
+                    auto dedup_mgr = storage.getDedupManager();
+                    auto dedup_lock = dedup_mgr->lockUniqueProcess();
+                    storage.renameTempPartAndReplace(new_part, transaction, /*rename_in_transaction=*/ false);
+                    dedup_mgr->dedupPart(new_part);
+                    auto lock = storage.lockParts();
+                    transaction.commit(lock);
+                }
+                else
                 {
                     auto lock = storage.lockParts();
                     storage.renameTempPartAndReplaceUnlocked(new_part, transaction, lock, /*rename_in_transaction=*/ false);

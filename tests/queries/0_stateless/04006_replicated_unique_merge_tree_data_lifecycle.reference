@@ -1,0 +1,82 @@
+--- replicated drop partition ---
+--- r1 after drop ---
+2024-01-02	1	30
+2024-01-02	2	40
+--- r2 after drop ---
+2024-01-02	1	30
+2024-01-02	2	40
+--- r1 after re-insert ---
+2024-01-01	1	999
+2024-01-02	1	30
+2024-01-02	2	40
+--- r2 after re-insert ---
+2024-01-01	1	999
+2024-01-02	1	30
+2024-01-02	2	40
+--- replicated truncate ---
+10
+10
+0
+0
+--- r1 after truncate + insert ---
+0	200
+1	201
+2	202
+3	203
+4	204
+--- r2 after truncate + insert ---
+0	200
+1	201
+2	202
+3	203
+4	204
+--- replicated drop partition: dedup after re-insert ---
+0
+0
+--- r1 dedup after re-insert ---
+2024-01-01	1	999
+2024-01-01	2	300
+--- r2 dedup after re-insert ---
+2024-01-01	1	999
+2024-01-01	2	300
+--- replicated truncate: dedup after re-insert ---
+0
+0
+--- r1 dedup after truncate ---
+2024-01-01	1	999
+2024-01-01	2	200
+--- r2 dedup after truncate ---
+2024-01-01	1	999
+2024-01-01	2	200
+--- replicated drop partition all ---
+0
+0
+--- r1 after drop all ---
+2024-01-01	1	200
+--- r2 after drop all ---
+2024-01-01	1	200
+--- replicated attach part: basic dedup ---
+0
+0
+--- r1 after attach ---
+2024-01-01	1	10
+2024-01-01	2	20
+2024-01-01	3	300
+--- r2 after attach ---
+2024-01-01	1	10
+2024-01-01	2	20
+2024-01-01	3	300
+--- replicated attach part: into empty table ---
+0
+--- r1 after re-attach ---
+2024-01-01	1	10
+2024-01-01	2	20
+--- r2 after re-attach ---
+2024-01-01	1	10
+2024-01-01	2	20
+--- r1 dedup after attach ---
+2024-01-01	1	999
+2024-01-01	2	20
+--- r2 dedup after attach ---
+2024-01-01	1	999
+2024-01-01	2	20

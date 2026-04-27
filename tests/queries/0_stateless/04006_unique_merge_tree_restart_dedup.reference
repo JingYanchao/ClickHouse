@@ -1,0 +1,76 @@
+--- restart dedup: basic ---
+10
+545
+10
+545
+--- restart dedup: intra-part ---
+3
+1	100
+2	200
+3	30
+3
+1	100
+2	200
+3	30
+--- restart dedup: multi-partition ---
+2024-01-01	1	100
+2024-01-01	2	20
+2024-01-02	1	30
+2024-01-02	2	200
+2024-01-01	1	100
+2024-01-01	2	20
+2024-01-02	1	30
+2024-01-02	2	200
+--- lazy materialization with dedup ---
+0	updated_0
+1	updated_1
+2	updated_2
+3	updated_3
+4	updated_4
+5	updated_5
+6	updated_6
+7	updated_7
+8	updated_8
+9	updated_9
+45	updated_45
+46	updated_46
+47	updated_47
+48	updated_48
+49	updated_49
+50	50
+51	51
+52	52
+53	53
+54	54
+100
+--- restart dedup: version ---
+0	500
+1	500
+2	500
+3	500
+4	500
+5	500
+6	500
+7	500
+8	500
+9	500
+0	500
+1	500
+2	500
+3	500
+4	500
+5	500
+6	500
+7	500
+8	500
+9	500
+0	999
+1	999
+2	999
+3	500
+4	500
+5	500
+6	500
+7	500
+8	500
+9	500

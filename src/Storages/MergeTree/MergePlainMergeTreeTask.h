@@ -2,6 +2,7 @@
 
 #include <Storages/MergeTree/IExecutableTask.h>
 #include <Storages/MergeTree/MergeTask.h>
+#include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MutationCommands.h>
 #include <Storages/MergeTree/MergeMutateSelectedEntry.h>
 #include <Interpreters/MergeTreeTransactionHolder.h>
@@ -93,6 +94,10 @@ private:
     ProfileEvents::Counters profile_counters;
 
     ContextMutablePtr task_context;
+
+    /// Snapshot of source parts' delete bitmaps taken at merge start.
+    /// Used for diff-based dedup optimization at commit time.
+    MergeTreeData::DeleteBitmapSnapshotMap source_delete_bitmap_snapshots;
 
     ContextMutablePtr createTaskContext() const;
 };

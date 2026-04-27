@@ -24,7 +24,11 @@
 #include <Storages/MergeTree/MergedPartOffsets.h>
 #include <Storages/MergeTree/checkDataPart.h>
 #include <Storages/MergeTree/ProjectionIndex/ProjectionIndexUnique.h>
+#include <Storages/MergeTree/MergeTreeIndexReadResultPool.h>
+#include <Columns/ColumnTuple.h>
 #include <Common/ThrottlerArray.h>
+
+#include <unordered_set>
 
 namespace DB
 {
@@ -180,6 +184,7 @@ MergeTreeSequentialSource::MergeTreeSequentialSource(
         .reader_settings = MergeTreeReaderSettings::createForMergeMutation(std::move(read_settings)),
         .storage_snapshot = storage_snapshot,
     };
+    extras.reader_settings.enable_upsert = storage.supportsUpsert();
 
     readers = MergeTreeReadTask::createReaders(read_task_info, extras, mark_ranges, patch_ranges);
 
@@ -244,15 +249,15 @@ try
         auto pos = reader_header.getPositionByName(name);
         auto & result_column = result_columns.emplace_back(std::move(read_result.columns[pos]));
 
-        /// When read_task_info->merged_part_offsets we need to adjust parent part offset in projection because it will
-        /// be different when parent has order by column and merge will change order of rows.
-        if (read_task_info->merged_part_offsets && read_task_info->data_part->isProjectionPart() && name == "_parent_part_offset")
+        /// When `merged_part_offsets` is set we need to adjust parent-part offsets
+        /// in projection columns because merge may reorder rows.
+        if (read_task_info->merged_part_offsets && read_task_info->data_part->isProjectionPart()
+            && name == "_parent_part_offset")
         {
             chassert(read_task_info->merged_part_offsets->isFinalized());
-
             result_column = result_column->convertToFullColumnIfSparse();
-            auto & column = result_column->assumeMutableRef();
-            auto & offset_data = assert_cast<ColumnUInt64 &>(column).getData();
+            auto & offset_data = assert_cast<ColumnUInt64 &>(result_column->assumeMutableRef()).getData();
+
             if (read_task_info->merged_part_offsets->isMappingEnabled())
             {
                 for (auto & offset : offset_data)
@@ -320,16 +325,20 @@ Pipe createMergeTreeSequentialSource(
     info->const_virtual_fields.emplace("_part_index", info->part_index_in_query);
     info->const_virtual_fields.emplace("_part_starting_offset", info->part_starting_offset_in_query);
 
-    /// Check if this is a unique projection part that needs offset translation
-    /// inside the embedded _unique_kv SST values.
+    /// Check if this is a unique projection part that needs custom filtering/translation
+    /// instead of the normal _row_exists path.
     const bool is_unique_projection_merge =
         info->data_part->isProjectionPart()
         && info->merged_part_offsets
         && std::ranges::find(columns_to_read, String(ProjectionIndexUnique::kv_column_name)) != columns_to_read.end();
 
-    /// The part might have some rows masked by lightweight deletes
+    /// The part might have some rows masked by lightweight deletes.
+    /// For unique projection parts, we skip the _row_exists filter entirely —
+    /// filtering is done by UniqueProjectionOffsetTransform based on the
+    /// parent part's delete bitmap and the SST value's embedded part_offset.
     bool has_lightweight_delete = info->data_part->hasLightweightDelete() || info->alter_conversions->hasLightweightDelete();
-    const bool need_to_filter_deleted_rows = apply_deleted_mask && has_lightweight_delete && !info->data_part->info.isPatch();
+    const bool need_to_filter_deleted_rows = apply_deleted_mask && has_lightweight_delete
+        && !info->data_part->info.isPatch() && !is_unique_projection_merge;
     const bool has_filter_column = std::ranges::find(columns_to_read, RowExistsColumn::name) != columns_to_read.end();
 
     if (need_to_filter_deleted_rows)
@@ -386,16 +395,26 @@ Pipe createMergeTreeSequentialSource(
         });
     }
 
-    /// For unique projection parts: translate the embedded part_offset values
-    /// inside _unique_kv via MergedPartOffsets.
+    /// For unique projection parts: filter stale entries by checking the embedded
+    /// part_offset against the parent part's delete bitmap, and translate surviving
+    /// offsets via MergedPartOffsets.
     if (is_unique_projection_merge)
     {
+        DeleteBitmapPtr part_delete_bitmap;
+        if (storage_snapshot->data)
+        {
+            const auto & snapshot_data = assert_cast<const MergeTreeData::SnapshotData &>(*storage_snapshot->data);
+            auto it = snapshot_data.delete_bitmap_buffer_map.find(saved_info_for_unique_projection_transform->data_part->getParentPartName());
+            if (it != snapshot_data.delete_bitmap_buffer_map.end())
+                part_delete_bitmap = it->second;
+        }
+
         pipe.addSimpleTransform(
-            [task_info = std::move(saved_info_for_unique_projection_transform)](const SharedHeader & header)
+            [task_info = std::move(saved_info_for_unique_projection_transform), bitmap = std::move(part_delete_bitmap)](const SharedHeader & header)
             {
                 return std::make_shared<UniqueProjectionOffsetTransform>(
                     *header, task_info->merged_part_offsets, task_info->part_index_in_query,
-                    task_info->part_starting_offset_in_query);
+                    task_info->part_starting_offset_in_query, bitmap);
             });
     }
 

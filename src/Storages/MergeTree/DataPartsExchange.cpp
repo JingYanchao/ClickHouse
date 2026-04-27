@@ -12,6 +12,7 @@
 #include <Server/HTTP/HTMLForm.h>
 #include <Server/HTTP/HTTPServerResponse.h>
 #include <Storages/MergeTree/MergedBlockOutputStream.h>
+#include <Storages/MergeTree/MergeTreeDedupPartManager.h>
 #include <Storages/MergeTree/ReplicatedFetchList.h>
 #include <Storages/StorageReplicatedMergeTree.h>
 #include <Storages/MergeTree/DataPartStorageOnDiskFull.h>
@@ -207,6 +208,16 @@ void Service::processQuery(const HTMLForm & params, ReadBufferPtr body, WriteBuf
         }
 
         sendPartFromDisk(part, out, client_protocol_version, false, send_projections);
+
+        /// Append dedup metadata (delete mark + partition block ranges) after
+        /// the part data so the fetching replica can apply them directly
+        /// instead of recomputing from source parts.
+        if (data.supportsUpsert())
+        {
+            auto dedup_meta = data.getDedupManager()->collectDedupMetadataForFetch(part);
+            dedup_meta.serialize(out);
+        }
+
         data.addLastSentPart(part->info);
     }
     catch (...)
@@ -359,11 +370,18 @@ MergeTreeData::DataPartPtr Service::findPart(const String & name)
         throw Exception(ErrorCodes::NO_SUCH_DATA_PART, "No part {} in table", name);
 
     bool zero_copy_enabled = (*data.getSettings())[MergeTreeSetting::allow_remote_fs_zero_copy_replication];
-    if (!zero_copy_enabled)
+
+    /// For Upsert tables, merged parts (level > 0) in PreActive state have
+    /// not yet finished cross-part dedup, so their delete marks are incomplete.
+    /// We must wait for the part to leave PreActive before serving it.
+    bool upsert_merged_part = data.supportsUpsert() && part->info.level > 0;
+
+    if (!zero_copy_enabled && !upsert_merged_part)
         return part;
 
     /// Ephemeral zero-copy lock may be lost for PreActive parts
-    /// do not expose PreActive parts for zero-copy
+    /// do not expose PreActive parts for zero-copy.
+    /// For Upsert merged parts, dedup metadata is not ready in PreActive state.
 
     static const UInt32 wait_timeout_ms = 1000;
     auto pred = [&] ()
@@ -376,9 +394,24 @@ MergeTreeData::DataPartPtr Service::findPart(const String & name)
     if (!pred_result)
         throw Exception(
                 ErrorCodes::ABORTED,
-                "Could not exchange part {} as it's in preActive state ({} ms) and it uses zero copy replication. "
+                "Could not exchange part {} as it's in preActive state ({} ms){}. "
                 "This is expected behaviour and the client will retry fetching the part automatically.",
-                name, wait_timeout_ms);
+                name, wait_timeout_ms,
+                upsert_merged_part ? " and dedup metadata is not ready" : " and it uses zero copy replication");
+
+    /// For Upsert merged parts that have become Outdated, the delete-mark
+    /// bitmap is no longer maintained (new INSERTs dedup against the
+    /// covering Active part instead).  Serving such a part would give the
+    /// fetching replica an inconsistent delete mark vs block-range snapshot.
+    /// Throw `NO_SUCH_DATA_PART` so the fetcher retries and
+    /// `findReplicaHavingCoveringPart` picks up the covering Active part
+    /// whose dedup metadata is up-to-date.
+    if (upsert_merged_part && part->getState() == MergeTreeDataPartState::Outdated)
+        throw Exception(
+                ErrorCodes::NO_SUCH_DATA_PART,
+                "Part {} is Outdated on this replica and its dedup metadata is stale. "
+                "The fetching replica should retry and fetch the covering part instead.",
+                name);
 
     return part;
 }
@@ -853,7 +886,16 @@ MergeTreeData::MutableDataPartPtr Fetcher::downloadPartToDisk(
         throw;
     }
 
+    /// For UniqueMergeTree: read dedup metadata (delete mark + partition
+    /// block ranges) appended after the part data by the source replica.
+    /// The server only sends dedup metadata for non-zero-copy fetches.
+    /// Deserialize before assertEOF so the stream is fully consumed.
+    std::optional<DedupMetadataForFetch> dedup_meta;
+    if (!to_remote_disk && data.supportsUpsert())
+        dedup_meta = DedupMetadataForFetch::deserialize(in);
+
     assertEOF(in);
+
     MergeTreeData::MutableDataPartPtr new_data_part;
     try
     {
@@ -870,6 +912,17 @@ MergeTreeData::MutableDataPartPtr Fetcher::downloadPartToDisk(
         new_data_part->remove_tmp_policy = IMergeTreeDataPart::BlobsRemovalPolicyForTemporaryParts::PRESERVE_BLOBS;
         new_data_part->modification_time = time(nullptr);
         new_data_part->loadColumnsChecksumsIndexes(true, false);
+
+        if (dedup_meta)
+        {
+            new_data_part->replaceDeleteBitmap(std::move(dedup_meta->delete_bitmap));
+            new_data_part->fetch_dedup_block_ranges = std::move(dedup_meta->block_ranges);
+
+            LOG_DEBUG(log, "Received dedup metadata for part {}: has_delete_bitmap={}, block_ranges_intervals={}",
+                new_data_part->name,
+                new_data_part->getDeleteBitmap() != nullptr,
+                boost::icl::interval_count(new_data_part->fetch_dedup_block_ranges));
+        }
     }
 #if USE_AWS_S3
     catch (const S3Exception & ex)

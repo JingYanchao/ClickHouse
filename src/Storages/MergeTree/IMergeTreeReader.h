@@ -90,6 +90,7 @@ public:
 
     virtual void updateAllMarkRanges(const MarkRanges & ranges) { all_mark_ranges = ranges; }
 
+    void setMemoryRowExistsOffset(size_t offset_);
 protected:
     /// Creates a context copy with experimental settings enabled and the enable_analyzer setting
     /// propagated. Used when compiling default or virtual-column expressions at read time.
@@ -160,6 +161,9 @@ protected:
 
     std::unique_ptr<SSTFileReadStream> createSSTReadStream(
         const String & stream_name, const ReadBufferFromFileBase::ProfileCallback & profile_callback_, clockid_t clock_type_);
+
+    /// Read data from memory for column `_row_exists`.
+    void fillMemoryRowExistsColumn(ColumnPtr column, size_t max_rows_to_read);
 private:
     friend class MergeTreeReaderIndex;
     friend class MergeTreeReaderTextIndex;
@@ -180,6 +184,9 @@ private:
 
     /// Fields of virtual columns that were filled in previous stages.
     VirtualFields virtual_fields;
+
+    /// Offset used to track the current read position when filling the in-memory `_row_exists` column.
+    size_t offset_for_memory_row_exists = 0;
 };
 
 using MergeTreeReaderPtr = std::unique_ptr<IMergeTreeReader>;

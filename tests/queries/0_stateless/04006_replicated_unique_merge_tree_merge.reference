@@ -1,0 +1,113 @@
+--- merge dedup ---
+10
+0	0	0
+1	1	1
+2	2	2
+3	3	3
+4	4	4
+5	5	5
+6	6	6
+7	7	7
+8	8	8
+9	9	9
+10
+0	0	0
+1	1	1
+2	2	2
+3	3	3
+4	4	4
+5	5	5
+6	6	6
+7	7	7
+8	8	8
+9	9	9
+--- mutation dedup ---
+0	0	0
+1	100	1
+2	2	2
+3	3	3
+4	4	4
+5	5	5
+6	6	6
+7	7	7
+8	8	8
+9	9	9
+0	0	0
+1	100	1
+2	200	200
+3	3	3
+4	4	4
+5	5	5
+6	6	6
+7	7	7
+8	8	8
+9	9	9
+--- two replica merge ---
+--- replica 1 after merge ---
+0	100
+1	101
+2	102
+3	103
+4	104
+5	5
+6	6
+7	7
+8	8
+9	9
+--- replica 2 after merge ---
+0	100
+1	101
+2	102
+3	103
+4	104
+5	5
+6	6
+7	7
+8	8
+9	9
+--- projection direct merge: delete bitmap ---
+--- r1 counts ---
+15
+15
+--- r2 counts ---
+15
+15
+--- r1 offset check ---
+1
+--- projection direct merge: different order ---
+--- r1 ---
+10
+10
+1
+--- r2 ---
+10
+10
+--- projection direct merge: versioned ---
+--- r1 ---
+10
+10
+5	5
+1
+--- r2 ---
+10
+10
+--- projection direct merge: versioned different order ---
+--- r1 data ---
+10
+0	500	5
+1	501	5
+2	502	5
+3	503	5
+4	504	5
+5	600	3
+6	601	3
+7	602	3
+8	603	3
+9	604	3
+--- r1 projection ---
+10
+5	5	0
+1
+--- r2 ---
+10
+10

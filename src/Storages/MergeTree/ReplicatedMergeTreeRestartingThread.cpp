@@ -1,6 +1,7 @@
 #include <atomic>
 #include <IO/Operators.h>
 #include <Storages/StorageReplicatedMergeTree.h>
+#include <Storages/MergeTree/MergeTreeDedupPartManager.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/MergeTree/ReplicatedMergeTreeRestartingThread.h>
 #include <Storages/MergeTree/ReplicatedMergeTreeQuorumEntry.h>
@@ -172,6 +173,14 @@ bool ReplicatedMergeTreeRestartingThread::runImpl()
     }
 
     setNotReadonly();
+
+    /// Rebuild delete marks for all active parts on process startup (first_time).
+    /// Must happen after cloneReplicaIfNeeded (inside tryStartup) so that the
+    /// local parts set is up-to-date, and before any merge/mutation can run.
+    /// On ZK session-expired reconnects the in-memory delete marks are still
+    /// valid, so we skip the expensive rebuild.
+    if (first_time && storage.supportsUpsert())
+        storage.getDedupManager()->loadDeleteBitmapsAndCheckOnStartup();
 
     /// Start queue processing
     storage.background_operations_assignee.start();

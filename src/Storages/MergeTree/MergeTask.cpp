@@ -553,6 +553,7 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare() const
     builder->withPartType(global_ctx->future_part->part_format.part_type);
 
     global_ctx->new_data_part = std::move(*builder).build();
+
     auto data_part_storage = global_ctx->new_data_part->getDataPartStoragePtr();
 
     if (data_part_storage->exists())
@@ -566,7 +567,17 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare() const
         global_ctx->temporary_directory_lock = global_ctx->data->getTemporaryPartDirectoryHolder(local_tmp_part_basename);
 
     global_ctx->storage_columns = global_ctx->metadata_snapshot->getColumns().getAllPhysical();
-    global_ctx->storage_snapshot = std::make_shared<StorageSnapshot>(*global_ctx->data, global_ctx->metadata_snapshot);
+    if (global_ctx->data->supportsUpsert())
+    {
+        /// Directly copy the pre-computed snapshots into SnapshotData.
+        /// Both maps have the same type (unordered_map<String, DeleteBitmapPtr>)
+        /// and snapshotSourceDeleteBitmaps already excludes nullptr entries.
+        auto snapshot_data = std::make_unique<MergeTreeData::SnapshotData>();
+        snapshot_data->delete_bitmap_buffer_map = global_ctx->delete_bitmap_snapshots;
+        global_ctx->storage_snapshot = std::make_shared<StorageSnapshot>(*global_ctx->data, global_ctx->metadata_snapshot, std::move(snapshot_data));
+    }
+    else
+        global_ctx->storage_snapshot = std::make_shared<StorageSnapshot>(*global_ctx->data, global_ctx->metadata_snapshot);
 
     ctx->need_remove_expired_values = false;
     ctx->force_ttl = false;
@@ -816,6 +827,13 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare() const
     global_ctx->new_data_part->setColumns(global_ctx->storage_columns, infos, global_ctx->metadata_snapshot->getMetadataVersion());
 
     ctx->sum_input_rows_upper_bound = global_ctx->merge_list_element_ptr->total_rows_count;
+    /// For UniqueMergeTree, rows marked as deleted will be filtered out during merge,
+    /// so subtract delete marks to get a more accurate upper bound.
+    if (global_ctx->data->supportsUpsert())
+    {
+        for (const auto & part : global_ctx->future_part->parts)
+            ctx->sum_input_rows_upper_bound -= part->getDeleteBitmapCount();
+    }
     ctx->sum_compressed_bytes_upper_bound = global_ctx->merge_list_element_ptr->total_size_bytes_compressed;
     ctx->sum_uncompressed_bytes_upper_bound = global_ctx->merge_list_element_ptr->total_size_bytes_uncompressed;
 
@@ -1131,8 +1149,20 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::prepareProjectionsToMergeAndRe
         const bool is_special_projection = projection.with_parent_part_offset || projection.with_block_number || projection.with_block_offset;
         if (global_ctx->merge_may_reduce_rows && (mode != DeduplicateMergeProjectionMode::IGNORE || is_special_projection))
         {
-            global_ctx->projections_to_rebuild.push_back(&projection);
-            continue;
+            /// For UniqueMergeTree, unique projection indexes can use Direct Merge
+            /// with dedicated filtering/translation (UniqueProjectionOffsetTransform),
+            /// unless rows are being removed by TTL expiration.
+            if (global_ctx->data->supportsUpsert()
+                && !ctx->need_remove_expired_values
+                && projection.index && projection.index->getName() == "unique")
+            {
+                /// Fall through to collect projection parts and enter Direct Merge path.
+            }
+            else
+            {
+                global_ctx->projections_to_rebuild.push_back(&projection);
+                continue;
+            }
         }
         else if (some_source_column_expired && mode != DeduplicateMergeProjectionMode::IGNORE)
         {
@@ -1832,6 +1862,12 @@ bool MergeTask::MergeProjectionsStage::prepareProjections() const
             global_ctx->mutator,
             global_ctx->merges_blocker,
             global_ctx->ttl_merges_blocker));
+
+        /// Pass parent parts' delete bitmap snapshots to the projection merge sub-task.
+        /// The bitmaps are keyed by parent part name. UniqueProjectionOffsetTransform
+        /// looks up the bitmap using the projection part's parent part name.
+        if (!global_ctx->delete_bitmap_snapshots.empty())
+            ctx->tasks_for_projections.back()->setDeleteBitmapSnapshots(global_ctx->delete_bitmap_snapshots);
     }
 
     /// merge projections with _part_offset first so that we can release offset mapping earlier.
@@ -2735,8 +2771,7 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::createMergedStream() const
         }
     }
 
-    if (!global_ctx->merge_may_reduce_rows
-        && !global_ctx->text_indexes_to_merge.empty()
+    if ((!global_ctx->merge_may_reduce_rows || global_ctx->data->supportsUpsert()) && !global_ctx->text_indexes_to_merge.empty()
         && (!global_ctx->merged_part_offsets || !global_ctx->merged_part_offsets->isMappingEnabled()))
     {
         global_ctx->merged_part_offsets = std::make_shared<MergedPartOffsets>(global_ctx->future_part->parts.size(), MergedPartOffsets::MappingMode::Enabled);
@@ -2879,8 +2914,6 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::createMergedStream() const
         else if (global_ctx->future_part->part_format.part_type == MergeTreeDataPartType::Compact)
             max_dynamic_subcolumns = (*merge_tree_settings)[MergeTreeSetting::merge_max_dynamic_subcolumns_in_compact_part].valueOrNullopt();
 
-        /// Propagate allow_tuple_element_aggregation from projection settings
-        /// so that AggregatingSortedTransform can aggregate Tuple elements.
         if (global_ctx->projection)
             global_ctx->merging_params.allow_tuple_element_aggregation
                 = (*merge_tree_settings)[MergeTreeSetting::allow_tuple_element_aggregation];
@@ -2991,7 +3024,13 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::createMergedStream() const
 
 MergeAlgorithm MergeTask::ExecuteAndFinalizeHorizontalPart::chooseMergeAlgorithm() const
 {
-    const size_t total_rows_count = global_ctx->merge_list_element_ptr->total_rows_count;
+    size_t total_rows_count = global_ctx->merge_list_element_ptr->total_rows_count;
+    /// For UniqueMergeTree, exclude delete-marked rows for a more accurate algorithm decision.
+    if (global_ctx->data->supportsUpsert())
+    {
+        for (const auto & part : global_ctx->future_part->parts)
+            total_rows_count -= part->getDeleteBitmapCount();
+    }
     const size_t total_size_bytes_uncompressed = global_ctx->merge_list_element_ptr->total_size_bytes_uncompressed;
     const auto & merge_tree_settings = global_ctx->data_settings;
 

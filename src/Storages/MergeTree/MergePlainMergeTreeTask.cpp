@@ -132,6 +132,19 @@ void MergePlainMergeTreeTask::prepare()
         }
     };
 
+    /// Snapshot source parts' delete marks before the merge starts.
+    /// At commit time, the diff (current - snapshot) tells us which rows
+    /// were newly deleted by concurrent INSERTs during the merge.
+    /// The same snapshot is also used by MergeTask for reading _row_exists,
+    /// ensuring both paths see a consistent view.
+    if (storage.supportsUpsert())
+    {
+        DataPartsVector source_parts;
+        for (const auto & p : future_part->parts)
+            source_parts.push_back(p);
+        source_delete_bitmap_snapshots = storage.getDeleteBitmapSnapshot(source_parts);
+    }
+
     merge_task = storage.merger_mutator.mergePartsToTemporaryPart(
         future_part,
         metadata_snapshot,
@@ -146,6 +159,11 @@ void MergePlainMergeTreeTask::prepare()
         cleanup,
         storage.merging_params,
         txn);
+
+    /// Pass the snapshot to MergeTask so it builds StorageSnapshot from the
+    /// same data, keeping the merge reader and commit-time dedup aligned.
+    if (!source_delete_bitmap_snapshots.empty())
+        merge_task->setDeleteBitmapSnapshots(source_delete_bitmap_snapshots);
 }
 
 
@@ -155,6 +173,13 @@ void MergePlainMergeTreeTask::finish()
 
     MergeTreeData::Transaction transaction(storage, txn.get());
     storage.merger_mutator.renameMergedTemporaryPart(new_part, future_part->parts, txn, transaction);
+    /// Pass delete mark snapshots to the before-commit hook for diff-based dedup.
+    {
+        MergeTreeData::BeforeCommitHookContext hook_ctx;
+        hook_ctx.data = std::move(source_delete_bitmap_snapshots);
+        transaction.setBeforeCommitHookContext(std::move(hook_ctx));
+    }
+
     transaction.commit();
 
     ThreadFuzzer::maybeInjectSleep();

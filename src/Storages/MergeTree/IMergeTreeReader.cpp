@@ -1,10 +1,12 @@
 #include <cstddef>
 #include <vector>
 #include <Storages/MergeTree/IMergeTreeReader.h>
+#include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreeIndexConditionText.h>
 #include <Storages/MergeTree/MergeTreeReadTask.h>
 #include <Storages/MergeTree/MergeTreeVirtualColumns.h>
 #include <Storages/MergeTree/LoadedMergeTreeDataPartInfoForReader.h>
+#include <Storages/MergeTree/MergeTreeIndexReadResultPool.h>
 #include <DataTypes/NestedUtils.h>
 #include <DataTypes/DataTypeNested.h>
 #include <Common/escapeForFileName.h>
@@ -73,6 +75,18 @@ IMergeTreeReader::IMergeTreeReader(
             NameAndTypePair requested_column_in_storage{column.getNameInStorage(), column.getTypeInStorage()};
             serializations_of_full_columns.emplace(column_to_read.getNameInStorage(), getSerializationInPart(requested_column_in_storage));
         }
+    }
+
+    if (settings.enable_upsert)
+    {
+        size_t left_mark = std::numeric_limits<size_t>::max();
+        for (auto r : all_mark_ranges)
+        {
+            if (left_mark > r.begin)
+                left_mark = r.begin;
+        }
+        const auto & index_granularity = data_part_info_for_read->getIndexGranularity();
+        offset_for_memory_row_exists = static_cast<UInt32>(index_granularity.getMarkStartingRow(left_mark));
     }
 }
 
@@ -603,6 +617,7 @@ std::unique_ptr<SSTFileReadStream> IMergeTreeReader::createSSTReadStream(
     /// Disable O_DIRECT and mmap for SST files: RocksDB issues unaligned reads
     /// that violate O_DIRECT constraints, causing EINVAL from pread.
     stream_settings.read_settings.direct_io_threshold = 0;
+    stream_settings.read_settings.mmap_threshold = 0;
     return std::make_unique<SSTFileReadStream>(
         data_part_info_for_read->getDataPartStorage(),
         stream_name,
@@ -615,6 +630,109 @@ std::unique_ptr<SSTFileReadStream> IMergeTreeReader::createSSTReadStream(
         /*marks_loader=*/nullptr,
         profile_callback_,
         clock_type_);
+}
+
+void IMergeTreeReader::fillMemoryRowExistsColumn(ColumnPtr column, size_t max_rows_to_read)
+{
+    chassert(settings.enable_upsert);
+    auto mutable_column = column->assumeMutable();
+    auto * derived_column = dynamic_cast<ColumnVector<UInt8> *>(mutable_column.get());
+    if (!derived_column)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Column _row_exists should be a UInt8 column, but got {}", column->getName());
+
+    /// Retrieve the delete mark bitmap from the storage snapshot instead of directly from the part.
+    /// The snapshot captures a consistent copy of the bitmap at query start time under lockParts,
+    /// which avoids race conditions with concurrent commitDeleteBitmapBuffers writes.
+    DeleteBitmapPtr delete_bitmap;
+    if (storage_snapshot->data && !data_part_info_for_read->isProjectionPart())
+    {
+        const auto & part_name = data_part_info_for_read->getPartName();
+        const auto & snapshot_data = assert_cast<const MergeTreeData::SnapshotData &>(*storage_snapshot->data);
+        const auto & delete_bitmap_buffer_map = snapshot_data.delete_bitmap_buffer_map;
+        const auto iter = delete_bitmap_buffer_map.find(part_name);
+        delete_bitmap = iter != delete_bitmap_buffer_map.end() ? iter->second : nullptr;
+    }
+
+    ColumnVector<UInt8>::Container & container = derived_column->getData();
+    auto initial_size = container.size();
+    container.resize(initial_size + max_rows_to_read);
+    UInt8 * data_ptr = container.data() + initial_size;
+
+    const bool has_buffer = delete_bitmap && delete_bitmap->cardinality() > 0;
+
+    /// Early exit if no deleted marks
+    if (!has_buffer)
+    {
+        /// Fast path: no deleted marks, all rows exist
+        memset(data_ptr, 1, max_rows_to_read);
+        offset_for_memory_row_exists += max_rows_to_read;
+        column = std::move(mutable_column);
+        return;
+    }
+
+    const size_t start = offset_for_memory_row_exists;
+    const size_t end = start + max_rows_to_read;
+
+    bool can_use_32bit_offset = data_part_info_for_read->getRowCount() <= std::numeric_limits<UInt32>::max();
+
+    auto process_delete_buffer = [&]<typename BitmapOffset>(BitmapOffset)
+    {
+        if (delete_bitmap->containsRange(start, end))
+        {
+            /// Fast path: all rows deleted.
+            memset(data_ptr, 0, max_rows_to_read);
+            return;
+        }
+
+        if (delete_bitmap->rangeCardinality(start, end) == 0)
+        {
+            /// Fast path: all rows exist.
+            memset(data_ptr, 1, max_rows_to_read);
+            return;
+        }
+
+        /// Mixed case: some rows exist, some don't - need per-element check.
+        /// Use block-wise checking to leverage memset for homogeneous blocks.
+        /// Block size of 32 provides good balance between check overhead and memset benefit.
+        constexpr static size_t BLOCK_SIZE = 32;
+
+        for (size_t block_start = start; block_start < end; block_start += BLOCK_SIZE)
+        {
+            size_t block_end = std::min(block_start + BLOCK_SIZE, end);
+            size_t block_size = block_end - block_start;
+
+            if (delete_bitmap->containsRange(block_start, block_end))
+            {
+                /// Fast path: entire block deleted
+                memset(data_ptr, 0, block_size);
+            }
+            else if (delete_bitmap->rangeCardinality(block_start, block_end) == 0)
+            {
+                /// Fast path: entire block exists
+                memset(data_ptr, 1, block_size);
+            }
+            else /// The case of `rangeCardinality` equaling to `block_size` is covered by `containsRange` check above.
+            {
+                /// Mixed block: check each row individually
+                for (size_t i = 0; i < block_size; ++i)
+                    data_ptr[i] = !delete_bitmap->contains<BitmapOffset>(static_cast<BitmapOffset>(block_start + i));
+            }
+            data_ptr += block_size;
+        }
+    };
+
+    if (can_use_32bit_offset)
+        process_delete_buffer(UInt32{});
+    else
+        process_delete_buffer(UInt64{});
+
+    column = std::move(mutable_column);
+    offset_for_memory_row_exists += max_rows_to_read;
+}
+
+void IMergeTreeReader::setMemoryRowExistsOffset(size_t offset_)
+{
+    offset_for_memory_row_exists = offset_;
 }
 
 }

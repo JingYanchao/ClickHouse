@@ -2,6 +2,7 @@
 
 #include <Columns/ColumnTuple.h>
 #include <Columns/ColumnVector.h>
+#include <Storages/MergeTree/MergeTreeIndexReadResultPool.h>
 
 namespace DB
 {
@@ -10,11 +11,13 @@ UniqueProjectionOffsetTransform::UniqueProjectionOffsetTransform(
     const Block & header,
     MergedPartOffsetsPtr offsets_,
     size_t part_index_,
-    size_t part_starting_offset_)
-    : ISimpleTransform(header, header, /*skip_empty_chunks=*/ false)
+    size_t part_starting_offset_,
+    DeleteBitmapPtr delete_bitmap_)
+    : ISimpleTransform(header, header, /*skip_empty_chunks=*/ true)
     , offsets(std::move(offsets_))
     , part_index(part_index_)
     , part_starting_offset(part_starting_offset_)
+    , delete_bitmap(std::move(delete_bitmap_))
     , kv_pos(header.getPositionByName(ProjectionIndexUnique::kv_column_name))
 {
 }
@@ -38,15 +41,47 @@ void UniqueProjectionOffsetTransform::transform(Chunk & chunk)
     else
         offset_data = assert_cast<ColumnUInt64 &>(value_col).getData();
 
-    for (auto & offset : offset_data)
+    /// Build a filter: keep rows whose part_offset is NOT in the delete bitmap.
+    /// Simultaneously translate offsets for surviving rows.
+    IColumn::Filter filter(offset_data.size(), 1);
+    bool has_deleted = false;
+
+    for (size_t j = 0; j < offset_data.size(); ++j)
     {
+        if (delete_bitmap && delete_bitmap->contains(offset_data[j]))
+        {
+            filter[j] = 0;
+            has_deleted = true;
+            continue;
+        }
+
         if (offsets && offsets->isMappingEnabled())
-            offset = (*offsets)[part_index, offset];
+        {
+            size_t filtered_index = offset_data[j];
+            if (delete_bitmap)
+                filtered_index -= delete_bitmap->rangeCardinality(0, offset_data[j]);
+            offset_data[j] = (*offsets)[part_index, filtered_index];
+        }
         else if (offsets)
-            offset += part_starting_offset;
+        {
+            offset_data[j] += part_starting_offset;
+        }
     }
 
-    chunk.setColumns(std::move(columns), num_rows);
+    if (has_deleted)
+    {
+        size_t remaining = 0;
+        for (auto & col : columns)
+        {
+            col = col->filter(filter, -1);
+            remaining = col->size();
+        }
+        chunk.setColumns(std::move(columns), remaining);
+    }
+    else
+    {
+        chunk.setColumns(std::move(columns), num_rows);
+    }
 }
 
 }

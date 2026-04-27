@@ -239,6 +239,9 @@
     M(MergeTreePartsCleanerThreads, "Number of threads in the MergeTree parts cleaner thread pool.") \
     M(MergeTreePartsCleanerThreadsActive, "Number of threads in the MergeTree parts cleaner thread pool running a task.") \
     M(MergeTreePartsCleanerThreadsScheduled, "Number of queued or active jobs in the MergeTree parts cleaner thread pool.") \
+    M(UniqueKeyDedupThreads, "Number of threads in the UniqueKeyDedup thread pool for parallel deduplication.") \
+    M(UniqueKeyDedupThreadsActive, "Number of threads in the UniqueKeyDedup thread pool running a task.") \
+    M(UniqueKeyDedupThreadsScheduled, "Number of queued or active jobs in the UniqueKeyDedup thread pool.") \
     M(DatabaseReplicatedCreateTablesThreads, "Number of threads in the threadpool for table creation in DatabaseReplicated.") \
     M(DatabaseReplicatedCreateTablesThreadsActive, "Number of active threads in the threadpool for table creation in DatabaseReplicated.") \
     M(DatabaseReplicatedCreateTablesThreadsScheduled, "Number of queued or active jobs in the threadpool for table creation in DatabaseReplicated.") \
@@ -347,11 +350,11 @@
     M(DNSAddressesCacheSize, "Number of cached DNS addresses") \
     M(MarkCacheBytes, "Total size of mark cache in bytes") \
     M(MarkCacheFiles, "Total number of mark files cached in the mark cache") \
+    M(SSTReaderCacheBytes, "Total size of the SST reader cache in bytes") \
+    M(SSTReaderCacheFiles, "Total number of SST file readers cached in the SST reader cache") \
     M(NamedCollection, "Number of named collections") \
     M(PrimaryIndexCacheBytes, "Total size of primary index cache in bytes") \
     M(PrimaryIndexCacheFiles, "Total number of index files cached in the primary index cache") \
-    M(SSTReaderCacheBytes, "Total size of the SST reader cache in bytes") \
-    M(SSTReaderCacheFiles, "Total number of SST file readers cached in the SST reader cache") \
     M(PageCacheBytes, "Total size of userspace page cache in bytes") \
     M(PageCacheCells, "Total number of entries in the userspace page cache") \
     M(UncompressedCacheBytes, "Total size of uncompressed cache in bytes. Uncompressed cache does not usually improve the performance and should be mostly avoided") \

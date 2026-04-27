@@ -16,6 +16,7 @@
 #include <IO/SharedThreadPools.h>
 #include <Compression/CachedCompressedReadBuffer.h>
 #include <DataTypes/DataTypeSortedStringKV.h>
+#include <Storages/MergeTree/MergeTreeVirtualColumns.h>
 
 namespace DB
 {
@@ -332,7 +333,7 @@ MergeTreeReaderWide::FileStreams::iterator MergeTreeReaderWide::addStream(const 
     };
 
     if (read_without_marks)
-        return streams.emplace(stream_name, create_stream.operator()<SSTFileReadStream>()).first;
+        return streams.emplace(stream_name, create_stream.operator()<MergeTreeReaderStreamSingleColumnWholePart>()).first;
 
     marks_loader->startAsyncLoad();
     return streams.emplace(stream_name, create_stream.operator()<MergeTreeReaderStreamSingleColumn>()).first;
@@ -589,6 +590,12 @@ void MergeTreeReaderWide::readData(
 {
     ISerialization::DeserializeBinaryBulkSettings deserialize_settings;
     deserialize_settings.data_part_type = MergeTreeDataPartType::Wide;
+
+    if (settings.enable_upsert && name_and_type.name == RowExistsColumn::name)
+    {
+        fillMemoryRowExistsColumn(column, max_rows_to_read);
+        return;
+    }
 
     deserializePrefix(serialization, name_and_type, from_mark, current_task_last_mark, deserialize_binary_bulk_state_map, cache, deserialize_states_cache, {});
 

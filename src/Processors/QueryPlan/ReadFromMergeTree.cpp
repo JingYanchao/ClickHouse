@@ -433,6 +433,7 @@ ReadFromMergeTree::ReadFromMergeTree(
     setStepDescription(description, context->getSettingsRef()[Setting::query_plan_max_step_description_length]);
     enable_vertical_final = query_info.isFinal() && context->getSettingsRef()[Setting::enable_vertical_final]
         && data.merging_params.mode == MergeTreeData::MergingParams::Replacing;
+    reader_settings.enable_upsert = data.supportsUpsert();
 }
 
 std::unique_ptr<ReadFromMergeTree> ReadFromMergeTree::createLocalParallelReplicasReadingStep(
@@ -3163,11 +3164,19 @@ std::unique_ptr<LazilyReadFromMergeTree> ReadFromMergeTree::keepOnlyRequiredColu
 
     PartRangesReadInfo info(getParts(), context->getSettingsRef(), *data.getSettings());
 
+    /// Disable apply_deleted_mask for lazy reading unconditionally.
+    /// The main reading stream has already filtered out deleted rows via _row_exists column.
+    /// The lazy reading stream reads rows by their global indices calculated from the main stream,
+    /// so applying _row_exists filter again would cause row count mismatch.
+    /// This affects all MergeTree engines with lightweight deletes, not just UniqueMergeTree.
+    auto lazy_reader_settings = reader_settings;
+    lazy_reader_settings.apply_deleted_mask = false;
+
     auto new_reading = std::make_unique<LazilyReadFromMergeTree>(
         std::move(lazy_reading_header),
         block_size.max_block_size_rows,
         info.min_marks_for_concurrent_read,
-        reader_settings,
+        lazy_reader_settings,
         mutations_snapshot,
         storage_snapshot,
         context,
@@ -3273,7 +3282,7 @@ void ReadFromMergeTree::initializePipeline(QueryPipelineBuilder & pipeline, cons
 {
     auto & result = getAnalysisResult();
 
-    if (enable_remove_parts_from_snapshot_optimization)
+    if (enable_remove_parts_from_snapshot_optimization && !data.supportsUpsert())
     {
         /// Do not keep data parts in snapshot.
         /// They are stored separately, and some could be released after PK analysis.

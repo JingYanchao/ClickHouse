@@ -38,6 +38,7 @@
 #include <Storages/MergeTree/MergeList.h>
 #include <Storages/MergeTree/MergePlainMergeTreeTask.h>
 #include <Storages/MergeTree/MergeTreeData.h>
+#include <Storages/MergeTree/MergeTreeDedupPartManager.h>
 #include <Storages/MergeTree/MergeTreeMutationStatus.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/MergeTree/MergeTreeSink.h>
@@ -2527,9 +2528,17 @@ PartitionCommandsResultInfo StorageMergeTree::attachPartition(
         /// otherwise it can lock parts in destructor and deadlock is possible.
         MergeTreeData::Transaction transaction(*this, local_context->getCurrentTransaction().get());
         {
+            std::optional<UniqueProcessLock> dedup_lock;
+            if (dedup_manager)
+                dedup_lock.emplace(dedup_manager->lockUniqueProcess());
+
             auto lock = lockParts();
             auto block_holder = fillNewPartNameAndResetLevel(loaded_parts[i], lock);
             renameTempPartAndAdd(loaded_parts[i], transaction, lock, /*rename_in_transaction=*/ false);
+
+            if (dedup_manager)
+                dedup_manager->dedupPart(loaded_parts[i]);
+
             transaction.commit(lock);
         }
 

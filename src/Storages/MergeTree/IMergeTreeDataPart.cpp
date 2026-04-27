@@ -29,6 +29,7 @@
 #include <Parsers/parseQuery.h>
 #include <Storages/ColumnsDescription.h>
 #include <Storages/MergeTree/MergeTreeData.h>
+#include <Storages/MergeTree/MergeTreeDedupPartManager.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/MergeTree/checkDataPart.h>
 #include <Storages/MergeTree/Backup.h>
@@ -37,11 +38,14 @@
 #include <Storages/MergeTree/MergeTreeIndexGranularityConstant.h>
 #include <Storages/MergeTree/PatchParts/PatchPartsUtils.h>
 #include <Storages/MergeTree/PrimaryIndexCache.h>
-#include <Storages/MergeTree/SSTFileUtil.h>
-#include <Storages/MergeTree/ProjectionIndex/ProjectionIndexUnique.h>
 #include <Storages/MergeTree/LoadedMergeTreeDataPartInfoForReader.h>
 #include <Storages/MergeTree/MergeTreeMarksLoader.h>
 #include <Storages/MergeTree/MergeTreeIndices.h>
+#include <Storages/MergeTree/MergeTreeIndexReadResultPool.h>
+#include <Storages/MergeTree/SSTFileUtil.h>
+#include <Storages/MergeTree/ProjectionIndex/ProjectionIndexUnique.h>
+
+#include <Storages/ProjectionsDescription.h>
 #include <base/JSON.h>
 #include <Common/CurrentMetrics.h>
 #include <Common/Exception.h>
@@ -2065,7 +2069,37 @@ bool IMergeTreeDataPart::supportLightweightDeleteMutate() const
 
 bool IMergeTreeDataPart::hasLightweightDelete() const
 {
-    return columns.contains(RowExistsColumn::name);
+    return columns.contains(RowExistsColumn::name) || storage.supportsUpsert();
+}
+
+MutableDeleteBitmapPtr & IMergeTreeDataPart::checkOrCreateDeleteBitmap() const
+{
+    if (!delete_bitmap)
+        delete_bitmap = ProjectionIndexBitmap::create(rows_count);
+
+    return delete_bitmap;
+}
+
+DeleteBitmapPtr IMergeTreeDataPart::getDeleteBitmap() const
+{
+    return delete_bitmap;
+}
+
+MutableDeleteBitmapPtr IMergeTreeDataPart::getMutableDeleteBitmap() const
+{
+    return delete_bitmap;
+}
+
+void IMergeTreeDataPart::replaceDeleteBitmap(MutableDeleteBitmapPtr bitmap) const
+{
+    delete_bitmap = std::move(bitmap);
+}
+
+size_t IMergeTreeDataPart::getDeleteBitmapCount() const
+{
+    if (!delete_bitmap)
+        return 0;
+    return delete_bitmap->cardinality();
 }
 
 SSTFileReaderPtr IMergeTreeDataPart::getOrOpenSSTReader(const StorageMetadataPtr & metadata_snapshot) const
@@ -2109,6 +2143,7 @@ SSTFileReaderPtr IMergeTreeDataPart::getOrOpenSSTReader(const StorageMetadataPtr
 
     return cached;
 }
+
 
 void IMergeTreeDataPart::assertHasVersionMetadata(MergeTreeTransaction * txn) const
 {
@@ -2405,6 +2440,9 @@ void IMergeTreeDataPart::remove()
     /// with by parent part.
     if (isProjectionPart() && !is_temp)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Projection part {} should be removed by its parent {}", name, parent_part_name);
+    
+    if (storage.supportsUpsert())
+        storage.getDedupManager()->removeDeleteBitmap(name);
 
     std::list<IDataPartStorage::ProjectionChecksums> projection_checksums;
 

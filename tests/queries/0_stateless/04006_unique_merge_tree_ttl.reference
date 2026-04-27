@@ -1,0 +1,43 @@
+--- whole-part TTL drop ---
+rows before TTL:	15
+rows after TTL:	5
+100	100
+101	101
+102	102
+103	103
+104	104
+--- mixed part: expired rows preserved ---
+rows before TTL:	10
+rows after TTL:	10
+0	0
+1	1
+2	2
+3	3
+4	4
+5	5
+6	6
+7	7
+8	8
+9	9
+--- insert after TTL ---
+after TTL drop:	0
+after fresh insert:	2
+1	10
+2	20
+after upsert:	2
+1	999
+2	20
+--- partitioned TTL ---
+before TTL:	10
+after TTL:	5
+100	100
+101	101
+102	102
+103	103
+104	104
+after upsert:	5
+100	9999
+101	101
+102	102
+103	103
+104	104

@@ -26,6 +26,8 @@ public:
 
     bool hasLightweightDelete() const override { return data_part->hasLightweightDelete(); }
 
+    bool isSupportsUpsert() const override { return data_part->storage.supportsUpsert(); }
+
     const String & getPartName() const override { return data_part->name; }
 
     const MergeTreePartInfo & getPartInfo() const override { return data_part->info; }

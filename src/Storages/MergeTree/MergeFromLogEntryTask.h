@@ -8,6 +8,7 @@
 #include <Storages/MergeTree/ReplicatedMergeTreeQueue.h>
 #include <Storages/MergeTree/ReplicatedMergeTreeLogEntry.h>
 #include <Storages/MergeTree/ReplicatedMergeMutateTaskBase.h>
+#include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/ZeroCopyLock.h>
 
 
@@ -59,6 +60,10 @@ private:
     MergeTaskPtr merge_task;
 
     std::map<String, UInt64> projections_merge_time;
+
+    /// Snapshot of source parts' delete bitmaps taken before merge starts.
+    /// Used by dedup to detect concurrent INSERT deletions during merge.
+    MergeTreeData::DeleteBitmapSnapshotMap source_delete_bitmap_snapshots;
 };
 
 

@@ -28,6 +28,7 @@
 #include <Interpreters/TransactionVersionMetadata.h>
 #include <DataTypes/Serializations/SerializationInfo.h>
 #include <Poco/LRUCache.h>
+#include <boost/icl/interval_set.hpp>
 
 
 namespace zkutil
@@ -57,6 +58,13 @@ using SSTFileReaderPtr = std::shared_ptr<const SSTFileReader>;
 
 struct MergeTreeReadTaskInfo;
 using MergeTreeReadTaskInfoPtr = std::shared_ptr<const MergeTreeReadTaskInfo>;
+
+struct ProjectionIndexBitmap;
+using ProjectionIndexBitmapPtr = std::shared_ptr<ProjectionIndexBitmap>;
+
+/// Immutable and mutable smart-pointer aliases for delete bitmaps.
+using DeleteBitmapPtr = std::shared_ptr<const ProjectionIndexBitmap>;
+using MutableDeleteBitmapPtr = std::shared_ptr<ProjectionIndexBitmap>;
 
 class PrimaryIndexCache;
 using PrimaryIndexCachePtr = std::shared_ptr<PrimaryIndexCache>;
@@ -267,6 +275,14 @@ public:
 
     /// When the part is removed from the working set. Changes once.
     mutable std::atomic<time_t> remove_time { std::numeric_limits<time_t>::max() };
+
+    /// For UniqueMergeTree: the union of all active parts' block ranges in the
+    /// partition, obtained from the source replica at fetch time. Used to skip
+    /// reverse-dedup for visible parts whose [min_block, max_block] is fully
+    /// contained within the source replica's active block ranges.
+    /// The delete mark from the source replica is assigned directly to
+    /// delete_bitmap below.
+    boost::icl::interval_set<Int64> fetch_dedup_block_ranges;
 
     /// If true, the destructor will delete the directory with the part.
     /// FIXME Why do we need this flag? What's difference from Temporary and DeleteOnDestroy state? Can we get rid of this?
@@ -558,6 +574,8 @@ public:
     /// File that contains list of substreams in order of serialization/deserialization for each column.
     static constexpr auto COLUMNS_SUBSTREAMS_FILE_NAME = "columns_substreams.txt";
 
+
+
     /// Checks that all TTLs (table min/max, column ttls, so on) for part
     /// calculated. Part without calculated TTL may exist if TTL was added after
     /// part creation (using alter query with materialize_ttl setting).
@@ -594,10 +612,33 @@ public:
     /// True if here is lightweight deleted mask file in part.
     bool hasLightweightDelete() const;
 
+    /// Returns an immutable (const) view of the delete bitmap.
+    /// Returns nullptr if no bitmap is set.
+    DeleteBitmapPtr getDeleteBitmap() const;
+
+    /// Returns a mutable view of the delete bitmap.
+    /// Returns nullptr if no bitmap is set.
+    MutableDeleteBitmapPtr getMutableDeleteBitmap() const;
+
+    /// Replaces the delete bitmap with a new one (or nullptr to clear).
+    /// Readers that already captured the old shared_ptr in a snapshot
+    /// continue to use it; new snapshots will pick up the updated bitmap.
+    void replaceDeleteBitmap(MutableDeleteBitmapPtr bitmap) const;
+
+    /// Ensures the delete mark bitmap is initialized for this part.
+    /// If not yet created, allocates a new bitmap sized to rows_count.
+    /// Returns a mutable reference to the internal bitmap pointer for
+    /// direct in-place modification (used by dedup).
+    MutableDeleteBitmapPtr & checkOrCreateDeleteBitmap() const;
+
+    /// Returns the number of rows marked as deleted in the delete bitmap.
+    size_t getDeleteBitmapCount() const;
+
     /// Returns cached SST reader for the unique projection of this part.
     /// Looks up or creates the reader in the global SSTFileReaderCache.
     /// Returns nullptr if no unique projection SST exists.
     SSTFileReaderPtr getOrOpenSSTReader(const StorageMetadataPtr & metadata_snapshot) const;
+
 
     /// Read existing rows count from _row_exists column
     UInt64 readExistingRowsCount();
@@ -839,6 +880,10 @@ private:
 
     /// Returns the name of the part state as a string.
     String stateToString() const;
+
+    /// Delete bitmap for unique dedup: bits set to 1 represent deleted (deduped) rows.
+    /// Populated by MergeTreeDedupPartManager during dedup or rebuild.
+    mutable MutableDeleteBitmapPtr delete_bitmap;
 
     /// This ugly flag is needed for debug assertions only
     mutable bool part_is_probably_removed_from_disk = false;

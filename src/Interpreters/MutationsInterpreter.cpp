@@ -365,7 +365,7 @@ bool MutationsInterpreter::Source::supportsLightweightDelete() const
 
 bool MutationsInterpreter::Source::materializeTTLRecalculateOnly() const
 {
-    return data && (*data->getSettings())[MergeTreeSetting::materialize_ttl_recalculate_only];
+    return data && (data->supportsUpsert() || (*data->getSettings())[MergeTreeSetting::materialize_ttl_recalculate_only]);
 }
 
 bool MutationsInterpreter::Source::hasSecondaryIndex(const String & name, StorageMetadataPtr metadata) const

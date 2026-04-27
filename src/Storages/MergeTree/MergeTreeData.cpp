@@ -62,6 +62,7 @@
 #include <Interpreters/MutationsInterpreter.h>
 #include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTIndexDeclaration.h>
+#include <Parsers/ASTProjectionDeclaration.h>
 #include <Parsers/ASTHelpers.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTLiteral.h>
@@ -96,6 +97,7 @@
 #include <Storages/MergeTree/Compaction/MergeSelectorApplier.h>
 #include <Storages/MergeTree/PatchParts/PatchPartsUtils.h>
 #include <Storages/MergeTree/Compaction/PartsCollectors/Common.h>
+#include <Storages/MergeTree/MergeTreeDedupPartManager.h>
 
 #include <boost/algorithm/string/join.hpp>
 
@@ -4286,12 +4288,45 @@ void MergeTreeData::checkAlterIsPossible(const AlterCommands & commands, Context
     /// Block the case of alter table add projection for special merge trees.
     if (std::any_of(commands.begin(), commands.end(), [](const AlterCommand & c) { return c.type == AlterCommand::ADD_PROJECTION; }))
     {
+        /// UniqueMergeTree only allows projection indexes (with TYPE clause),
+        /// regular projections are not supported because they cannot maintain
+        /// consistency with the dedup delete bitmap.
+        if (supportsUpsert())
+        {
+            for (const auto & command : commands)
+            {
+                if (command.type != AlterCommand::ADD_PROJECTION)
+                    continue;
+
+                const auto * projection_decl = command.projection_decl->as<ASTProjectionDeclaration>();
+                if (projection_decl && !projection_decl->type)
+                    throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+                        "Regular projections are not supported for UniqueMergeTree. "
+                        "Only projection indexes (with TYPE clause) are allowed. "
+                        "Projection '{}' does not have a TYPE clause",
+                        command.projection_name);
+            }
+        }
+
         if (merging_params.mode != MergingParams::Mode::Ordinary
             && (*settings_from_storage)[MergeTreeSetting::deduplicate_merge_projection_mode] == DeduplicateMergeProjectionMode::THROW)
             throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
                 "ADD PROJECTION is not supported in {} with deduplicate_merge_projection_mode = throw. "
                 "Please set setting 'deduplicate_merge_projection_mode' to 'drop' or 'rebuild'",
                 getName());
+    }
+
+    /// Block dropping the unique projection index for UniqueMergeTree.
+    /// Dropping it would break dedup because the delete bitmap relies on the index.
+    if (supportsUpsert())
+    {
+        for (const auto & command : commands)
+        {
+            if (command.type == AlterCommand::DROP_PROJECTION && command.projection_name == getUniqueProjectionName())
+                throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+                    "Cannot drop projection '{}' because it is the unique index used for dedup in {}",
+                    command.projection_name, getName());
+        }
     }
 
     removeImplicitStatistics(new_metadata.columns);
@@ -8500,6 +8535,12 @@ void MergeTreeData::Transaction::renameParts()
 
 MergeTreeData::DataPartsVector MergeTreeData::Transaction::commit()
 {
+    /// Invoke before-commit hook (e.g. UniqueMergeTree dedup) before lockParts.
+    /// The returned guard must stay alive until commit finishes.
+    std::any before_commit_guard;
+    if (data.before_transaction_commit_hook && !isEmpty())
+        before_commit_guard = data.before_transaction_commit_hook(precommitted_parts, before_commit_hook_context);
+
     auto lock = data.lockParts();
     return commit(lock);
 }
@@ -8630,6 +8671,9 @@ MergeTreeData::DataPartsVector MergeTreeData::Transaction::commit(DataPartsLock 
                     add_bytes += part->getBytesOnDisk();
                     add_rows += part->rows_count;
                     ++add_parts;
+
+                    if (data.supportsUpsert())
+                    data.dedup_manager->commitDeleteBitmapBuffers(acquired_parts_lock);
 
                     data.modifyPartState(part, DataPartState::Active, acquired_parts_lock);
                     data.addPartContributionToColumnAndSecondaryIndexSizes(part);
@@ -10555,6 +10599,20 @@ StorageMetadataPtr MergeTreeData::getInMemoryMetadataPtr(bool bypass_metadata_ca
     return cache->emplace(this, IStorage::getInMemoryMetadataPtr(bypass_metadata_cache)).first->second;
 }
 
+
+MergeTreeData::DeleteBitmapSnapshotMap MergeTreeData::getDeleteBitmapSnapshot(const DataPartsVector & parts) const
+{
+    DeleteBitmapSnapshotMap snapshots;
+    auto lock = readLockParts();
+    for (const auto & part : parts)
+    {
+        const auto delete_bitmap = part->getDeleteBitmap();
+        if (delete_bitmap)
+            snapshots.emplace(part->name, delete_bitmap);
+    }
+    return snapshots;
+}
+
 StorageSnapshotPtr
 MergeTreeData::createStorageSnapshot(const StorageMetadataPtr & metadata_snapshot, ContextPtr query_context, bool without_data) const
 {
@@ -10569,6 +10627,26 @@ MergeTreeData::createStorageSnapshot(const StorageMetadataPtr & metadata_snapsho
 
     bool apply_mutations_on_fly = query_context->getSettingsRef()[Setting::apply_mutations_on_fly];
     bool apply_patch_parts = query_context->getSettingsRef()[Setting::apply_patch_parts];
+
+    if (supportsUpsert())
+    {
+        auto shared_lock = readLockParts();
+        auto parts = std::make_shared<RangesInDataParts>(*query_ranges);
+
+        std::erase_if(*parts, [](const auto & part)
+        {
+            return part.data_part->rows_count == 0
+                || part.data_part->rows_count == part.data_part->getDeleteBitmapCount();
+        });
+
+        for (const auto & part : *parts)
+        {
+            if (part.data_part->getDeleteBitmap())
+                snapshot_data->delete_bitmap_buffer_map[part.data_part->name] = part.data_part->getDeleteBitmap();
+        }
+
+        snapshot_data->parts = std::move(parts);
+    }
 
     IMutationsSnapshot::Params params
     {

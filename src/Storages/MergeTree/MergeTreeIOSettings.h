@@ -74,6 +74,8 @@ struct MergeTreeReaderSettings
     /// columns prefixes.
     bool read_only_column_sample = false;
 
+    bool enable_upsert = false;
+
     static MergeTreeReaderSettings createFromContext(const ContextPtr & context);
     /// Note storage_settings used only in private, do not remove
     static MergeTreeReaderSettings createForQuery(const ContextPtr & context, const MergeTreeSettings & storage_settings, const SelectQueryInfo & query_info);

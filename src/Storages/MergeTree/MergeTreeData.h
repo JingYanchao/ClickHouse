@@ -1,5 +1,6 @@
 #pragma once
 
+#include <any>
 #include <mutex>
 #include <tuple>
 #include <base/defines.h>
@@ -88,6 +89,8 @@ class ExpressionActions;
 using ExpressionActionsPtr = std::shared_ptr<ExpressionActions>;
 using ManyExpressionActions = std::vector<ExpressionActionsPtr>;
 class MergeTreeDeduplicationLog;
+class MergeTreeDedupPartManager;
+using MergeTreeDedupPartManagerPtr = std::shared_ptr<MergeTreeDedupPartManager>;
 using PartitionIdToMaxBlock = std::unordered_map<String, Int64>;
 
 namespace ErrorCodes
@@ -352,6 +355,16 @@ public:
     /// * Next, if commit() is called, the parts are added to the active set and the parts that are
     ///   covered by them are marked Outdated.
     /// If neither commit() nor rollback() was called, the destructor rollbacks the operation.
+    /// Context passed to the before-commit hook.
+    /// Carries optional payload (e.g. delete mark snapshots for merge/mutation).
+    /// The dedup layer infers the operation type from part metadata
+    /// (level, mutation version, snapshot presence) instead of requiring
+    /// callers to pass an explicit enum.
+    struct BeforeCommitHookContext
+    {
+        std::any data;  /// Arbitrary payload, e.g. DeleteBitmapSnapshotMap
+    };
+
     class Transaction : private boost::noncopyable
     {
     public:
@@ -359,6 +372,11 @@ public:
 
         DataPartsVector commit();
         DataPartsVector commit(DataPartsLock & lock);
+
+        /// Set/get the context passed to the before-commit hook.
+        /// Carries optional payload (e.g. delete mark snapshots).
+        void setBeforeCommitHookContext(BeforeCommitHookContext ctx) { before_commit_hook_context = std::move(ctx); }
+        const BeforeCommitHookContext & getBeforeCommitHookContext() const { return before_commit_hook_context; }
 
         /// Rename should be done explicitly, before calling commit(), to
         /// guarantee that no lock held during rename (since rename is IO
@@ -389,6 +407,7 @@ public:
 
         MutableDataParts precommitted_parts;
         MutableDataParts precommitted_parts_need_rename;
+        BeforeCommitHookContext before_commit_hook_context;
     };
 
     using TransactionUniquePtr = std::unique_ptr<Transaction>;
@@ -546,6 +565,15 @@ public:
 
     bool hasProjection() const override;
 
+    /// Hook called by Transaction::commit BEFORE lockParts.
+    /// Used by UniqueMergeTree for dedup; returns an RAII guard
+    /// (e.g. UniqueProcessLock) that must stay alive until commit finishes.
+    using BeforeTransactionCommitHook = std::function<std::any(const MutableDataParts & parts, const BeforeCommitHookContext & context)>;
+
+    void setBeforeTransactionCommitHook(BeforeTransactionCommitHook hook) { before_transaction_commit_hook = std::move(hook); }
+
+    MergeTreeDedupPartManagerPtr getDedupManager() const { return dedup_manager; }
+
     bool areAsynchronousInsertsEnabled() const override;
 
     bool supportsTrivialCountOptimization(const StorageSnapshotPtr & storage_snapshot, ContextPtr query_context) const override;
@@ -614,6 +642,10 @@ public:
 
     using MutationsSnapshotPtr = std::shared_ptr<const IMutationsSnapshot>;
 
+    /// Snapshot of source parts' delete bitmaps, keyed by part name.
+    /// Used to compute the diff between merge-start and commit-time delete bitmaps.
+    using DeleteBitmapSnapshotMap = std::unordered_map<String, DeleteBitmapPtr>;
+
     /// Snapshot for MergeTree contains the current set of data parts
     /// and mutations required to be applied at the moment of the start of query.
     struct SnapshotData : public StorageSnapshot::Data
@@ -627,7 +659,15 @@ public:
         RangesInDataPartsPtr parts;
 
         MutationsSnapshotPtr mutations_snapshot;
+
+        DeleteBitmapSnapshotMap delete_bitmap_buffer_map;
     };
+
+    /// Snapshot the current delete bitmaps for the given parts.
+    /// Should be called at merge/mutation start (before the merge executes)
+    /// so that at commit time we can compute the diff and only process
+    /// newly deleted keys. Thread-safe: reads COW bitmap pointers.
+    DeleteBitmapSnapshotMap getDeleteBitmapSnapshot(const DataPartsVector & parts) const;
 
     StorageSnapshotPtr getStorageSnapshot(const StorageMetadataPtr & metadata_snapshot, ContextPtr query_context) const override;
 
@@ -1239,6 +1279,10 @@ public:
     /// Merging params - what additional actions to perform during merge.
     const MergingParams merging_params;
 
+    /// Whether the user has specified a custom version column for the unique index.
+    /// When false, the default version (_block_number) is used.
+    bool hasCustomizedVersionColumnForUniqueIndex() const { return !merging_params.version_column.empty(); }
+
     bool is_custom_partitioned = false;
 
     /// Used only for old syntax tables. Never changes after init.
@@ -1390,6 +1434,10 @@ public:
     /// Returns the number of parts for which index was unloaded.
     size_t unloadPrimaryKeysAndClearCachesOfOutdatedParts();
 
+    /// Return the name of the unique projection used for upsert dedup.
+    /// Non-empty only for UniqueMergeTree.
+    virtual String getUniqueProjectionName() const { return {}; }
+
 protected:
     friend class IMergeTreeDataPart;
     friend class MergeTreeDataMergerMutator;
@@ -1406,6 +1454,12 @@ protected:
     /// Relative path data, changes during rename for ordinary databases use
     /// under lockForShare if rename is possible.
     String relative_data_path;
+
+    /// Hook called before lockParts in Transaction::commit.
+    BeforeTransactionCommitHook before_transaction_commit_hook;
+
+    /// Manages cross-part dedup and delete mark buffers (UniqueMergeTree only).
+    MergeTreeDedupPartManagerPtr dedup_manager;
 
 private:
     /// Columns and secondary indices sizes can be calculated lazily.

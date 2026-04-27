@@ -1,0 +1,119 @@
+--- two replica insert and fetch ---
+10
+10
+--- replica 1 after upsert ---
+0	100
+1	101
+2	102
+3	103
+4	104
+5	5
+6	6
+7	7
+8	8
+9	9
+--- replica 2 after fetch ---
+0	100
+1	101
+2	102
+3	103
+4	104
+5	5
+6	6
+7	7
+8	8
+9	9
+10
+10
+--- two replica insert on different replicas ---
+--- replica 1 ---
+0	200
+1	201
+2	202
+3	203
+4	204
+5	5
+6	6
+7	7
+8	8
+9	9
+--- replica 2 ---
+0	200
+1	201
+2	202
+3	203
+4	204
+5	5
+6	6
+7	7
+8	8
+9	9
+--- merge_tree fetch: basic ---
+--- r1 after merge_tree ---
+0	999
+1	101
+2	102
+3	103
+4	104
+5	5
+6	6
+7	7
+8	8
+9	9
+--- r2 after merge_tree ---
+0	999
+1	101
+2	102
+3	103
+4	104
+5	5
+6	6
+7	7
+8	8
+9	9
+--- merge_tree fetch: update then insert ---
+--- r1 final ---
+0	1000
+1	1001
+2	1002
+3	1003
+4	1004
+5	5
+6	6
+7	7
+8	8
+9	9
+--- r2 final ---
+0	1000
+1	1001
+2	1002
+3	1003
+4	1004
+5	5
+6	6
+7	7
+8	8
+9	9
+--- merge_tree fetch: update on r2 ---
+--- r1 after r2 merge_tree ---
+0	0
+1	1
+2	2
+3	3
+4	4
+5	5
+6	6
+7	777
+8	777
+9	777
+--- r2 after r2 merge_tree ---
+0	0
+1	1
+2	2
+3	3
+4	4
+5	5
+6	6
+7	777
+8	777
+9	777

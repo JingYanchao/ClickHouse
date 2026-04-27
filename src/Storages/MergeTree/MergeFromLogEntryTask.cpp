@@ -1,5 +1,6 @@
 
 #include <Storages/MergeTree/MergeFromLogEntryTask.h>
+#include <Storages/MergeTree/MergeTreeDedupPartManager.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/MergeTree/Compaction/CompactionStatistics.h>
 #include <Storages/StorageReplicatedMergeTree.h>
@@ -186,6 +187,16 @@ ReplicatedMergeMutateTaskBase::PrepareResult MergeFromLogEntryTask::prepare()
         parts.push_back(source_part_or_covering);
     }
 
+    ///for unique merge tree table, only the entry maker can execute merge, the other replica waiting to fetch
+    if (storage.supportsUpsert() && storage.replica_name != entry.source_replica)
+    {
+        LOG_DEBUG(
+            log,
+            "Will waiting to fetch part {} from another replica, table is upsert and this replica can not execute this entry",
+            entry.new_part_name);
+        return PrepareResult{.prepared_successfully = false, .need_to_check_missing_part_in_fetch = true, .part_log_writer = {}};
+    }
+
     for (const auto & patch_part_name : entry.patch_parts)
     {
         auto patch_part = storage.getActiveContainingPart(patch_part_name);
@@ -363,6 +374,17 @@ ReplicatedMergeMutateTaskBase::PrepareResult MergeFromLogEntryTask::prepare()
 
     transaction_ptr = std::make_unique<MergeTreeData::Transaction>(storage, NO_TRANSACTION_RAW);
 
+    /// Snapshot source parts' delete marks before the merge starts.
+    /// At commit time, the diff (current - snapshot) tells us which rows
+    /// were newly deleted by concurrent INSERTs during the merge.
+    if (storage.supportsUpsert())
+    {
+        DataPartsVector source_parts;
+        for (const auto & p : parts)
+            source_parts.push_back(p);
+        source_delete_bitmap_snapshots = storage.getDeleteBitmapSnapshot(source_parts);
+    }
+
     merge_task = storage.merger_mutator.mergePartsToTemporaryPart(
             future_merged_part,
             metadata_snapshot,
@@ -377,6 +399,11 @@ ReplicatedMergeMutateTaskBase::PrepareResult MergeFromLogEntryTask::prepare()
             entry.cleanup,
             storage.merging_params,
             NO_TRANSACTION_PTR);
+
+    /// Pass the snapshot to MergeTask so it builds StorageSnapshot from the
+    /// same data, keeping the merge reader and commit-time dedup aligned.
+    if (!source_delete_bitmap_snapshots.empty())
+        merge_task->setDeleteBitmapSnapshots(source_delete_bitmap_snapshots);
 
     /// Adjust priority
     for (auto & item : future_merged_part->parts)
@@ -398,6 +425,15 @@ bool MergeFromLogEntryTask::finalize(ReplicatedMergeMutateTaskBase::PartLogWrite
     projections_merge_time = merge_task->grabProjectionsMergeTime();
 
     storage.merger_mutator.renameMergedTemporaryPart(part, parts, NO_TRANSACTION_PTR, *transaction_ptr);
+
+    /// Pass delete mark snapshots to the before-commit hook for diff-based dedup.
+    if (storage.supportsUpsert())
+    {
+        MergeTreeData::BeforeCommitHookContext hook_ctx;
+        hook_ctx.data = std::move(source_delete_bitmap_snapshots);
+        transaction_ptr->setBeforeCommitHookContext(std::move(hook_ctx));
+    }
+
     /// Why we reset task here? Because it holds shared pointer to part and tryRemovePartImmediately will
     /// not able to remove the part and will throw an exception (because someone holds the pointer).
     ///

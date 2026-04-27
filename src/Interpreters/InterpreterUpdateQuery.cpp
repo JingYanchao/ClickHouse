@@ -1,5 +1,6 @@
 #include <Interpreters/InterpreterUpdateQuery.h>
 #include <Interpreters/InterpreterFactory.h>
+#include <Interpreters/InterpreterUniqueUpdateQuery.h>
 
 #include <Access/ContextAccess.h>
 #include <Databases/IDatabase.h>
@@ -73,6 +74,12 @@ BlockIO InterpreterUpdateQuery::execute()
 
     FunctionNameNormalizer::visit(query_ptr.get());
     auto & update_query = query_ptr->as<ASTUpdateQuery &>();
+    auto table_id = getContext()->resolveStorageID(update_query, Context::ResolveOrdinary);
+    StoragePtr table = DatabaseCatalog::instance().getTable(table_id, getContext());
+    if (const auto * data = dynamic_cast<const MergeTreeData*>(table.get()); data && data->supportsUpsert())
+    {
+        return InterpreterUniqueUpdateQuery(query_ptr, getContext()).execute();
+    }
 
     AccessRightsElements required_access;
     required_access.emplace_back(AccessType::ALTER_UPDATE, update_query.getDatabase(), update_query.getTable());
@@ -88,11 +95,9 @@ BlockIO InterpreterUpdateQuery::execute()
         throw Exception(ErrorCodes::QUERY_IS_PROHIBITED, "Update queries are prohibited");
 
     getContext()->checkAccess(required_access);
-    auto table_id = getContext()->resolveStorageID(update_query, Context::ResolveOrdinary);
     update_query.setDatabase(table_id.database_name);
 
     /// First check table storage for validations.
-    StoragePtr table = DatabaseCatalog::instance().getTable(table_id, getContext());
     if (table->isStaticStorage())
         throw Exception(ErrorCodes::TABLE_IS_READ_ONLY, "Table is read-only");
 
