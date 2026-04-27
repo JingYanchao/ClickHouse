@@ -298,7 +298,7 @@ static SummingSortedAlgorithm::ColumnsDefinition defineColumns(
         bool is_non_empty_tuple = typeid_cast<const DataTypeTuple *>(column.type.get()) && !typeid_cast<const DataTypeTuple *>(column.type.get())->getElements().empty();
         if (aggregate_all_columns && (is_non_empty_tuple || typeid_cast<const DataTypeArray *>(column.type.get())) && !simple)
         {
-            const auto map_name = Nested::extractTableName(column.name);
+            const auto map_name = Nested::splitName(column.name, /*reverse=*/true).first;
             /// if nested table name ends with `Map` it is a possible candidate for special handling
             if (map_name == column.name || !endsWith(map_name, "Map"))
             {
@@ -351,7 +351,7 @@ static SummingSortedAlgorithm::ColumnsDefinition defineColumns(
         /// Discover nested Maps and find columns for summation
         if (typeid_cast<const DataTypeArray *>(column.type.get()) && !simple)
         {
-            const auto map_name = Nested::extractTableName(column.name);
+            const auto map_name = Nested::splitName(column.name, /*reverse=*/true).first;
             /// if nested table name ends with `Map` it is a possible candidate for special handling
             if (map_name == column.name || !endsWith(map_name, "Map"))
             {
