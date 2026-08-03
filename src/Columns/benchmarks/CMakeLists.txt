@@ -7,3 +7,8 @@ clickhouse_add_executable(benchmark_compute_hash_into benchmark_compute_hash_int
 target_link_libraries (benchmark_compute_hash_into PRIVATE
     ch_contrib::gbenchmark_all
     dbms)
+
+clickhouse_add_executable(benchmark_unique_key_encoding benchmark_unique_key_encoding.cpp)
+target_link_libraries (benchmark_unique_key_encoding PRIVATE
+    ch_contrib::gbenchmark_all
+    dbms)
