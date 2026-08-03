@@ -48,7 +48,7 @@ std::vector<ProbeResult> UniqueKeyProbeSimple::probeBatch(const Block & keys, co
     for (const auto & name : unique_key_column_names)
         uk_columns.push_back(keys.getByName(name).column);
 
-    VectorWithMemoryTracking<String> encoded;
+    std::vector<String> encoded;
     UniqueKeyEncoding::encodeBlock(uk_columns, /*permutation=*/nullptr, max_encoded_size, encoded);
 
     std::vector<std::string_view> views;

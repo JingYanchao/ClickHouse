@@ -56,7 +56,7 @@ String testEncodeRow(const Columns & cols, size_t row, size_t max_size = 4096)
     row_cols.reserve(cols.size());
     for (const auto & c : cols)
         row_cols.push_back(c->cut(row, 1));
-    VectorWithMemoryTracking<String> out;
+    std::vector<String> out;
     UniqueKeyEncoding::encodeBlock(row_cols, /*permutation=*/nullptr, max_size, out);
     return out.at(0);
 }
@@ -485,7 +485,7 @@ void expectBlockEncodesAs(const std::vector<String> & inputs)
     for (const auto & s : inputs)
         col->insert(Field(s));
     Columns cols{std::move(col)};
-    VectorWithMemoryTracking<String> encoded;
+    std::vector<String> encoded;
     UniqueKeyEncoding::encodeBlock(cols, /*permutation=*/nullptr, /*max_size=*/4096, encoded);
     ASSERT_EQ(encoded.size(), inputs.size());
     for (size_t r = 0; r < inputs.size(); ++r)
@@ -593,7 +593,7 @@ TEST(UniqueKeyEncoding, FixedStringBlockEncoderByteEquivalentEmbeddedNull)
     col->insertData("\x00""1234567", N);
     Columns cols{std::move(col)};
 
-    VectorWithMemoryTracking<String> got;
+    std::vector<String> got;
     UniqueKeyEncoding::encodeBlock(cols, /*permutation=*/nullptr, /*max_size=*/4096, got);
     ASSERT_EQ(got.size(), 4u);
 
@@ -876,7 +876,7 @@ TEST(UniqueKeyEncoding, NullableBatchMultiRowOrdering)
     auto col = ColumnNullable::create(std::move(nested), std::move(null_map));
     Columns cols{std::move(col)};
 
-    VectorWithMemoryTracking<String> encoded;
+    std::vector<String> encoded;
     UniqueKeyEncoding::encodeBlock(cols, /*permutation=*/nullptr, 4096, encoded);
     ASSERT_EQ(encoded.size(), 5u);
 
@@ -918,7 +918,7 @@ TEST(UniqueKeyEncoding, NullableBatchPermutationAlignsFlagAndNested)
     Columns cols{std::move(col)};
 
     IColumn::Permutation perm{4, 0, 3, 1, 2};
-    VectorWithMemoryTracking<String> encoded;
+    std::vector<String> encoded;
     UniqueKeyEncoding::encodeBlock(cols, &perm, 4096, encoded);
     ASSERT_EQ(encoded.size(), perm.size());
 
@@ -1017,7 +1017,7 @@ TEST(UniqueKeyEncoding, EncodeBlockBasic)
     col->insert(Field(UInt64(3)));
 
     Columns cols{std::move(col)};
-    VectorWithMemoryTracking<String> encoded;
+    std::vector<String> encoded;
     UniqueKeyEncoding::encodeBlock(cols, /*permutation=*/nullptr, 4096, encoded);
 
     ASSERT_EQ(encoded.size(), 3u);
@@ -1034,7 +1034,7 @@ TEST(UniqueKeyEncoding, EncodeBlockSizeLimitRejection)
 
     Columns cols{std::move(col)};
 
-    VectorWithMemoryTracking<String> out;
+    std::vector<String> out;
     EXPECT_THROW(UniqueKeyEncoding::encodeBlock(cols, /*permutation=*/nullptr, 100, out), DB::Exception);
 
     /// Sufficient limit — both rows should encode successfully.
@@ -1052,7 +1052,7 @@ TEST(UniqueKeyEncoding, EncodeBlockPermutationValidAccepted)
     Columns cols{std::move(col)};
 
     IColumn::Permutation perm{2, 0, 1};
-    VectorWithMemoryTracking<String> out;
+    std::vector<String> out;
     EXPECT_NO_THROW(UniqueKeyEncoding::encodeBlock(cols, &perm, 256, out));
     ASSERT_EQ(out.size(), 3u);
 }
@@ -1074,8 +1074,8 @@ TEST(UniqueKeyEncoding, ColumnConstEncodeBlockMatchesFullColumn)
     Columns const_cols{std::move(const_col)};
     Columns full_cols{std::move(full)};
 
-    VectorWithMemoryTracking<String> const_out;
-    VectorWithMemoryTracking<String> full_out;
+    std::vector<String> const_out;
+    std::vector<String> full_out;
     UniqueKeyEncoding::encodeBlock(const_cols, /*permutation=*/nullptr, 4096, const_out);
     UniqueKeyEncoding::encodeBlock(full_cols, /*permutation=*/nullptr, 4096, full_out);
 
@@ -1096,7 +1096,7 @@ TEST(UniqueKeyEncoding, EncodeBlockEmptyBlock)
     auto col = ColumnUInt64::create();
     Columns cols{std::move(col)};
 
-    VectorWithMemoryTracking<String> out;
+    std::vector<String> out;
     UniqueKeyEncoding::encodeBlock(cols, /*permutation=*/nullptr, 256, out);
     EXPECT_TRUE(out.empty());
 }
@@ -1114,7 +1114,7 @@ TEST(UniqueKeyEncoding, DISABLED_MicrobenchUInt641M)
         col->insert(Field(rng()));
     Columns cols{std::move(col)};
 
-    VectorWithMemoryTracking<String> out;
+    std::vector<String> out;
     auto t0 = std::chrono::steady_clock::now();
     UniqueKeyEncoding::encodeBlock(cols, /*permutation=*/nullptr, 256, out);
     auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1138,7 +1138,7 @@ TEST(UniqueKeyEncoding, DISABLED_MicrobenchString321M)
     }
     Columns cols{std::move(col)};
 
-    VectorWithMemoryTracking<String> out;
+    std::vector<String> out;
     auto t0 = std::chrono::steady_clock::now();
     UniqueKeyEncoding::encodeBlock(cols, /*permutation=*/nullptr, 256, out);
     auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1164,7 +1164,7 @@ TEST(UniqueKeyEncoding, DISABLED_MicrobenchCompoundUInt64String1M)
     }
     Columns cols{std::move(col_u), std::move(col_s)};
 
-    VectorWithMemoryTracking<String> out;
+    std::vector<String> out;
     auto t0 = std::chrono::steady_clock::now();
     UniqueKeyEncoding::encodeBlock(cols, /*permutation=*/nullptr, 256, out);
     auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1268,12 +1268,10 @@ TEST(UniqueKeyEncoding, NullableTupleAllNullThrowsNotImplemented)
     expectEncodeRowThrowsNotImplemented(cols, "Nullable(Tuple(UInt64,UInt64)) all-NULL");
 }
 
-/// ---------------------------------------------------------------------------
-/// Direct single-row serializeAsComparable on a NULL row of an unsupported
-/// nullable column. The NULL branch must still validate the nested type, so an
-/// unsupported nullable schema is rejected on every row, not only once a
-/// non-NULL value is hit.
-/// ---------------------------------------------------------------------------
+/// Disabled: serializeAsComparable is a per-column virtual method added by
+/// the refactoring (PR #109010); it does not exist in the pre-refactoring
+/// centralized-switch codebase.
+#if 0
 TEST(UniqueKeyEncoding, NullableUnsupportedNullRowDirectSerializeThrowsNotImplemented)
 {
     DataTypes inner{std::make_shared<DataTypeUInt64>(), std::make_shared<DataTypeUInt64>()};
@@ -1297,3 +1295,4 @@ TEST(UniqueKeyEncoding, NullableUnsupportedNullRowDirectSerializeThrowsNotImplem
             << "should throw NOT_IMPLEMENTED, got " << e.code() << ": " << e.message();
     }
 }
+#endif

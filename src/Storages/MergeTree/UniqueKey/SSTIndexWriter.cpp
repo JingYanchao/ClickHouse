@@ -503,7 +503,7 @@ UInt64 SSTIndexWriter::writeFromBlock(
             "SSTIndexWriter::writeFromBlock: part has {} rows, exceeds UInt32 row-number capacity",
             num_rows);
 
-    VectorWithMemoryTracking<String> encoded;
+    std::vector<String> encoded;
     UniqueKeyEncoding::encodeBlock(uk_columns, permutation, max_encoded_size, encoded);
 
     SSTIndexWriter writer(part_storage, context);
@@ -571,7 +571,7 @@ UInt64 SSTIndexWriter::writeFromBlockUnsorted(
             uk_perm[i] = i;
     }
 
-    VectorWithMemoryTracking<String> encoded;
+    std::vector<String> encoded;
     UniqueKeyEncoding::encodeBlock(uk_columns, &uk_perm, max_encoded_size, encoded);
 
     /// Caller's `permutation` maps part_offset → source_row; invert once

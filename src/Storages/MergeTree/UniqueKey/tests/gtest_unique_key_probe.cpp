@@ -69,7 +69,7 @@ namespace
         auto col = ColumnUInt64::create();
         col->insertValue(k);
         Columns cols{std::move(col)};
-        VectorWithMemoryTracking<String> out;
+        std::vector<String> out;
         UniqueKeyEncoding::encodeBlock(cols, /*permutation=*/nullptr, MAX_ENC, out);
         return out.at(0);
     }

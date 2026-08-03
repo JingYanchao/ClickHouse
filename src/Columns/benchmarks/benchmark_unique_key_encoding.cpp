@@ -50,9 +50,9 @@ namespace
 {
 
 /// Output container type.
-/// After refactoring: VectorWithMemoryTracking<String>.
+/// After refactoring: std::vector<String>.
 /// Before refactoring: std::vector<String> - change this alias to match.
-using EncodedVector = VectorWithMemoryTracking<String>;
+using EncodedVector = std::vector<String>;
 
 /// Generous limit for benchmark purposes - never expected to trigger.
 constexpr size_t MAX_ENCODED_SIZE = 1 << 20; // 1 MiB

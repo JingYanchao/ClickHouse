@@ -185,7 +185,7 @@ TEST_F(SSTFixture, RoundTrip10K)
     auto status = reader.Open(finalPath());
     ASSERT_TRUE(status.ok()) << status.ToString();
 
-    VectorWithMemoryTracking<String> encoded;
+    std::vector<String> encoded;
     UniqueKeyEncoding::encodeBlock(cols, /*permutation=*/nullptr, /*max_size=*/256, encoded);
     for (size_t i = 0; i < N; ++i)
     {
@@ -243,7 +243,7 @@ TEST_F(SSTFixture, CorruptionRebuild)
     rocksdb::SstFileReader reader(makeReaderOptions());
     ASSERT_TRUE(reader.Open(finalPath()).ok());
     auto one_col = makeUInt64Columns({keys[42]});
-    VectorWithMemoryTracking<String> encoded;
+    std::vector<String> encoded;
     UniqueKeyEncoding::encodeBlock(one_col, /*permutation=*/nullptr, 256, encoded);
     EXPECT_TRUE(sstIteratorContains(reader, encoded[0]));
 }
@@ -588,7 +588,7 @@ TEST_F(SSTFixture, MidStreamFailurePropagatesCleanly)
 {
     /// Descending keys: second Put violates the strictly-increasing invariant.
     auto cols = makeUInt64Columns({10, 5});
-    VectorWithMemoryTracking<String> encoded;
+    std::vector<String> encoded;
     UniqueKeyEncoding::encodeBlock(cols, /*permutation=*/nullptr, 256, encoded);
     ASSERT_EQ(encoded.size(), 2u);
 
@@ -656,7 +656,7 @@ TEST_F(SSTFixture, WriteThroughEncryptedDiskAdapter)
     ASSERT_TRUE(reader.Open(plain_path.string()).ok());
 
     auto cols = makeUInt64Columns(keys);
-    VectorWithMemoryTracking<String> encoded;
+    std::vector<String> encoded;
     UniqueKeyEncoding::encodeBlock(cols, /*permutation=*/nullptr, /*max_size=*/256, encoded);
     for (size_t i = 0; i < keys.size(); ++i)
     {
