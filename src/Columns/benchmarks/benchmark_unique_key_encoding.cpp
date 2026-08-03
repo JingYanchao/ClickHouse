@@ -254,9 +254,15 @@ void BM_EncodeBlock(benchmark::State & state, const std::vector<ColumnPtr> & col
     const IColumn::Permutation * perm_ptr = use_permutation ? &perm : nullptr;
     Columns uk_columns(cols.begin(), cols.end());
 
+    /// Reuse the same container across iterations to isolate encoding
+    /// performance from allocation/deallocation overhead. encodeBlock calls
+    /// out.clear() internally, so strings are reset each iteration but the
+    /// backing buffer capacity is preserved.
+    EncodedVector encoded;
+    encoded.reserve(n);
+
     for (auto _ : state)
     {
-        EncodedVector encoded;
         encodeBlock(uk_columns, perm_ptr, MAX_ENCODED_SIZE, encoded);
         benchmark::DoNotOptimize(encoded.data());
     }
