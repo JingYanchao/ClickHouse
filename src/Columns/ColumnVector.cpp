@@ -1418,18 +1418,26 @@ std::span<char> ColumnVector<T>::insertRawUninitialized(size_t count)
 }
 
 template <typename T>
-void ColumnVector<T>::serializeAsComparable(size_t n, String & out) const
+ALWAYS_INLINE void ColumnVector<T>::serializeAsComparable(size_t n, String & out) const
 {
     if constexpr (std::is_integral_v<T>)
     {
-        auto value = data[n];
-        transformEndianness<std::endian::big>(value);
         if constexpr (std::is_signed_v<T>)
         {
-            char * bytes = reinterpret_cast<char *>(&value);
-            bytes[0] ^= 0x80;
+            /// XOR sign bit on the register value BEFORE byte swap - keeps
+            /// the value in a register, matching the pre-refactoring code.
+            using Unsigned = std::make_unsigned_t<T>;
+            static constexpr Unsigned sign_bit = Unsigned{1} << (sizeof(Unsigned) * 8 - 1);
+            auto value = static_cast<Unsigned>(data[n]) ^ sign_bit;
+            transformEndianness<std::endian::big>(value);
+            out.append(reinterpret_cast<const char *>(&value), sizeof(T));
         }
-        out.append(reinterpret_cast<const char *>(&value), sizeof(T));
+        else
+        {
+            auto value = data[n];
+            transformEndianness<std::endian::big>(value);
+            out.append(reinterpret_cast<const char *>(&value), sizeof(T));
+        }
     }
     else if constexpr (is_big_int_v<T>)
     {
@@ -1444,8 +1452,9 @@ void ColumnVector<T>::serializeAsComparable(size_t n, String & out) const
     }
     else if constexpr (std::is_same_v<T, Float32>)
     {
-        UInt32 bits = std::bit_cast<UInt32>(data[n]);
-        if (std::isnan(data[n]))
+        const Float32 v = data[n];
+        UInt32 bits = std::bit_cast<UInt32>(v);
+        if (std::isnan(v))
             bits = 0xFFFFFFFFU;
         else
         {
@@ -1461,8 +1470,9 @@ void ColumnVector<T>::serializeAsComparable(size_t n, String & out) const
     }
     else if constexpr (std::is_same_v<T, Float64>)
     {
-        UInt64 bits = std::bit_cast<UInt64>(data[n]);
-        if (std::isnan(data[n]))
+        const Float64 v = data[n];
+        UInt64 bits = std::bit_cast<UInt64>(v);
+        if (std::isnan(v))
             bits = 0xFFFFFFFFFFFFFFFFULL;
         else
         {

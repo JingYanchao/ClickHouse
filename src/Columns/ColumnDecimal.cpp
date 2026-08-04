@@ -695,10 +695,20 @@ void ColumnDecimal<T>::updateAt(const IColumn & src, size_t dst_pos, size_t src_
 }
 
 template <is_decimal T>
-void ColumnDecimal<T>::serializeAsComparable(size_t n, String & out) const
+ALWAYS_INLINE void ColumnDecimal<T>::serializeAsComparable(size_t n, String & out) const
 {
     using Native = T::NativeType;
-    if constexpr (!std::is_same_v<T, Time64> && (std::is_integral_v<Native> || is_big_int_v<Native>))
+    if constexpr (!std::is_same_v<T, Time64> && std::is_integral_v<Native>)
+    {
+        /// XOR sign bit on the register value BEFORE byte swap - keeps
+        /// the value in a register, matching the pre-refactoring code.
+        using Unsigned = std::make_unsigned_t<Native>;
+        static constexpr Unsigned sign_bit = Unsigned{1} << (sizeof(Unsigned) * 8 - 1);
+        auto value = static_cast<Unsigned>(data[n].value) ^ sign_bit;
+        transformEndianness<std::endian::big>(value);
+        out.append(reinterpret_cast<const char *>(&value), sizeof(Native));
+    }
+    else if constexpr (!std::is_same_v<T, Time64> && is_big_int_v<Native>)
     {
         Native value = data[n].value;
         transformEndianness<std::endian::big>(value);
