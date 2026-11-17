@@ -209,6 +209,8 @@ struct Settings
 
     void write(WriteBuffer & out, SettingsWriteFormat format = SettingsWriteFormat::DEFAULT) const;
     void read(ReadBuffer & in, SettingsWriteFormat format = SettingsWriteFormat::DEFAULT);
+    /// Equivalent to `read` on a fresh object followed by `changes`, without materializing all settings.
+    static SettingsChanges readChanges(ReadBuffer & in, SettingsWriteFormat format);
     /// Equivalent to Settings().write(out, <any format>) but faster.
     static void writeEmpty(WriteBuffer & out);
 

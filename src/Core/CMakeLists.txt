@@ -5,3 +5,7 @@ endif ()
 if (ENABLE_FUZZING)
     add_subdirectory(fuzzers)
 endif()
+
+if (ENABLE_BENCHMARKS)
+    add_subdirectory(benchmarks)
+endif()

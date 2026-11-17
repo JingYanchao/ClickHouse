@@ -2783,8 +2783,7 @@ void TCPHandler::processQuery(std::shared_ptr<QueryState> & state)
         ? SettingsWriteFormat::STRINGS_WITH_FLAGS
         : SettingsWriteFormat::BINARY;
 
-    Settings passed_settings;
-    passed_settings.read(*in, settings_format);
+    auto settings_changes = Settings::readChanges(*in, settings_format);
 
     std::string received_extra_roles;
     // TODO: check if having `is_interserver_mode` doesn't break interoperability with the CH-client.
@@ -2937,8 +2936,9 @@ void TCPHandler::processQuery(std::shared_ptr<QueryState> & state)
     client_info.connection_parallel_replicas_protocol_version = client_parallel_replicas_protocol_version;
     client_info.is_from_introspection_port = is_from_introspection_port;
 
-    state->run_query_in_background = passed_settings[Setting::run_query_in_background].changed
-        ? passed_settings[Setting::run_query_in_background].value
+    const Field * run_query_in_background = settings_changes.tryGet("run_query_in_background");
+    state->run_query_in_background = run_query_in_background
+        ? run_query_in_background->safeGet<bool>()
         : session->sessionOrGlobalContext()->getSettingsRef()[Setting::run_query_in_background].value;
 
     state->query_context = state->run_query_in_background
@@ -2996,9 +2996,8 @@ void TCPHandler::processQuery(std::shared_ptr<QueryState> & state)
         && VersionNumber(client_info.connection_client_version_major, client_info.connection_client_version_minor, client_info.connection_client_version_patch)
             < VersionNumber(25, 10, 0)
     )
-        passed_settings.set("optimize_const_name_size", -1);
+        settings_changes.setSetting("optimize_const_name_size", Int64(-1));
 
-    auto settings_changes = passed_settings.changes();
     if (query_kind == ClientInfo::QueryKind::INITIAL_QUERY)
     {
         /// Throw an exception if the passed settings violate the constraints.

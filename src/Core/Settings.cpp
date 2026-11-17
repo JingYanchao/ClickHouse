@@ -12783,6 +12783,17 @@ void Settings::read(ReadBuffer & in, SettingsWriteFormat format)
     impl->read(in, format);
 }
 
+SettingsChanges Settings::readChanges(ReadBuffer & in, SettingsWriteFormat format)
+{
+    if (format < SettingsWriteFormat::STRINGS_WITH_FLAGS)
+    {
+        Settings settings;
+        settings.read(in, format);
+        return settings.changes();
+    }
+    return SettingsImpl::readChanges(in);
+}
+
 void Settings::writeEmpty(WriteBuffer & out)
 {
     BaseSettingsHelpers::writeString("", out);

@@ -11,10 +11,12 @@
 #include <Common/UnorderedMapWithMemoryTracking.h>
 #include <Common/VectorWithMemoryTracking.h>
 
+#include <algorithm>
 #include <optional>
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 #include <boost/blank.hpp>
 
@@ -333,6 +335,10 @@ public:
 
     /// Read settings in binary format
     void readBinary(ReadBuffer & in);
+
+    /// Same result as `read` (STRINGS_WITH_FLAGS) on a fresh object followed by `changes`,
+    /// but without materializing all settings.
+    static SettingsChanges readChanges(ReadBuffer & in);
 
     /// Copy settings with HOT_RELOAD flag from `new_settings` into `this`.
     /// Leave other settings unchanged.
@@ -892,6 +898,83 @@ void BaseSettings<TTraits>::read(ReadBuffer & in, SettingsWriteFormat format)
         }
     }
     BaseSettingsHelpers::flushWarnings();
+}
+
+template <typename TTraits>
+SettingsChanges BaseSettings<TTraits>::readChanges(ReadBuffer & in)
+{
+    static constexpr size_t custom_index = static_cast<size_t>(-1);
+    const auto & accessor = Traits::Accessor::instance();
+    /// The setting index is kept to order the result like `changes`: built-in settings by index, custom ones last.
+    std::vector<std::pair<size_t, SettingChange>> read_changes;
+    size_t num_settings = 0;
+
+    /// Later occurrences override earlier ones, like repeated assignments in `read`.
+    auto upsert = [&](size_t index, std::string_view name, Field value)
+    {
+        for (auto & entry : read_changes)
+        {
+            if (entry.second.name == name)
+            {
+                entry.second.value = std::move(value);
+                return;
+            }
+        }
+        read_changes.emplace_back(index, SettingChange{name, std::move(value)});
+    };
+
+    while (true)
+    {
+        String read_name = BaseSettingsHelpers::readName(in);
+        if (read_name.empty() /* empty string is a marker of the end of settings */)
+            break;
+
+        if (++num_settings > MAX_SETTINGS_IN_A_SEQUENCE)
+            BaseSettingsHelpers::throwTooManySettings("settings");
+
+        std::string_view name = TTraits::resolveName(read_name);
+        size_t index = accessor.find(name);
+
+        using Flags = BaseSettingsHelpers::Flags;
+        UInt64 flags = BaseSettingsHelpers::readFlags(in);
+        bool is_important = (flags & Flags::IMPORTANT);
+        bool is_custom = (flags & Flags::CUSTOM);
+
+        if (index != custom_index)
+        {
+            if (is_custom)
+            {
+                SettingFieldCustom temp;
+                temp.parseFromString(BaseSettingsHelpers::readString(in));
+                upsert(index, accessor.getName(index), accessor.castValueUtil(index, static_cast<Field>(temp)));
+            }
+            else
+                upsert(index, accessor.getName(index), accessor.stringToValueUtil(index, BaseSettingsHelpers::readString(in)));
+        }
+        else if (is_custom && Traits::allow_custom_settings)
+        {
+            SettingFieldCustom temp;
+            temp.parseFromString(BaseSettingsHelpers::readString(in));
+            upsert(custom_index, read_name, static_cast<Field>(temp));
+        }
+        else if (is_important)
+        {
+            BaseSettingsHelpers::throwSettingNotFound(name);
+        }
+        else
+        {
+            BaseSettingsHelpers::warningSettingNotFound(name);
+            BaseSettingsHelpers::readString(in);
+        }
+    }
+    BaseSettingsHelpers::flushWarnings();
+
+    std::stable_sort(read_changes.begin(), read_changes.end(), [](const auto & lhs, const auto & rhs) { return lhs.first < rhs.first; });
+    SettingsChanges res;
+    res.reserve(read_changes.size());
+    for (auto & entry : read_changes)
+        res.push_back(std::move(entry.second));
+    return res;
 }
 
 template <typename TTraits>
